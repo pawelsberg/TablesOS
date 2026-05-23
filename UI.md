@@ -52,8 +52,8 @@ The entry screen. Lists every table in the store.
     create table (prompts for a nema and opens empty Schema Editor), 
     open **Drives** (read-only diagnostic view of every legacy-IDE slot:
     model / serial / firmware / size, MBR boot signature, and either the
-    TablesOS volume header — version, data-location LBA, system GUID — or
-    the classic MBR partition table; the slot whose on-disk system GUID
+    TablesOS MBR header — OS/loader version, data-location LBA, system GUID —
+    or the classic MBR partition table; the slot whose on-disk system GUID
     matches the boot-time one is marked as "this disk"),
     open **About / Licenses** (`a`),
     shutdown

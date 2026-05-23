@@ -36,6 +36,21 @@ header — there is no partition table.
 The builder writes an **already-formatted** TablesOS volume at the data
 location (no runtime formatting); the kernel only ever *mounts*.
 
+### Format versions (all independent)
+
+Three on-disk/wire format versions are tracked **separately** — they are *not*
+the product/release version (the crates' `0.1.0`), and each is bumped only when
+its own format changes. All three are `1` today:
+
+| Version | Where | Source |
+|---------|-------|--------|
+| OS/loader format | MBR header `0x1B8` | `boot/stage1.s` |
+| Volume (store) format | superblock `SB_VERSION` | `tablestore/src/pager.rs` |
+| Journal format | journal record header | `tablestore/src/journal.rs` |
+
+The Drives diagnostic surfaces the **OS/loader** version (it reads the MBR, not
+the mounted superblock).
+
 ## Fixed addresses
 
 | Addr        | Use                                            |

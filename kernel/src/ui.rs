@@ -1947,11 +1947,12 @@ impl<D: BlockDevice> App<D> {
     /// Uptime comes from the calibrated TSC; before calibration it's omitted.
     fn hud_readout(&self) -> String {
         let per = time::tsc_per_us();
+        let ver = env!("CARGO_PKG_VERSION");
         if per == 0 {
-            return "TABLESOS // SYS ONLINE".into();
+            return format!("TABLESOS v{ver} // SYS ONLINE");
         }
         let secs = unsafe { core::arch::x86_64::_rdtsc() } / (per.saturating_mul(1_000_000)).max(1);
-        format!("TABLESOS // T+{}s // ONLINE", secs)
+        format!("TABLESOS v{ver} // T+{}s // ONLINE", secs)
     }
 
     fn render(&mut self) {
@@ -3412,7 +3413,7 @@ impl<D: BlockDevice> App<D> {
             ));
             let mbr_desc = match &d.mbr {
                 MbrInfo::TablesOs { version, sys_guid, .. } => alloc::format!(
-                    "  currently: TablesOS volume v{}  GUID {}",
+                    "  currently: TablesOS disk (OS/loader v{})  GUID {}",
                     version,
                     ata::fmt_guid(sys_guid),
                 ),
@@ -3523,7 +3524,10 @@ impl<D: BlockDevice> App<D> {
 /// Shared by `frame_about` (render) and the scroll handler (clamping `top`).
 fn about_lines() -> Vec<TextLine> {
     let mut out = Vec::new();
-    out.push(line("TablesOS", LineKind::Accent));
+    out.push(line(
+        &format!("TablesOS v{}", env!("CARGO_PKG_VERSION")),
+        LineKind::Accent,
+    ));
     out.push(line(
         "A relational table store that boots on bare metal.",
         LineKind::Normal,
@@ -3772,7 +3776,7 @@ fn push_drive_card(body: &mut Vec<TextLine>, d: &DriveInfo, selected: bool) {
         } => {
             body.push(line(
                 &format!(
-                    "  TablesOS volume — version {}   data @ LBA {}",
+                    "  TablesOS MBR header — OS/loader version {}   data @ LBA {}",
                     version, data_loc_lba
                 ),
                 LineKind::Accent,

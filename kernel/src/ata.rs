@@ -261,6 +261,9 @@ pub struct DriveInfo {
 pub enum MbrInfo {
     /// `TBLSBOOT` magic at MBR offset 0x1B0 → our own custom MBR.
     TablesOs {
+        /// OS/BIOS-loader version from MBR header offset 0x1B8 — the boot
+        /// format version, distinct from the relational volume's superblock
+        /// format version (`tablestore` `SB_VERSION`) and the journal version.
         version: u16,
         data_loc_lba: u64,
         stage2_lba: u32,
