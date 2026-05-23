@@ -22,6 +22,7 @@ Characteristics:
 6. **SSD safe** system uses SSD in a safe manner - taking into account nature of
    flash memmory. Preventing physical damage of the medium.
 7. **Graphic user interface** (VESA) allows to interact with operating system.
+8. **No partition tables. No partitions** - Custom MBR - contains: system id, operating system bios version, data location  
 
 ---
 
@@ -34,6 +35,12 @@ references a column in another (or the same) table.
 
 There is no implicit primary key. A foreign key may target any column that
 carries a uniqueness guarantee (a `UNIQUE` column).
+
+A table may also define an ordered set of **reference columns**: the columns
+used to render one of its rows as a compact label wherever that row appears as
+a reference (for example `id:1 name:John`). If none are configured the system
+falls back automatically to the table's `UNIQUE` columns, or the first column
+if there are none.
 
 ---
 
@@ -65,7 +72,10 @@ this is checked at definition time.
 
 ### Browsing related rows
 
-The GUI shows relationships when browsing.
+The GUI shows relationships when browsing. A referenced row is shown by its
+**reference label** (its reference columns, formatted `col:value …`), so
+following a foreign key or scanning the "referenced by" list shows the related
+row's identity directly rather than a bare key.
 
 ---
 
@@ -77,10 +87,13 @@ The GUI shows relationships when browsing.
 | `Drop table` | Delete a table and all its rows and FKs. |
 | `Add column <name> <type> [null\|not null] [unique]` | Append a column. Existing rows get NULL (column must be nullable) . |
 | `Drop column <name>` | Remove a column. Rejected if it carries or is targeted by a FK. |
+| `Rename column <name> <new-name>` | Rename a column; any foreign key naming it is updated to match. |
+| `Move column <name> <new-location>` | Reorder column.  |
 | `Add fk <col> -> <table>.<col>` | Define a foreign key. |
 | `Drop fk <fk-name>` | Remove a foreign key |
 | `Add unique` | Add unique to a column |
 | `Remove unique` | Remove unique from a column |
+| `Set reference columns` | Choose the ordered columns used to label a row when it appears as a reference. |
 
 
 ### Data Operations

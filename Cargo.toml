@@ -1,0 +1,67 @@
+# TablesOS workspace.
+#
+# The workspace root is also the *image builder*: it takes the freshly
+# compiled `kernel` binary (built for the bare-metal `x86_64-unknown-none`
+# target via a Cargo artifact-dependency) and wraps it into a BIOS-bootable
+# disk image with the `bootloader` crate. See BUILD.md.
+
+[package]
+name = "tablesos-builder"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[workspace]
+members = ["kernel", "tablestore", "pngdec"]
+resolver = "2"
+
+# The kernel as an artifact dependency, compiled for bare metal. Because it is
+# a *normal* dependency, Cargo exposes `CARGO_BIN_FILE_KERNEL_kernel` to this
+# crate's own compilation, so the image is built at runtime in `main.rs`
+# (Cargo does not forward that variable to build scripts).
+[dependencies]
+kernel = { path = "kernel", artifact = "bin", target = "x86_64-unknown-none" }
+# Used at build time to lay down an already-formatted volume in the image
+# (the OS never formats at runtime).
+tablestore = { path = "tablestore" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+# Cargo builds the `kernel` artifact dependency with the *dev* profile
+# regardless of `--release` (a `-Z bindeps` quirk). An unoptimised, debug-info
+# kernel is multi-MB, which makes the BIOS bootloader crawl while "loading
+# kernel...". Optimise the kernel, the engine AND `pngdec` in every profile so
+# the image stays small and boots fast. (Per-package overrides apply to
+# artifact deps.) `pngdec` matters in particular: it decodes the embedded
+# background/font PNGs at boot, and at the dev default `opt-level = 0` that
+# decode is ~12x slower (measured ~350 ms vs ~30 ms per 1168x784 background on
+# the host) — which, multiplied again by QEMU's TCG software CPU, is what made
+# "loading assets" drag on for seconds.
+[profile.dev.package.kernel]
+opt-level = 2
+debug = false
+
+[profile.dev.package.tablestore]
+opt-level = 2
+debug = false
+
+[profile.dev.package.pngdec]
+opt-level = 2
+debug = false
+
+[profile.release.package.kernel]
+opt-level = 2
+debug = false
+
+[profile.release.package.tablestore]
+opt-level = 2
+debug = false
+
+[profile.release.package.pngdec]
+opt-level = 2
+debug = false

@@ -1,0 +1,272 @@
+//! PS/2 keyboard + mouse.
+//!
+//! The BIOS leaves the 8042 controller translating to scancode **set 1** with
+//! the keyboard enabled, so the keyboard needs no init. The mouse (second
+//! port) does: enable it, set defaults, turn on streaming. IRQ handlers feed
+//! raw bytes here; the UI loop drains decoded [`Event`]s.
+
+use alloc::collections::VecDeque;
+use spin::Mutex;
+use x86_64::instructions::port::Port;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    Char(char),
+    Enter,
+    Esc,
+    Backspace,
+    Tab,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    Delete,
+    PageUp,
+    PageDown,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Event {
+    Key(Key),
+    /// Absolute pointer position after a move.
+    MouseMove(usize, usize),
+    /// Left button pressed at this position (a click for the UI).
+    Click(usize, usize),
+}
+
+struct Kbd {
+    shift: bool,
+    extended: bool,
+}
+
+static QUEUE: Mutex<VecDeque<Event>> = Mutex::new(VecDeque::new());
+static KBD: Mutex<Kbd> = Mutex::new(Kbd {
+    shift: false,
+    extended: false,
+});
+
+// Mouse assembly + absolute state.
+struct MouseState {
+    packet: [u8; 3],
+    idx: usize,
+    x: i32,
+    y: i32,
+    max_x: i32,
+    max_y: i32,
+    left_was_down: bool,
+}
+static MOUSE: Mutex<MouseState> = Mutex::new(MouseState {
+    packet: [0; 3],
+    idx: 0,
+    x: 0,
+    y: 0,
+    max_x: 1023,
+    max_y: 767,
+    left_was_down: false,
+});
+
+/// These locks are also taken by the keyboard/mouse IRQ handlers. A spinlock
+/// taken on the main path while an interrupt fires on the same core would
+/// deadlock, so every main-side access masks interrupts first.
+fn no_irq<R>(f: impl FnOnce() -> R) -> R {
+    x86_64::instructions::interrupts::without_interrupts(f)
+}
+
+pub fn set_bounds(w: usize, h: usize) {
+    no_irq(|| {
+        let mut m = MOUSE.lock();
+        m.max_x = w as i32 - 1;
+        m.max_y = h as i32 - 1;
+        m.x = m.max_x / 2;
+        m.y = m.max_y / 2;
+    });
+}
+
+pub fn poll() -> Option<Event> {
+    no_irq(|| QUEUE.lock().pop_front())
+}
+
+pub fn mouse_pos() -> (usize, usize) {
+    no_irq(|| {
+        let m = MOUSE.lock();
+        (m.x as usize, m.y as usize)
+    })
+}
+
+fn push(e: Event) {
+    let mut q = QUEUE.lock();
+    if q.len() < 256 {
+        q.push_back(e);
+    }
+}
+
+// ---- keyboard (scancode set 1) ----
+
+pub fn on_keyboard_byte(code: u8) {
+    let mut k = KBD.lock();
+    if code == 0xE0 {
+        k.extended = true;
+        return;
+    }
+    let released = code & 0x80 != 0;
+    let make = code & 0x7F;
+    let ext = k.extended;
+    k.extended = false;
+
+    // Shift state.
+    if make == 0x2A || make == 0x36 {
+        k.shift = !released;
+        return;
+    }
+    if released {
+        return;
+    }
+    let shift = k.shift;
+    drop(k);
+
+    if ext {
+        let key = match make {
+            0x48 => Key::Up,
+            0x50 => Key::Down,
+            0x4B => Key::Left,
+            0x4D => Key::Right,
+            0x47 => Key::Home,
+            0x4F => Key::End,
+            0x53 => Key::Delete,
+            0x49 => Key::PageUp,
+            0x51 => Key::PageDown,
+            _ => return,
+        };
+        push(Event::Key(key));
+        return;
+    }
+    let ev = match make {
+        0x1C => Key::Enter,
+        0x01 => Key::Esc,
+        0x0E => Key::Backspace,
+        0x0F => Key::Tab,
+        _ => {
+            if let Some(c) = scancode_char(make, shift) {
+                Key::Char(c)
+            } else {
+                return;
+            }
+        }
+    };
+    push(Event::Key(ev));
+}
+
+fn scancode_char(code: u8, shift: bool) -> Option<char> {
+    const LOW: &[u8] = b"\
+\x00\x001234567890-=\x00\x00qwertyuiop[]\x00\x00asdfghjkl;'`\x00\\zxcvbnm,./";
+    const UP: &[u8] = b"\
+\x00\x00!@#$%^&*()_+\x00\x00QWERTYUIOP{}\x00\x00ASDFGHJKL:\"~\x00|ZXCVBNM<>?";
+    if code == 0x39 {
+        return Some(' ');
+    }
+    let table = if shift { UP } else { LOW };
+    let i = code as usize;
+    if i < table.len() && table[i] != 0 {
+        Some(table[i] as char)
+    } else {
+        None
+    }
+}
+
+// ---- mouse ----
+
+fn wait_write() {
+    let mut status: Port<u8> = Port::new(0x64);
+    for _ in 0..100_000 {
+        if unsafe { status.read() } & 0x02 == 0 {
+            return;
+        }
+    }
+}
+fn wait_read() {
+    let mut status: Port<u8> = Port::new(0x64);
+    for _ in 0..100_000 {
+        if unsafe { status.read() } & 0x01 != 0 {
+            return;
+        }
+    }
+}
+
+fn cmd(byte: u8) {
+    wait_write();
+    unsafe { Port::<u8>::new(0x64).write(byte) };
+}
+fn write_aux(byte: u8) {
+    cmd(0xD4); // address the mouse
+    wait_write();
+    unsafe { Port::<u8>::new(0x60).write(byte) };
+    wait_read();
+    let _ack: u8 = unsafe { Port::<u8>::new(0x60).read() };
+}
+
+/// Enable and configure the PS/2 mouse. Best-effort: hardware may differ, but
+/// QEMU's PS/2 mouse follows this sequence.
+pub fn init_mouse() {
+    // Run the whole handshake with the mouse IRQ masked so the handler does
+    // not steal our ACK bytes.
+    no_irq(init_mouse_inner);
+}
+
+fn init_mouse_inner() {
+    cmd(0xA8); // enable aux device
+    cmd(0x20); // read controller config
+    wait_read();
+    let mut cfg: u8 = unsafe { Port::<u8>::new(0x60).read() };
+    cfg |= 0b10; // enable IRQ12
+    cfg &= !0b10_0000; // enable mouse clock
+    cmd(0x60);
+    wait_write();
+    unsafe { Port::<u8>::new(0x60).write(cfg) };
+    write_aux(0xF6); // set defaults
+    write_aux(0xF4); // enable data reporting
+}
+
+pub fn on_mouse_byte(byte: u8) {
+    let mut m = MOUSE.lock();
+    // Resync: first packet byte always has bit 3 set.
+    if m.idx == 0 && byte & 0x08 == 0 {
+        return;
+    }
+    let i = m.idx;
+    m.packet[i] = byte;
+    m.idx += 1;
+    if m.idx < 3 {
+        return;
+    }
+    m.idx = 0;
+
+    let flags = m.packet[0];
+    let mut dx = m.packet[1] as i32;
+    let mut dy = m.packet[2] as i32;
+    if flags & 0x10 != 0 {
+        dx -= 256;
+    }
+    if flags & 0x20 != 0 {
+        dy -= 256;
+    }
+    // Overflow bits → ignore that axis.
+    if flags & 0xC0 != 0 {
+        dx = 0;
+        dy = 0;
+    }
+    m.x = (m.x + dx).clamp(0, m.max_x);
+    m.y = (m.y - dy).clamp(0, m.max_y); // screen Y grows downward
+    let (px, py) = (m.x as usize, m.y as usize);
+
+    let left = flags & 0x01 != 0;
+    let edge = left && !m.left_was_down;
+    m.left_was_down = left;
+    drop(m);
+
+    push(Event::MouseMove(px, py));
+    if edge {
+        push(Event::Click(px, py));
+    }
+}

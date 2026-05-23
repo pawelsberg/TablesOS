@@ -1,0 +1,11 @@
+# Artifact dependencies (`-Z bindeps`) are how the builder crate pulls in the
+# kernel binary compiled for a different target. Enabling it here means a plain
+# `cargo build` works without passing `-Z` on the command line (nightly only).
+[unstable]
+bindeps = true
+
+# The kernel (and everything compiled for the bare-metal target) must be
+# position-dependent: it is linked and run at a fixed physical address with
+# no dynamic loader, so there is no GOT/PLT to fix up.
+[target.x86_64-unknown-none]
+rustflags = ["-Crelocation-model=static"]

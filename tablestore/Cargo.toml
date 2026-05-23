@@ -1,0 +1,15 @@
+[package]
+name = "tablestore"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "TablesOS relational engine: unlimited-precision values, schema, paged store, write-ahead journal."
+
+[lib]
+# `cargo test -p tablestore` builds for the host (std available under cfg(test));
+# every other build is `no_std + alloc` for the kernel.
+test = true
+
+[features]
+default = []

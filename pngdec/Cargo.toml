@@ -1,0 +1,15 @@
+[package]
+name = "pngdec"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# `no_std + alloc` so the kernel can decode embedded PNG assets at boot, yet it
+# builds with `std` under `cargo test` for host verification (same pattern as
+# the `tablestore` engine crate).
+
+[lib]
+test = true
+
+[dependencies]
