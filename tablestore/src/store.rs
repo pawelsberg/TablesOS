@@ -998,6 +998,13 @@ impl<D: BlockDevice> Store<D> {
     pub fn device_mut(&mut self) -> &mut D {
         self.pager.device_mut()
     }
+
+    /// Monotonic counter bumped on every committed mutation; unchanged by
+    /// read-only operations. A caller can cache derived data (e.g. a decoded
+    /// row list) tagged with this value and treat it as fresh while it holds.
+    pub fn generation(&self) -> u64 {
+        self.pager.sb.generation
+    }
 }
 
 #[cfg(test)]

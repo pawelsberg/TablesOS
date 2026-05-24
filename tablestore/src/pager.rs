@@ -66,12 +66,23 @@ impl Superblock {
     }
 }
 
+/// Upper bound on cached clean pages (`CACHE_MAX * PAGE` = 32 MiB). Browsing a
+/// table re-reads it on every keystroke; without a cache that is thousands of
+/// polled PIO sector reads per key and the GUI appears to freeze. A whole-table
+/// scan stays under this for any realistic table, so it lives entirely in RAM
+/// after the first read; if it ever overflows the cache is simply dropped.
+const CACHE_MAX: usize = 8192;
+
 pub struct Pager<D: BlockDevice> {
     dev: D,
     pub sb: Superblock,
     /// Staged page images for the active transaction (also a read cache so the
     /// transaction sees its own writes). Keyed by page number.
     dirty: BTreeMap<u64, Page>,
+    /// Read-through cache of committed (clean) pages, keyed by page number.
+    /// Always holds the current on-disk content: refreshed on commit, untouched
+    /// by rollback (the committed state it mirrors does not change there).
+    cache: BTreeMap<u64, Page>,
 }
 
 impl<D: BlockDevice> Pager<D> {
@@ -95,6 +106,7 @@ impl<D: BlockDevice> Pager<D> {
             dev,
             sb,
             dirty: BTreeMap::new(),
+            cache: BTreeMap::new(),
         })
     }
 
@@ -109,6 +121,7 @@ impl<D: BlockDevice> Pager<D> {
             dev,
             sb,
             dirty: BTreeMap::new(),
+            cache: BTreeMap::new(),
         })
     }
 
@@ -116,9 +129,13 @@ impl<D: BlockDevice> Pager<D> {
         &mut self.dev
     }
 
-    /// Read a page, honouring uncommitted writes from the active transaction.
+    /// Read a page, honouring uncommitted writes from the active transaction,
+    /// then the clean-page cache, then the disk (populating the cache).
     pub fn read_page(&mut self, page: u64) -> Result<Page> {
         if let Some(p) = self.dirty.get(&page) {
+            return Ok(p.clone());
+        }
+        if let Some(p) = self.cache.get(&page) {
             return Ok(p.clone());
         }
         if page >= self.sb.total_pages {
@@ -126,6 +143,10 @@ impl<D: BlockDevice> Pager<D> {
         }
         let mut buf = zeroed_page();
         journal::read_page(&mut self.dev, page, &mut buf)?;
+        if self.cache.len() >= CACHE_MAX {
+            self.cache.clear();
+        }
+        self.cache.insert(page, buf.clone());
         Ok(buf)
     }
 
@@ -180,6 +201,15 @@ impl<D: BlockDevice> Pager<D> {
         }
         journal::commit(&mut self.dev, txid, &batch)?;
         self.sb = sb;
+        // The just-committed images are now the clean on-disk content: fold
+        // them into the read cache (keeping it warm and correct) before the
+        // staging set is dropped. Page 0 (the superblock) is never cached.
+        for (p, img) in &self.dirty {
+            if self.cache.len() >= CACHE_MAX {
+                self.cache.clear();
+            }
+            self.cache.insert(*p, img.clone());
+        }
         self.dirty.clear();
         Ok(())
     }

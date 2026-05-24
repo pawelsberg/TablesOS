@@ -5,7 +5,6 @@
 //! port) does: enable it, set defaults, turn on streaming. IRQ handlers feed
 //! raw bytes here; the UI loop drains decoded [`Event`]s.
 
-use alloc::collections::VecDeque;
 use spin::Mutex;
 use x86_64::instructions::port::Port;
 
@@ -32,8 +31,11 @@ pub enum Event {
     Key(Key),
     /// Absolute pointer position after a move.
     MouseMove(usize, usize),
-    /// Left button pressed at this position (a click for the UI).
+    /// Left button pressed at this position (a click for the UI — acts as Enter).
     Click(usize, usize),
+    /// Right button pressed (the UI treats it as Esc — back/cancel). Position
+    /// is omitted: like Esc it always acts on the focused screen.
+    RightClick,
 }
 
 struct Kbd {
@@ -41,7 +43,49 @@ struct Kbd {
     extended: bool,
 }
 
-static QUEUE: Mutex<VecDeque<Event>> = Mutex::new(VecDeque::new());
+/// Fixed-capacity event ring shared between the IRQ handlers (producers) and
+/// the UI loop (consumer). Deliberately **heap-free**: the global allocator is
+/// one spinlock shared with the main thread, which allocates with interrupts
+/// enabled. A growing `VecDeque` would take that allocator lock *inside* the
+/// keyboard/mouse interrupt; if the main thread were mid-allocation the IRQ
+/// would spin on the held lock forever, hanging the core (mouse and keyboard
+/// dead). A plain array can never allocate, so that deadlock cannot occur.
+const QUEUE_CAP: usize = 512;
+
+struct EventRing {
+    buf: [Event; QUEUE_CAP],
+    head: usize,
+    len: usize,
+}
+impl EventRing {
+    const fn new() -> EventRing {
+        EventRing {
+            buf: [Event::MouseMove(0, 0); QUEUE_CAP],
+            head: 0,
+            len: 0,
+        }
+    }
+    /// Append an event; drop it if the ring is full (input outran the UI).
+    fn push(&mut self, e: Event) {
+        if self.len == QUEUE_CAP {
+            return;
+        }
+        let tail = (self.head + self.len) % QUEUE_CAP;
+        self.buf[tail] = e;
+        self.len += 1;
+    }
+    fn pop(&mut self) -> Option<Event> {
+        if self.len == 0 {
+            return None;
+        }
+        let e = self.buf[self.head];
+        self.head = (self.head + 1) % QUEUE_CAP;
+        self.len -= 1;
+        Some(e)
+    }
+}
+
+static QUEUE: Mutex<EventRing> = Mutex::new(EventRing::new());
 static KBD: Mutex<Kbd> = Mutex::new(Kbd {
     shift: false,
     extended: false,
@@ -56,6 +100,7 @@ struct MouseState {
     max_x: i32,
     max_y: i32,
     left_was_down: bool,
+    right_was_down: bool,
 }
 static MOUSE: Mutex<MouseState> = Mutex::new(MouseState {
     packet: [0; 3],
@@ -65,6 +110,7 @@ static MOUSE: Mutex<MouseState> = Mutex::new(MouseState {
     max_x: 1023,
     max_y: 767,
     left_was_down: false,
+    right_was_down: false,
 });
 
 /// These locks are also taken by the keyboard/mouse IRQ handlers. A spinlock
@@ -85,7 +131,7 @@ pub fn set_bounds(w: usize, h: usize) {
 }
 
 pub fn poll() -> Option<Event> {
-    no_irq(|| QUEUE.lock().pop_front())
+    no_irq(|| QUEUE.lock().pop())
 }
 
 pub fn mouse_pos() -> (usize, usize) {
@@ -96,10 +142,7 @@ pub fn mouse_pos() -> (usize, usize) {
 }
 
 fn push(e: Event) {
-    let mut q = QUEUE.lock();
-    if q.len() < 256 {
-        q.push_back(e);
-    }
+    QUEUE.lock().push(e);
 }
 
 // ---- keyboard (scancode set 1) ----
@@ -261,12 +304,18 @@ pub fn on_mouse_byte(byte: u8) {
     let (px, py) = (m.x as usize, m.y as usize);
 
     let left = flags & 0x01 != 0;
-    let edge = left && !m.left_was_down;
+    let right = flags & 0x02 != 0;
+    let left_edge = left && !m.left_was_down;
+    let right_edge = right && !m.right_was_down;
     m.left_was_down = left;
+    m.right_was_down = right;
     drop(m);
 
     push(Event::MouseMove(px, py));
-    if edge {
+    if left_edge {
         push(Event::Click(px, py));
+    }
+    if right_edge {
+        push(Event::RightClick);
     }
 }

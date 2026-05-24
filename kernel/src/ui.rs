@@ -1,8 +1,12 @@
 //! The GUI: the only thing the user ever sees. Keyboard-driven (the spec's
-//! "input is keyboard and mouse" — the mouse is a visible pointer and can
-//! click list rows / buttons; every action also has a key so the system is
-//! fully operable from the keyboard). Screens are colour-coded and map 1:1
-//! to UI.md.
+//! "input is keyboard and mouse" — the mouse is a visible pointer that can
+//! click a list/grid row to activate it and click any on-screen `[…]` shortcut
+//! to fire its key; every action also has a key so the system is fully operable
+//! from the keyboard). Screens are colour-coded and map 1:1 to UI.md.
+//!
+//! Clicks resolve through the per-line [`Hit`] targets recorded while the frame
+//! is built, so the layout code is the single source of truth for what each row
+//! does — `on_click` never re-derives screen geometry.
 
 use alloc::collections::BTreeMap;
 use alloc::format;
@@ -10,7 +14,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-use tablestore::schema::Column;
+use tablestore::schema::{Column, ForeignKey};
 use tablestore::store::RowId;
 use tablestore::value::Value;
 use tablestore::{BlockDevice, Store, StoreError, Type};
@@ -521,23 +525,47 @@ pub fn run<D: BlockDevice>(
         booted_sys_guid,
         data_lba,
         last_usb_test: None,
+        hitmap: Vec::new(),
+        row_cache: None,
     };
     app.render();
     loop {
-        if let Some(ev) = ps2::poll() {
-            match ev {
-                Event::MouseMove(x, y) => app.draw_cursor(x, y),
+        let Some(first) = ps2::poll() else {
+            x86_64::instructions::hlt();
+            continue;
+        };
+        // A full repaint blits the whole framebuffer, so doing one per input
+        // event makes fast key-repeat (held arrows) enqueue faster than we can
+        // draw — the screen appears to freeze under the backlog. Instead drain
+        // every pending event, applying each, and repaint just once at the end.
+        // We out-poll the input IRQs comfortably, so the queue empties promptly.
+        let mut ev = Some(first);
+        let mut repaint = false;
+        let mut moved_to: Option<(usize, usize)> = None;
+        while let Some(e) = ev {
+            match e {
+                Event::MouseMove(x, y) => moved_to = Some((x, y)),
                 Event::Click(x, y) => {
                     app.on_click(x, y);
-                    app.render();
+                    repaint = true;
+                }
+                Event::RightClick => {
+                    app.on_right_click();
+                    repaint = true;
                 }
                 Event::Key(k) => {
                     app.on_key(k);
-                    app.render();
+                    repaint = true;
                 }
             }
-        } else {
-            x86_64::instructions::hlt();
+            ev = ps2::poll();
+        }
+        if repaint {
+            // render() stamps the pointer at the current position itself, so a
+            // pending move needs no separate handling here.
+            app.render();
+        } else if let Some((x, y)) = moved_to {
+            app.draw_cursor(x, y);
         }
     }
 }
@@ -556,6 +584,25 @@ struct App<D: BlockDevice> {
     /// Latest USB-MSC write-test result, if any. Surfaced on the xHCI
     /// screen so the user has visible proof the BlockDevice path works.
     last_usb_test: Option<xhci::WriteTestResult>,
+    /// Click targets for the body lines of the most recently rendered frame,
+    /// indexed by body line. Lets `on_click` map a pointer position straight to
+    /// the row/shortcut it is over, instead of re-deriving the layout.
+    hitmap: Vec<ClickRow>,
+    /// Memoised Table Browser row list. Decoding a table's rows is by far the
+    /// costliest thing the GUI does (500 rows = 500 blob decodes); without this
+    /// every keystroke re-decoded the whole table twice (dispatch + render),
+    /// making navigation crawl. Reused while the table, filter, sort and store
+    /// generation all match; any commit bumps the generation and invalidates it.
+    row_cache: Option<RowCache>,
+}
+
+/// A decoded Browser row list, tagged with everything that would make it stale.
+struct RowCache {
+    table: String,
+    filter: Option<(String, Value)>,
+    sort: Option<(usize, bool)>,
+    generation: u64,
+    rows: Vec<(RowId, Vec<Option<Value>>)>,
 }
 
 impl<D: BlockDevice> App<D> {
@@ -708,36 +755,43 @@ impl<D: BlockDevice> App<D> {
                 filter,
                 mut sort,
             } => {
-                let rows = self.rows(&table, &filter, sort);
                 let ncols = self
                     .store
                     .get_table(&table)
                     .map(|t| t.columns.len())
                     .unwrap_or(0);
-                row = row.min(rows.len().saturating_sub(1));
+                // Cached row count: pure navigation never decodes the table.
+                let nrows = self.cached_rows(&table, &filter, sort).len();
+                row = row.min(nrows.saturating_sub(1));
                 col = col.min(ncols.saturating_sub(1));
+                // One page = the rows visible at once, so PageUp/PageDown move
+                // the cursor (and thus the viewport) by a whole screen.
+                let vis = visible_rows();
                 match k {
                     Key::Up if row > 0 => row -= 1,
-                    Key::Down if row + 1 < rows.len() => row += 1,
+                    Key::Down if row + 1 < nrows => row += 1,
                     Key::Left if col > 0 => col -= 1,
                     Key::Right if col + 1 < ncols => col += 1,
-                    Key::PageUp => row = row.saturating_sub(10),
-                    Key::PageDown => row = (row + 10).min(rows.len().saturating_sub(1)),
+                    Key::PageUp => row = row.saturating_sub(vis),
+                    Key::PageDown => row = (row + vis).min(nrows.saturating_sub(1)),
                     Key::Esc => nav = Nav::Pop,
                     // Cycle sort on the column under the cursor:
                     //   unsorted → ascending → descending → unsorted.
                     // The cursor sticks to the same RowId so the selection
                     // visually follows the row across reorderings.
                     Key::Char('o') if ncols > 0 => {
-                        let anchor = rows.get(row).map(|(id, _)| *id);
+                        let anchor = self.cached_rows(&table, &filter, sort).get(row).map(|(id, _)| *id);
                         sort = match sort {
                             Some((c, true)) if c == col => Some((col, false)),
                             Some((c, false)) if c == col => None,
                             _ => Some((col, true)),
                         };
-                        let new_rows = self.rows(&table, &filter, sort);
                         if let Some(id) = anchor {
-                            if let Some(p) = new_rows.iter().position(|(rid, _)| *rid == id) {
+                            if let Some(p) = self
+                                .cached_rows(&table, &filter, sort)
+                                .iter()
+                                .position(|(rid, _)| *rid == id)
+                            {
                                 row = p;
                             }
                         }
@@ -747,8 +801,8 @@ impl<D: BlockDevice> App<D> {
                             None => "sort cleared".into(),
                         };
                     }
-                    Key::Enter if !rows.is_empty() => {
-                        let id = rows[row].0;
+                    Key::Enter if nrows > 0 => {
+                        let id = self.cached_rows(&table, &filter, sort)[row].0;
                         nav = Nav::Push(Screen::RowView {
                             table: table.clone(),
                             id,
@@ -760,14 +814,14 @@ impl<D: BlockDevice> App<D> {
                             nav = Nav::Push(s);
                         }
                     }
-                    Key::Char('u') if !rows.is_empty() => {
-                        let id = rows[row].0;
+                    Key::Char('u') if nrows > 0 => {
+                        let id = self.cached_rows(&table, &filter, sort)[row].0;
                         if let Some(s) = self.open_editor(&table, Some(id)) {
                             nav = Nav::Push(s);
                         }
                     }
-                    Key::Char('d') if !rows.is_empty() => {
-                        let id = rows[row].0;
+                    Key::Char('d') if nrows > 0 => {
+                        let id = self.cached_rows(&table, &filter, sort)[row].0;
                         nav = Nav::Push(Screen::Confirm {
                             msg: format!("Delete the selected row from '{table}'?"),
                             action: Action::DeleteRow(table.clone(), id),
@@ -781,7 +835,6 @@ impl<D: BlockDevice> App<D> {
                     }
                     _ => {}
                 }
-                let vis = visible_rows();
                 if row < top {
                     top = row;
                 }
@@ -1763,8 +1816,11 @@ impl<D: BlockDevice> App<D> {
                     return;
                 }
                 Err(e) => {
-                    // Attach the error to a column when we can identify it.
-                    let idx = column_for_error(&ed.cols, &e);
+                    // Attach the error to a column when we can identify it. The
+                    // FK list is needed to resolve a foreign-key violation (it
+                    // names the FK, not the column) back to its source field.
+                    let fks = self.store.get_table(&ed.table).map(|t| t.fks).unwrap_or_default();
+                    let idx = column_for_error(&ed.cols, &fks, &e);
                     ed.error = Some((idx, describe(&e)));
                 }
             }
@@ -1773,6 +1829,36 @@ impl<D: BlockDevice> App<D> {
     }
 
     // ---- data helpers -----------------------------------------------------
+
+    /// Borrow the Browser's row list, decoding the table only when the cache
+    /// is stale (different table/filter/sort, or a commit has bumped the store
+    /// generation). Pure navigation hits the cache, so it never re-decodes.
+    fn cached_rows(
+        &mut self,
+        table: &str,
+        filter: &Option<(String, Value)>,
+        sort: Option<(usize, bool)>,
+    ) -> &[(RowId, Vec<Option<Value>>)] {
+        let generation = self.store.generation();
+        let fresh = matches!(
+            &self.row_cache,
+            Some(c) if c.table == table
+                && c.filter == *filter
+                && c.sort == sort
+                && c.generation == generation
+        );
+        if !fresh {
+            let rows = self.rows(table, filter, sort);
+            self.row_cache = Some(RowCache {
+                table: table.to_string(),
+                filter: filter.clone(),
+                sort,
+                generation,
+                rows,
+            });
+        }
+        &self.row_cache.as_ref().unwrap().rows
+    }
 
     fn rows(
         &mut self,
@@ -1906,34 +1992,59 @@ impl<D: BlockDevice> App<D> {
 
     // ---- mouse ------------------------------------------------------------
 
-    fn on_click(&mut self, _x: usize, y: usize) {
-        // A click selects the list/grid line under the pointer, then behaves
-        // like Enter — enough to drive every screen with the mouse too.
-        let line = y.saturating_sub(BODY_TOP + CELL_H) / CELL_H;
-        let act = {
-            match self.top() {
-                Screen::List { sel } => {
-                    *sel = line;
-                    true
-                }
-                Screen::Browser { row, .. } => {
-                    *row = line;
-                    true
-                }
-                Screen::Pick { sel, options, .. } => {
-                    if line < options.len() {
-                        *sel = line;
-                        true
-                    } else {
-                        false
+    fn on_click(&mut self, x: usize, y: usize) {
+        // Map the pointer to the body line it is over, then act on that line's
+        // recorded click target. Clicking off any row or shortcut does nothing.
+        if y < BODY_TOP {
+            return;
+        }
+        let li = (y - BODY_TOP) / CELL_H;
+        let (hit, text) = match self.hitmap.get(li) {
+            Some(r) => (r.hit, r.text.clone()),
+            None => return,
+        };
+        match hit {
+            Hit::None => {}
+            Hit::Focus(i) => self.set_cursor(i),
+            Hit::Activate(i) => {
+                self.set_cursor(i);
+                self.on_key(Key::Enter);
+            }
+            Hit::Shortcuts => {
+                if x >= BODY_X {
+                    if let Some(k) = shortcut_at(&text, (x - BODY_X) / CELL_W) {
+                        self.on_key(k);
                     }
                 }
-                _ => false,
             }
-        };
-        if act {
-            self.on_key(Key::Enter);
         }
+    }
+
+    /// Move the focused screen's cursor/selection to item `i`. Mirrors the
+    /// per-screen selection field so a click can place the cursor before an
+    /// activation (Enter) runs against it.
+    fn set_cursor(&mut self, i: usize) {
+        match self.top() {
+            Screen::List { sel } => *sel = i,
+            Screen::Browser { row, .. } => *row = i,
+            Screen::RowView { sel, .. } => *sel = i,
+            Screen::Schema { sel, .. } => *sel = i,
+            Screen::RefCols { sel, .. } => *sel = i,
+            Screen::Pick { sel, .. } => *sel = i,
+            Screen::Drives { sel, .. } => *sel = i,
+            Screen::Pci { sel, .. } => *sel = i,
+            Screen::CreateOsPick { sel, .. } => *sel = i,
+            Screen::Editor(ed) => ed.focus = i,
+            Screen::Builder(b) => b.focus = i,
+            _ => {}
+        }
+    }
+
+    fn on_right_click(&mut self) {
+        // The right button mirrors Esc: back out of / cancel the current
+        // screen, so the pointer alone can navigate both directions. Position
+        // is irrelevant — like Esc, it always acts on the focused screen.
+        self.on_key(Key::Esc);
     }
 
     fn draw_cursor(&self, x: usize, y: usize) {
@@ -1959,6 +2070,20 @@ impl<D: BlockDevice> App<D> {
         // Gather everything that needs a &mut self *before* locking the
         // framebuffer (drawing borrows the display, not the store).
         let frame = self.build_frame();
+        // Capture this frame's click targets so `on_click` can resolve a
+        // pointer position against exactly what is on screen.
+        self.hitmap = frame
+            .body
+            .iter()
+            .map(|l| ClickRow {
+                hit: l.hit,
+                text: if matches!(l.hit, Hit::Shortcuts) {
+                    l.text.clone()
+                } else {
+                    String::new()
+                },
+            })
+            .collect();
         let (mx, my) = ps2::mouse_pos();
         let readout = self.hud_readout();
         fbm::with(|d| {
@@ -2111,7 +2236,7 @@ impl<D: BlockDevice> App<D> {
         body.push(line(
             "Tables  [↑↓] select  [Enter] open  [c]reate  [d]rives  [p]ci  [n]ew OS on USB  [a]bout  [s]hutdown",
             LineKind::Dim,
-        ));
+        ).hit(Hit::Shortcuts));
         body.push(line("", LineKind::Normal));
         if tables.is_empty() {
             body.push(line("(no tables yet — press 'c' to create one)", LineKind::Dim));
@@ -2130,7 +2255,7 @@ impl<D: BlockDevice> App<D> {
                 } else {
                     LineKind::Normal
                 },
-            ));
+            ).hit(Hit::Activate(i)));
         }
         Frame {
             title: "TablesOS — Table List".into(),
@@ -2155,12 +2280,11 @@ impl<D: BlockDevice> App<D> {
             _ => unreachable!(),
         };
         let schema = self.store.get_table(&table).ok();
-        let rows = self.rows(&table, &filter, sort);
         let mut body = Vec::new();
         body.push(line(
-            "[↑↓←→] cell  [Enter] row  [i]nsert [u]pdate [d]elete  [o]rder  [s]chema  [Esc] back",
+            "[↑↓←→] cell  [PgUp/Dn] page  [Enter] row  [i]nsert [u]pdate [d]elete  [o]rder  [s]chema  [Esc] back",
             LineKind::Dim,
-        ));
+        ).hit(Hit::Shortcuts));
         let mut hdr_line_idx: Option<usize> = None;
         if let Some(t) = &schema {
             let mut hdr = String::new();
@@ -2205,6 +2329,9 @@ impl<D: BlockDevice> App<D> {
             }
         }
         let vis = visible_rows();
+        // Borrow the (memoised) row list only now — after every `self.store`
+        // call above — so the FK-label scans don't fight the immutable borrow.
+        let rows = self.cached_rows(&table, &filter, sort);
         let mut row_line_idx: Option<usize> = None;
         for (vi, (_, cells)) in rows.iter().enumerate().skip(top).take(vis) {
             let mut s = String::new();
@@ -2232,7 +2359,7 @@ impl<D: BlockDevice> App<D> {
                 } else {
                     LineKind::Normal
                 },
-            ));
+            ).hit(Hit::Activate(vi)));
             if vi == row {
                 row_line_idx = Some(body.len() - 1);
             }
@@ -2274,7 +2401,7 @@ impl<D: BlockDevice> App<D> {
         // Outgoing FK fields are annotated with the referenced row's label.
         let fk_labels = self.fk_field_labels(&table, id);
         let mut body = Vec::new();
-        body.push(line("[↑↓] target  [Enter] navigate  [Esc] back", LineKind::Dim));
+        body.push(line("[↑↓] target  [Enter] navigate  [Esc] back", LineKind::Dim).hit(Hit::Shortcuts));
         body.push(line("", LineKind::Normal));
         if let (Some(t), Some(row)) = (&t, &row) {
             for (ci, c) in t.columns.iter().enumerate() {
@@ -2310,7 +2437,7 @@ impl<D: BlockDevice> App<D> {
                 } else {
                     LineKind::Normal
                 },
-            ));
+            ).hit(Hit::Activate(i)));
         }
         Frame {
             title: format!("Row View — {table}"),
@@ -2330,7 +2457,7 @@ impl<D: BlockDevice> App<D> {
         body.push(line(
             "[Tab/↑↓] move  type to edit  [Del] toggle NULL  [→] field builder  [Enter] OK  [Esc] cancel",
             LineKind::Dim,
-        ));
+        ).hit(Hit::Shortcuts));
         body.push(line("", LineKind::Normal));
         for (i, c) in ed.cols.iter().enumerate() {
             let f = &ed.fields[i];
@@ -2363,7 +2490,7 @@ impl<D: BlockDevice> App<D> {
                 } else {
                     LineKind::Normal
                 },
-            ));
+            ).hit(Hit::Focus(i)));
             if let Some((ei, msg)) = &ed.error {
                 if *ei == i {
                     body.push(line(&format!("    ⮡ {msg}"), LineKind::Error));
@@ -2378,7 +2505,7 @@ impl<D: BlockDevice> App<D> {
             } else {
                 LineKind::Accent
             },
-        ));
+        ).hit(Hit::Activate(nfields)));
         body.push(line(
             "[ Cancel ]",
             if ed.focus == nfields + 1 {
@@ -2386,7 +2513,7 @@ impl<D: BlockDevice> App<D> {
             } else {
                 LineKind::Normal
             },
-        ));
+        ).hit(Hit::Activate(nfields + 1)));
         let what = if ed.id.is_some() { "Update" } else { "Insert" };
         Frame {
             title: format!("Row Editor ({what}) — {}", ed.table),
@@ -2409,7 +2536,7 @@ impl<D: BlockDevice> App<D> {
                 "[Tab/↑↓] move  type to edit  [Enter] OK  [Esc] cancel"
             },
             LineKind::Dim,
-        ));
+        ).hit(Hit::Shortcuts));
         body.push(line(
             &format!("Editing '{}' ({})", b.col_name, b.ty.name()),
             LineKind::Accent,
@@ -2426,7 +2553,7 @@ impl<D: BlockDevice> App<D> {
             // Sign toggles are a single character; render them on one line.
             if f.id.is_sign() {
                 let shown = if f.neg { "-" } else { "+" };
-                body.push(line(&format!("{:<14} : {}{}", f.label, shown, caret), kind));
+                body.push(line(&format!("{:<14} : {}{}", f.label, shown, caret), kind).hit(Hit::Focus(i)));
                 continue;
             }
             // Everything else (integer/decimal digits, free text, year,
@@ -2444,7 +2571,7 @@ impl<D: BlockDevice> App<D> {
                     " ".repeat(17) // align under the value (14 label + " : ")
                 };
                 let tail = if ci == last { caret } else { "" };
-                body.push(line(&format!("{head}{chunk}{tail}"), kind));
+                body.push(line(&format!("{head}{chunk}{tail}"), kind).hit(Hit::Focus(i)));
             }
         }
         body.push(line("", LineKind::Normal));
@@ -2458,15 +2585,15 @@ impl<D: BlockDevice> App<D> {
             body.push(line(&format!("⮡ {msg}"), LineKind::Error));
         }
         body.push(line("", LineKind::Normal));
-        if b.has_now() {
+        if let Some(ni) = b.now_index() {
             body.push(line(
                 "[ Now ]",
-                if Some(b.focus) == b.now_index() {
+                if b.focus == ni {
                     LineKind::Selected
                 } else {
                     LineKind::Accent
                 },
-            ));
+            ).hit(Hit::Activate(ni)));
         }
         body.push(line(
             "[ OK ]",
@@ -2475,7 +2602,7 @@ impl<D: BlockDevice> App<D> {
             } else {
                 LineKind::Accent
             },
-        ));
+        ).hit(Hit::Activate(b.ok_index())));
         body.push(line(
             "[ Cancel ]",
             if b.focus == b.cancel_index() {
@@ -2483,7 +2610,7 @@ impl<D: BlockDevice> App<D> {
             } else {
                 LineKind::Normal
             },
-        ));
+        ).hit(Hit::Activate(b.cancel_index())));
         Frame {
             title: format!("Field builder — {} ({})", b.col_name, b.ty.name()),
             bg: fbm::C_BG_EDIT,
@@ -2503,7 +2630,7 @@ impl<D: BlockDevice> App<D> {
         body.push(line(
             "[a]dd [r]ename [x]drop col [u]niq [,/.] reorder [k]add fk [K]drop fk [R]ef cols [D]rop table [Esc]back",
             LineKind::Dim,
-        ));
+        ).hit(Hit::Shortcuts));
         body.push(line("", LineKind::Normal));
         if let Some(t) = &t {
             for (i, c) in t.columns.iter().enumerate() {
@@ -2521,7 +2648,7 @@ impl<D: BlockDevice> App<D> {
                     } else {
                         LineKind::Normal
                     },
-                ));
+                ).hit(Hit::Focus(i)));
             }
             body.push(line("", LineKind::Normal));
             body.push(line("Foreign keys:", LineKind::Accent));
@@ -2554,7 +2681,7 @@ impl<D: BlockDevice> App<D> {
         body.push(line(
             "[↑↓] column  [Enter/Space] toggle  [,/.] reorder  [c]lear  [Esc] back",
             LineKind::Dim,
-        ));
+        ).hit(Hit::Shortcuts));
         body.push(line("", LineKind::Normal));
         body.push(line(
             "Reference columns — this row's label wherever it is referenced elsewhere.",
@@ -2576,7 +2703,7 @@ impl<D: BlockDevice> App<D> {
                     } else {
                         LineKind::Normal
                     },
-                ));
+                ).hit(Hit::Activate(i)));
             }
         }
         body.push(line("", LineKind::Normal));
@@ -2621,7 +2748,7 @@ impl<D: BlockDevice> App<D> {
                 line(&title, LineKind::Accent),
                 line(&format!("> {buf}_"), LineKind::Normal),
                 line("", LineKind::Normal),
-                line("[Enter] accept   [Esc] cancel", LineKind::Dim),
+                line("[Enter] accept   [Esc] cancel", LineKind::Dim).hit(Hit::Shortcuts),
             ],
             status,
             cell_hls: Vec::new(),
@@ -2640,7 +2767,7 @@ impl<D: BlockDevice> App<D> {
         };
         let mut body = alloc::vec![
             line(&title, LineKind::Accent),
-            line("[↑↓] select  [Enter] choose  [Esc] cancel", LineKind::Dim),
+            line("[↑↓] select  [Enter] choose  [Esc] cancel", LineKind::Dim).hit(Hit::Shortcuts),
             line("", LineKind::Normal),
         ];
         for (i, o) in options.iter().enumerate() {
@@ -2651,7 +2778,7 @@ impl<D: BlockDevice> App<D> {
                 } else {
                     LineKind::Normal
                 },
-            ));
+            ).hit(Hit::Activate(i)));
         }
         Frame {
             title: "Pick".into(),
@@ -2674,7 +2801,7 @@ impl<D: BlockDevice> App<D> {
                 line("", LineKind::Normal),
                 line(&msg, LineKind::Error),
                 line("", LineKind::Normal),
-                line("[Enter] = confirm     [Esc] = cancel  (default: cancel)", LineKind::Dim),
+                line("[Enter] = confirm     [Esc] = cancel  (default: cancel)", LineKind::Dim).hit(Hit::Shortcuts),
             ],
             status,
             cell_hls: Vec::new(),
@@ -2690,7 +2817,7 @@ impl<D: BlockDevice> App<D> {
         body.push(line(
             "[↑↓] select drive   [r] re-enumerate   [Esc] back",
             LineKind::Dim,
-        ));
+        ).hit(Hit::Shortcuts));
         body.push(line(
             "Read-only diagnostic. No writes happen here; TablesOS only ever uses the disk it booted from.",
             LineKind::Dim,
@@ -2698,7 +2825,7 @@ impl<D: BlockDevice> App<D> {
         body.push(line("", LineKind::Normal));
 
         for (i, d) in drives.iter().enumerate().skip(top) {
-            push_drive_card(&mut body, d, i == sel);
+            push_drive_card(&mut body, d, i == sel, i);
         }
 
         Frame {
@@ -2719,7 +2846,7 @@ impl<D: BlockDevice> App<D> {
         body.push(line(
             "[↑↓ PgUp/Dn] select   [Enter] inspect xHCI   [r] re-enumerate   [t] test 1s delay   [Esc] back",
             LineKind::Dim,
-        ));
+        ).hit(Hit::Shortcuts));
         body.push(line(
             "PCI bus enumeration. The kernel currently only drives legacy IDE — xHCI / AHCI / NVMe are listed but not used.",
             LineKind::Dim,
@@ -2764,7 +2891,7 @@ impl<D: BlockDevice> App<D> {
                 } else {
                     LineKind::Normal
                 },
-            ));
+            ).hit(Hit::Activate(i)));
         }
         body.push(line("", LineKind::Normal));
         body.push(line("Selected device:", LineKind::Accent));
@@ -2862,7 +2989,7 @@ impl<D: BlockDevice> App<D> {
         body.push(line(
             "[r] re-read  [b] up  [e] enable-slot  [a] addr+desc  [c] config-desc  [g] configure EPs  [m] MSC probe  [w] write+verify  [Esc] back",
             LineKind::Dim,
-        ));
+        ).hit(Hit::Shortcuts));
         body.push(line(
             "Pipeline: [b]→[e]→[a]→[c]→[g]→[m]→[w] BlockDevice write+read round-trip on LBA 1 (phase 7).",
             LineKind::Dim,
@@ -3386,7 +3513,7 @@ impl<D: BlockDevice> App<D> {
         body.push(line(
             "[↑↓] select  [Enter] use this drive  [Esc] cancel",
             LineKind::Dim,
-        ));
+        ).hit(Hit::Shortcuts));
         body.push(line(
             "Picks a USB drive to overwrite with a fresh TablesOS image. The booted disk is excluded automatically.",
             LineKind::Dim,
@@ -3410,7 +3537,7 @@ impl<D: BlockDevice> App<D> {
                     d.lba28_sectors / 2048
                 ),
                 head,
-            ));
+            ).hit(Hit::Activate(i)));
             let mbr_desc = match &d.mbr {
                 MbrInfo::TablesOs { version, sys_guid, .. } => alloc::format!(
                     "  currently: TablesOS disk (OS/loader v{})  GUID {}",
@@ -3445,7 +3572,7 @@ impl<D: BlockDevice> App<D> {
         body.push(line(
             "[Enter] or [Esc] back to Table List",
             LineKind::Dim,
-        ));
+        ).hit(Hit::Shortcuts));
         body.push(line("", LineKind::Normal));
         body.push(line(
             &format!("Install report — target USB slot {}", report.target_slot),
@@ -3502,7 +3629,7 @@ impl<D: BlockDevice> App<D> {
             _ => unreachable!(),
         };
         let mut body = Vec::new();
-        body.push(line("[↑↓ PgUp/PgDn] scroll   [Esc] back", LineKind::Dim));
+        body.push(line("[↑↓ PgUp/PgDn] scroll   [Esc] back", LineKind::Dim).hit(Hit::Shortcuts));
         body.push(line("", LineKind::Normal));
         let vis = visible_rows();
         for tl in about_lines().into_iter().skip(top).take(vis) {
@@ -3631,14 +3758,107 @@ enum LineKind {
     Accent,
 }
 
+/// What a mouse click on a body line does. Co-located with the line so the
+/// layout code that emits a row is the single source of truth for *where* that
+/// row sits and *what* clicking it means — the click handler never re-derives
+/// the screen geometry (the drift that used to make clicks land on the wrong
+/// row).
+#[derive(Clone, Copy)]
+enum Hit {
+    /// Inert: clicking this line does nothing.
+    None,
+    /// Select item `i` (move the cursor / focus) without activating it.
+    Focus(usize),
+    /// Select item `i` and act as if Enter were pressed on it.
+    Activate(usize),
+    /// A key-hint bar: the bracketed `[…]` token under the pointer resolves to
+    /// a key and is injected, so each shortcut is clickable.
+    Shortcuts,
+}
+
 struct TextLine {
     text: String,
     kind: LineKind,
+    hit: Hit,
+}
+impl TextLine {
+    /// Attach a click target (builder-style, for the layout code).
+    fn hit(mut self, h: Hit) -> TextLine {
+        self.hit = h;
+        self
+    }
 }
 fn line(t: &str, kind: LineKind) -> TextLine {
     TextLine {
         text: t.to_string(),
         kind,
+        hit: Hit::None,
+    }
+}
+
+/// One body line's click target, captured from the last rendered frame for the
+/// click handler. `text` is only populated for `Hit::Shortcuts`, where the
+/// `[…]` token under the pointer has to be parsed.
+struct ClickRow {
+    hit: Hit,
+    text: String,
+}
+
+/// Resolve a click at character column `cc` on a key-hint line to the key it
+/// names. A "hot word" runs from a `[` to the next space, so `[c]reate` is
+/// clickable across the whole word; the text inside the brackets names the
+/// key. Multi-key navigation hints (`[↑↓]`, `[Tab/↑↓]`, `[,/.]`) name no single
+/// action and resolve to nothing.
+fn shortcut_at(text: &str, cc: usize) -> Option<Key> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '[' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        let mut tok = String::new();
+        while j < chars.len() && chars[j] != ']' {
+            tok.push(chars[j]);
+            j += 1;
+        }
+        // The hot word extends past the closing bracket to the next space.
+        let mut end = (j + 1).min(chars.len());
+        while end < chars.len() && chars[end] != ' ' {
+            end += 1;
+        }
+        if (i..end).contains(&cc) {
+            return key_for_token(&tok);
+        }
+        i = end;
+    }
+    None
+}
+
+/// Map the text inside a `[…]` hint to a key, or `None` for anything that is
+/// not a single unambiguous action.
+fn key_for_token(tok: &str) -> Option<Key> {
+    match tok {
+        "Enter" | "Enter/Space" => return Some(Key::Enter),
+        "Esc" => return Some(Key::Esc),
+        "Del" => return Some(Key::Delete),
+        "Tab" => return Some(Key::Tab),
+        "Space" => return Some(Key::Char(' ')),
+        "→" => return Some(Key::Right),
+        "←" => return Some(Key::Left),
+        "↑" => return Some(Key::Up),
+        "↓" => return Some(Key::Down),
+        _ => {}
+    }
+    // A lone character is a literal shortcut (`c`, `D`, `,`, …); anything longer
+    // is a multi-key hint with no single action.
+    let mut it = tok.chars();
+    let c = it.next()?;
+    if it.next().is_none() && !matches!(c, '↑' | '↓' | '←' | '→') {
+        Some(Key::Char(c))
+    } else {
+        None
     }
 }
 
@@ -3713,7 +3933,7 @@ fn pci_visible_rows() -> usize {
 /// `LineKind::Selected` (full-row highlight) when this drive is the cursor
 /// target; subsequent detail lines are always normal so the highlight just
 /// names the focused card without smearing across all its details.
-fn push_drive_card(body: &mut Vec<TextLine>, d: &DriveInfo, selected: bool) {
+fn push_drive_card(body: &mut Vec<TextLine>, d: &DriveInfo, selected: bool, idx: usize) {
     let header_kind = if selected {
         LineKind::Selected
     } else {
@@ -3723,7 +3943,7 @@ fn push_drive_card(body: &mut Vec<TextLine>, d: &DriveInfo, selected: bool) {
         body.push(line(
             &format!("[{}]  (no device)", d.slot),
             header_kind,
-        ));
+        ).hit(Hit::Focus(idx)));
         body.push(line("", LineKind::Normal));
         return;
     }
@@ -3731,7 +3951,7 @@ fn push_drive_card(body: &mut Vec<TextLine>, d: &DriveInfo, selected: bool) {
     body.push(line(
         &format!("[{}]  {}{}", d.slot, d.model, booted_tag),
         header_kind,
-    ));
+    ).hit(Hit::Focus(idx)));
     body.push(line(
         &format!(
             "  serial: {}    firmware: {}",
@@ -3877,10 +4097,15 @@ fn describe(e: &StoreError) -> String {
     }
 }
 
-fn column_for_error(cols: &[Column], e: &StoreError) -> usize {
+fn column_for_error(cols: &[Column], fks: &[ForeignKey], e: &StoreError) -> usize {
     let name = match e {
         StoreError::NullViolation { column } | StoreError::UniqueViolation { column } => {
             Some(column.as_str())
+        }
+        // A foreign-key violation names the *FK*, not the column; map it back
+        // to the FK's source column so the error lands under that field.
+        StoreError::ForeignKeyViolation { fk } => {
+            fks.iter().find(|f| f.name == *fk).map(|f| f.from_col.as_str())
         }
         _ => None,
     };

@@ -16,6 +16,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod seed;
+
 const KERNEL_ELF: &str = env!("CARGO_BIN_FILE_KERNEL_kernel");
 
 const SECTOR: usize = 512;
@@ -103,6 +105,16 @@ fn main() {
     let vol_sectors = IMG_SECTORS - data_lba;
     let mut st = tablestore::Store::format(tablestore::MemBlockDevice::new(vol_sectors))
         .expect("format in-memory volume");
+    // Optionally fill the volume with the test dataset (`--seed`), so the
+    // booted system comes up populated. Done before the snapshot below, so the
+    // seeded rows are baked into the image exactly like any formatted volume.
+    if std::env::args().any(|a| a == "--seed") {
+        let stats = seed::seed(&mut st).expect("seed test data");
+        println!(
+            "seeded volume: {} addresses, {} people, {} distances, {} notes",
+            stats.addresses, stats.people, stats.distances, stats.notes
+        );
+    }
     let vol = st.device_mut().snapshot();
     let voff = data_lba as usize * SECTOR;
     assert_eq!(vol.len(), img.len() - voff, "volume size mismatch");

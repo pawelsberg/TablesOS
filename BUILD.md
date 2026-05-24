@@ -26,9 +26,37 @@ cargo run
 # Only build the flashable image (no QEMU).
 cargo run -- --no-run
 
+# Build an image pre-loaded with a test dataset, then boot it. Add --no-run to
+# just write the seeded image. See "Test data" below.
+cargo run -- --seed
+cargo run -- --seed --no-run
+
 # Run the engine's unit tests on the host (no emulator needed).
 cargo test -p tablestore
 ```
+
+## Test data (`--seed`)
+
+`--seed` fills the volume with a representative, foreign-key-linked dataset
+before it is laid into the image, so the GUI comes up populated:
+
+| Table       | Rows | Columns                                                                                | Reference label      |
+|-------------|------|----------------------------------------------------------------------------------------|----------------------|
+| `addresses` | 100  | `id` (unique), `name`                                                                  | `name`               |
+| `people`    | 200  | `id` (unique), `firstname`, `surname`, `address_id` → `addresses.id`                   | `firstname` `surname`|
+| `distances` | 20   | `id` (unique), `from_address_id` / `to_address_id` → `addresses.id`, `distance_miles`  | `distance_miles`     |
+| `notes`     | 500  | `id` (unique), `note`, `timestamp`                                                     | (default)            |
+
+The **reference label** is the ordered set of columns shown wherever a row
+appears as a reference (FK cells in the Browser, FK fields and relationships in
+Row View) — so e.g. `people.address_id` renders as `name:High Road` rather than
+the raw id.
+
+Seeding happens at build time (in `src/seed.rs`, via the same `tablestore`
+engine the kernel runs), so it survives the image rebuild that every `cargo
+run` performs. A plain `cargo run` builds an **empty** volume; pass `--seed`
+whenever you want the data. The dataset logic lives in
+[`src/seed.rs`](src/seed.rs) — edit there to change counts or columns.
 
 The bootable image is written to `target/tablesos.img`. It is **one raw
 device** — `[custom MBR | stage 2 | kernel | TablesOS volume]`, no partition
