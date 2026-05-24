@@ -23,6 +23,7 @@ use crate::ata::{self, DriveInfo, MbrInfo};
 use crate::font::{self, Font};
 use crate::framebuffer::{self as fbm, Rgb, CELL_H, CELL_W};
 use crate::install::{self, InstallReport};
+use crate::interrupts;
 use crate::pci::{self, PciDevice};
 use crate::ps2::{self, Event, Key};
 use crate::rtc;
@@ -36,6 +37,14 @@ const MARGIN: usize = CELL_W; // one-cell border
 // lines (rather than truncating them). Matches the value column the builder
 // lays out after its 17-char label prefix.
 const BUILDER_WRAP: usize = 60;
+
+// Table Browser column sizing. Each column slot is its content width plus a
+// one-char gap. `DEFAULT_COL_W` is the content width used when a column has no
+// per-column [`display_width`](tablestore::schema::Column::display_width); the
+// editor clamps an explicit width to `MIN_COL_W..=MAX_COL_W`.
+const DEFAULT_COL_W: usize = 15;
+const MIN_COL_W: u16 = 1;
+const MAX_COL_W: u16 = 120;
 
 // Sci-fi HUD geometry. Body text lives inside a corner-bracketed panel, framed
 // by a glowing title bar above and a status bar below.
@@ -63,6 +72,9 @@ enum Action {
     DropFk(String),
     AddColPickType(String, String), // table, new column name
     RenameColumn(String, String),   // table, current column name
+    /// Set a column's Table Browser display width; the entered number (blank
+    /// clears it to the default) comes from the prompt when it resolves.
+    SetDisplayWidth(String, String), // table, column name
     AddFkPickFrom(String),
     AddFkPickToTable(String, String), // table, from_col
     AddFkPickToCol(String, String, String), // table, from_col, to_table
@@ -115,6 +127,8 @@ enum Screen {
     Prompt {
         title: String,
         buf: String,
+        /// Insertion caret into `buf` (char index).
+        caret: usize,
         action: Action,
     },
     Pick {
@@ -167,6 +181,9 @@ enum Screen {
 struct Field {
     value: String,
     is_null: bool,
+    /// Insertion caret, a char index in `0..=value.chars().count()`. The text
+    /// inputs all carry one so the arrow keys can navigate within a value.
+    caret: usize,
 }
 
 struct Editor {
@@ -210,6 +227,8 @@ struct PartField {
     label: &'static str,
     buf: String,
     neg: bool,
+    /// Insertion caret into `buf` (char index). Sign-only parts ignore it.
+    caret: usize,
 }
 
 impl PartId {
@@ -279,6 +298,7 @@ impl FieldBuilder {
             label,
             buf: String::new(),
             neg: false,
+            caret: 0,
         };
         let date = || alloc::vec![f(PartId::Year, "Year"), f(PartId::Month, "Month"), f(PartId::Day, "Day")];
         let time = || {
@@ -360,6 +380,7 @@ impl FieldBuilder {
 
     fn set(&mut self, id: PartId, buf: String, neg: bool) {
         if let Some(f) = self.fields.iter_mut().find(|f| f.id == id) {
+            f.caret = buf.chars().count();
             f.buf = buf;
             f.neg = neg;
         }
@@ -527,27 +548,26 @@ pub fn run<D: BlockDevice>(
         last_usb_test: None,
         hitmap: Vec::new(),
         row_cache: None,
+        cursor_on: true,
+        last_blink: interrupts::ticks(),
     };
     app.render();
     loop {
-        let Some(first) = ps2::poll() else {
-            x86_64::instructions::hlt();
-            continue;
-        };
         // A full repaint blits the whole framebuffer, so doing one per input
         // event makes fast key-repeat (held arrows) enqueue faster than we can
         // draw — the screen appears to freeze under the backlog. Instead drain
         // every pending event, applying each, and repaint just once at the end.
         // We out-poll the input IRQs comfortably, so the queue empties promptly.
-        let mut ev = Some(first);
         let mut repaint = false;
+        let mut interacted = false;
         let mut moved_to: Option<(usize, usize)> = None;
-        while let Some(e) = ev {
+        while let Some(e) = ps2::poll() {
             match e {
                 Event::MouseMove(x, y) => moved_to = Some((x, y)),
                 Event::Click(x, y) => {
                     app.on_click(x, y);
                     repaint = true;
+                    interacted = true;
                 }
                 Event::RightClick => {
                     app.on_right_click();
@@ -556,9 +576,27 @@ pub fn run<D: BlockDevice>(
                 Event::Key(k) => {
                     app.on_key(k);
                     repaint = true;
+                    interacted = true;
                 }
             }
-            ev = ps2::poll();
+        }
+        // After typing or clicking, show the caret solid and restart its blink,
+        // so it's steady while you work and only blinks once you pause — the
+        // conventional behaviour.
+        if interacted {
+            app.cursor_on = true;
+            app.last_blink = interrupts::ticks();
+        }
+        // Blink: while a text field is focused, flip the caret on a fixed
+        // cadence. The ~18 Hz timer IRQ already wakes the `hlt` below, so this
+        // costs one repaint per half-period and nothing while idle elsewhere.
+        if !repaint && app.has_text_cursor() {
+            let now = interrupts::ticks();
+            if now.wrapping_sub(app.last_blink) >= BLINK_TICKS {
+                app.last_blink = now;
+                app.cursor_on = !app.cursor_on;
+                repaint = true;
+            }
         }
         if repaint {
             // render() stamps the pointer at the current position itself, so a
@@ -566,9 +604,16 @@ pub fn run<D: BlockDevice>(
             app.render();
         } else if let Some((x, y)) = moved_to {
             app.draw_cursor(x, y);
+        } else {
+            // Idle: sleep until the next IRQ (input or the ~18 Hz timer tick,
+            // which paces the blink).
+            x86_64::instructions::hlt();
         }
     }
 }
+
+/// Caret blink half-period, in PIT ticks (~18.2 Hz). ≈9 ticks ≈ 0.5 s.
+const BLINK_TICKS: u64 = 9;
 
 struct App<D: BlockDevice> {
     store: Store<D>,
@@ -594,6 +639,11 @@ struct App<D: BlockDevice> {
     /// making navigation crawl. Reused while the table, filter, sort and store
     /// generation all match; any commit bumps the generation and invalidates it.
     row_cache: Option<RowCache>,
+    /// Text-caret blink phase (drawn when true) and the PIT tick at which it
+    /// last flipped. The ~18 Hz timer IRQ wakes the idle `hlt` loop, which
+    /// toggles this on a fixed cadence while a text field is focused.
+    cursor_on: bool,
+    last_blink: u64,
 }
 
 /// A decoded Browser row list, tagged with everything that would make it stale.
@@ -619,6 +669,18 @@ impl<D: BlockDevice> App<D> {
     }
     fn err(&mut self, e: StoreError) {
         self.status = describe(&e);
+    }
+
+    /// Is a text field currently focused (so the blinking caret should run)?
+    /// Mirrors which screens `build_frame` sets `Frame::cursor` for: the editor
+    /// and builder when on a field (not the OK/Cancel buttons), and the prompt.
+    fn has_text_cursor(&self) -> bool {
+        match self.stack.last() {
+            Some(Screen::Editor(ed)) => ed.focus < ed.cols.len(),
+            Some(Screen::Builder(b)) => b.focus < b.fields.len(),
+            Some(Screen::Prompt { .. }) => true,
+            _ => false,
+        }
     }
 
     // ---- input -----------------------------------------------------------
@@ -682,6 +744,7 @@ impl<D: BlockDevice> App<D> {
                         nav = Nav::Push(Screen::Prompt {
                             title: "New table name".into(),
                             buf: String::new(),
+                            caret: 0,
                             action: Action::CreateTable,
                         });
                     }
@@ -888,6 +951,7 @@ impl<D: BlockDevice> App<D> {
                         nav = Nav::Push(Screen::Prompt {
                             title: "New column name".into(),
                             buf: String::new(),
+                            caret: 0,
                             action: Action::AddColPickType(table.clone(), String::new()),
                         })
                     }
@@ -902,8 +966,25 @@ impl<D: BlockDevice> App<D> {
                         let c = t.as_ref().unwrap().columns[sel].name.clone();
                         nav = Nav::Push(Screen::Prompt {
                             title: format!("Rename column '{c}' to"),
+                            caret: c.chars().count(),
                             buf: c.clone(),
                             action: Action::RenameColumn(table.clone(), c),
+                        });
+                    }
+                    Key::Char('w') if n > 0 => {
+                        let col = &t.as_ref().unwrap().columns[sel];
+                        let buf = col
+                            .display_width
+                            .map(|w| w.to_string())
+                            .unwrap_or_default();
+                        nav = Nav::Push(Screen::Prompt {
+                            title: format!(
+                                "Browser width for '{}' (blank = default)",
+                                col.name
+                            ),
+                            caret: buf.chars().count(),
+                            buf,
+                            action: Action::SetDisplayWidth(table.clone(), col.name.clone()),
                         });
                     }
                     Key::Char('u') if n > 0 => {
@@ -1349,7 +1430,7 @@ impl<D: BlockDevice> App<D> {
     fn key_prompt(&mut self, k: Key) {
         let mut done: Option<(Action, String)> = None;
         {
-            let Screen::Prompt { buf, action, .. } = self.top() else {
+            let Screen::Prompt { buf, caret, action, .. } = self.top() else {
                 return;
             };
             match k {
@@ -1357,10 +1438,17 @@ impl<D: BlockDevice> App<D> {
                     self.pop();
                     return;
                 }
+                Key::Left => ce_left(buf, caret),
+                Key::Right => ce_right(buf, caret),
+                Key::Home => *caret = 0,
+                Key::End => *caret = buf.chars().count(),
                 Key::Backspace => {
-                    buf.pop();
+                    ce_backspace(buf, caret);
                 }
-                Key::Char(c) => buf.push(c),
+                Key::Delete => {
+                    ce_delete(buf, caret);
+                }
+                Key::Char(c) => ce_insert(buf, caret, c),
                 Key::Enter => done = Some((action.clone(), buf.clone())),
                 _ => {}
             }
@@ -1460,6 +1548,32 @@ impl<D: BlockDevice> App<D> {
                     Err(e) => self.err(e),
                 }
             }
+            Action::SetDisplayWidth(table, col) => {
+                let trimmed = text.trim();
+                let width = if trimmed.is_empty() {
+                    None
+                } else {
+                    match trimmed.parse::<u32>() {
+                        Ok(w) => Some(
+                            w.clamp(MIN_COL_W as u32, MAX_COL_W as u32) as u16,
+                        ),
+                        Err(_) => {
+                            self.status =
+                                "width must be a whole number (blank to clear)".into();
+                            return;
+                        }
+                    }
+                };
+                match self.store.set_display_width(&table, &col, width) {
+                    Ok(_) => {
+                        self.status = match width {
+                            Some(w) => format!("'{col}' browser width set to {w}"),
+                            None => format!("'{col}' browser width reset to default"),
+                        }
+                    }
+                    Err(e) => self.err(e),
+                }
+            }
             _ => {}
         }
     }
@@ -1475,6 +1589,7 @@ impl<D: BlockDevice> App<D> {
                     ty,
                     nullable: true,
                     unique: false,
+                    display_width: None,
                 };
                 match self.store.add_column(&table, col) {
                     Ok(_) => self.status = "column added (nullable)".into(),
@@ -1591,7 +1706,7 @@ impl<D: BlockDevice> App<D> {
                 Some(None) => (String::new(), true),
                 None => (String::new(), c.nullable),
             };
-            fields.push(Field { value, is_null });
+            fields.push(Field { caret: value.chars().count(), value, is_null });
         }
         Some(Screen::Editor(Editor {
             table: table.to_string(),
@@ -1612,28 +1727,45 @@ impl<D: BlockDevice> App<D> {
                 return;
             };
             let nf = ed.cols.len();
+            let on_field = ed.focus < nf;
             match k {
                 Key::Esc => want_cancel = true,
+                // Tab and ↑/↓ move between fields (and the OK/Cancel buttons);
+                // ←/→/Home/End now navigate *within* the focused field's text.
                 Key::Tab | Key::Down => ed.focus = (ed.focus + 1) % (nf + 2),
                 Key::Up => ed.focus = (ed.focus + nf + 1) % (nf + 2),
-                Key::Delete if ed.focus < nf && ed.cols[ed.focus].nullable => {
+                Key::Left if on_field => {
+                    let f = &mut ed.fields[ed.focus];
+                    ce_left(&f.value, &mut f.caret);
+                }
+                Key::Right if on_field => {
+                    let f = &mut ed.fields[ed.focus];
+                    ce_right(&f.value, &mut f.caret);
+                }
+                Key::Home if on_field => ed.fields[ed.focus].caret = 0,
+                Key::End if on_field => {
+                    let f = &mut ed.fields[ed.focus];
+                    f.caret = f.value.chars().count();
+                }
+                Key::Delete if on_field && ed.cols[ed.focus].nullable => {
                     let f = &mut ed.fields[ed.focus];
                     f.is_null = !f.is_null;
                 }
-                // `→` on any field opens the structured value builder (part
-                // fields, plus "fill current value" for the date/time types).
-                Key::Right if ed.focus < nf => {
+                // `→` is now caret movement, so the structured value builder
+                // (part fields, plus "fill current value" for date/time types)
+                // opens with PgDn instead.
+                Key::PageDown if on_field => {
                     want_parts = Some(ed.focus);
                 }
-                Key::Backspace if ed.focus < nf => {
+                Key::Backspace if on_field => {
                     let f = &mut ed.fields[ed.focus];
                     f.is_null = false;
-                    f.value.pop();
+                    ce_backspace(&mut f.value, &mut f.caret);
                 }
-                Key::Char(c) if ed.focus < nf => {
+                Key::Char(c) if on_field => {
                     let f = &mut ed.fields[ed.focus];
                     f.is_null = false;
-                    f.value.push(c);
+                    ce_insert(&mut f.value, &mut f.caret, c);
                 }
                 Key::Enter => {
                     if ed.focus == nf + 1 {
@@ -1692,11 +1824,31 @@ impl<D: BlockDevice> App<D> {
                 // `n` fills the current value — but only for the date/time
                 // types; for a string field `n` is a literal to be typed.
                 Key::Char('n') | Key::Char('N') if b.has_now() => want_now = true,
-                Key::Backspace if b.focus < nf => {
-                    b.fields[b.focus].buf.pop();
-                }
+                // On a sign part ←/→ flip the sign; on a typed part they move
+                // the caret. (The sign arm is listed first so it wins.)
                 Key::Left | Key::Right if b.focus < nf && b.fields[b.focus].id.is_sign() => {
                     b.fields[b.focus].neg = !b.fields[b.focus].neg;
+                }
+                Key::Left if b.focus < nf => {
+                    let f = &mut b.fields[b.focus];
+                    ce_left(&f.buf, &mut f.caret);
+                }
+                Key::Right if b.focus < nf => {
+                    let f = &mut b.fields[b.focus];
+                    ce_right(&f.buf, &mut f.caret);
+                }
+                Key::Home if b.focus < nf => b.fields[b.focus].caret = 0,
+                Key::End if b.focus < nf => {
+                    let f = &mut b.fields[b.focus];
+                    f.caret = f.buf.chars().count();
+                }
+                Key::Backspace if b.focus < nf => {
+                    let f = &mut b.fields[b.focus];
+                    ce_backspace(&mut f.buf, &mut f.caret);
+                }
+                Key::Delete if b.focus < nf => {
+                    let f = &mut b.fields[b.focus];
+                    ce_delete(&mut f.buf, &mut f.caret);
                 }
                 Key::Char(c) if b.focus < nf => {
                     let f = &mut b.fields[b.focus];
@@ -1709,9 +1861,9 @@ impl<D: BlockDevice> App<D> {
                     } else if f.id == PartId::Year && (c == '-' || c == '+') {
                         f.neg = c == '-';
                     } else if f.id.is_text() {
-                        f.buf.push(c);
-                    } else if c.is_ascii_digit() && f.buf.len() < f.id.max_digits() {
-                        f.buf.push(c);
+                        ce_insert(&mut f.buf, &mut f.caret, c);
+                    } else if c.is_ascii_digit() && f.buf.chars().count() < f.id.max_digits() {
+                        ce_insert(&mut f.buf, &mut f.caret, c);
                     }
                 }
                 Key::Enter => {
@@ -1757,6 +1909,7 @@ impl<D: BlockDevice> App<D> {
                 self.pop(); // remove the placeholder, back to the editor
                 if let Screen::Editor(ed) = self.top() {
                     if let Some(f) = ed.fields.get_mut(fi) {
+                        f.caret = disp.chars().count();
                         f.value = disp;
                         f.is_null = false;
                     }
@@ -2086,6 +2239,8 @@ impl<D: BlockDevice> App<D> {
             .collect();
         let (mx, my) = ps2::mouse_pos();
         let readout = self.hud_readout();
+        // The text caret is a blinking overlay: only painted on the "on" phase.
+        let cursor = if self.cursor_on { frame.cursor } else { None };
         fbm::with(|d| {
             let (w, h) = (d.width(), d.height());
 
@@ -2180,6 +2335,13 @@ impl<D: BlockDevice> App<D> {
                 } else {
                     d.draw_text(BODY_X, y, &line.text, color, Font::Body);
                 }
+                // Blinking insertion caret: a 2px vertical bar at the cell, drawn
+                // over the text so it sits between glyphs without shifting them.
+                if let Some((cl, cc)) = cursor {
+                    if cl == li {
+                        d.fill_rect(BODY_X + cc * CELL_W, y, fbm::SCALE, CELL_H, fbm::C_FG);
+                    }
+                }
                 y += CELL_H;
             }
 
@@ -2263,6 +2425,7 @@ impl<D: BlockDevice> App<D> {
             body,
             status,
             cell_hls: Vec::new(),
+            cursor: None,
         }
     }
 
@@ -2280,6 +2443,18 @@ impl<D: BlockDevice> App<D> {
             _ => unreachable!(),
         };
         let schema = self.store.get_table(&table).ok();
+        // Per-column content width: the configured display width, or the
+        // default. The on-screen slot is one wider, for the gap between columns.
+        let widths: Vec<usize> = schema
+            .as_ref()
+            .map(|t| {
+                t.columns
+                    .iter()
+                    .map(|c| c.display_width.map(|w| w as usize).unwrap_or(DEFAULT_COL_W))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let content_w = |ci: usize| widths.get(ci).copied().unwrap_or(DEFAULT_COL_W);
         let mut body = Vec::new();
         body.push(line(
             "[↑↓←→] cell  [PgUp/Dn] page  [Enter] row  [i]nsert [u]pdate [d]elete  [o]rder  [s]chema  [Esc] back",
@@ -2299,7 +2474,10 @@ impl<D: BlockDevice> App<D> {
                     Some((sc, false)) if sc == ci => " ↓",
                     _ => "",
                 };
-                let _ = write!(hdr, "{:<16}", format!("{}{}{}", c.name, fk_mark, sort_mark));
+                hdr.push_str(&cell_pad(
+                    &format!("{}{}{}", c.name, fk_mark, sort_mark),
+                    content_w(ci),
+                ));
             }
             body.push(line(&hdr, LineKind::Accent));
             hdr_line_idx = Some(body.len() - 1);
@@ -2342,15 +2520,17 @@ impl<D: BlockDevice> App<D> {
                     Some(v) => {
                         // FK columns: show the referenced row's label if resolvable.
                         match fk_cell_labels.iter().find(|(f, _)| *f == ci) {
-                            Some((_, map)) => match map.get(&v.display()) {
-                                Some(lbl) => trunc(lbl, 15),
-                                None => trunc(&v.display(), 15),
-                            },
-                            None => trunc(&v.display(), 15),
+                            Some((_, map)) => map
+                                .get(&v.display())
+                                .cloned()
+                                .unwrap_or_else(|| v.display()),
+                            None => v.display(),
                         }
                     }
                 };
-                let _ = write!(s, "{:<16}", txt);
+                // Per-column display width: wider values are truncated here, in
+                // the grid only — the stored value is untouched.
+                s.push_str(&cell_pad(&txt, content_w(ci)));
             }
             body.push(line(
                 &s,
@@ -2369,14 +2549,16 @@ impl<D: BlockDevice> App<D> {
         }
         // Column cursor: brighter rectangle on the selected column, both in
         // the header (always shown if there is a schema) and at the selected
-        // cell within the highlighted row. 16 chars = one column slot.
+        // cell within the highlighted row. The slot is the column's content
+        // width plus the one-char gap; its x is the sum of the slots before it.
         let mut cell_hls: Vec<(usize, usize, usize, Rgb)> = Vec::new();
-        let col_x = col * 16;
+        let col_x: usize = (0..col).map(|ci| content_w(ci) + 1).sum();
+        let col_slot = content_w(col) + 1;
         if let Some(li) = hdr_line_idx {
-            cell_hls.push((li, col_x, 16, fbm::C_CELL_SEL_FILL));
+            cell_hls.push((li, col_x, col_slot, fbm::C_CELL_SEL_FILL));
         }
         if let Some(li) = row_line_idx {
-            cell_hls.push((li, col_x, 16, fbm::C_CELL_SEL_FILL));
+            cell_hls.push((li, col_x, col_slot, fbm::C_CELL_SEL_FILL));
         }
         let title = match &filter {
             Some((c, v)) => format!("Browser — {table}  (filtered: {c} = {})", trunc(&v.display(), 24)),
@@ -2388,6 +2570,7 @@ impl<D: BlockDevice> App<D> {
             body,
             status,
             cell_hls,
+            cursor: None,
         }
     }
 
@@ -2445,6 +2628,7 @@ impl<D: BlockDevice> App<D> {
             body,
             status,
             cell_hls: Vec::new(),
+            cursor: None,
         }
     }
 
@@ -2454,13 +2638,15 @@ impl<D: BlockDevice> App<D> {
         };
         let nfields = ed.cols.len();
         let mut body = Vec::new();
+        let mut cursor = None;
         body.push(line(
-            "[Tab/↑↓] move  type to edit  [Del] toggle NULL  [→] field builder  [Enter] OK  [Esc] cancel",
+            "[Tab/↑↓] field  [←→] caret  [Home/End]  type to edit  [Del] NULL  [PgDn] builder  [Enter] OK  [Esc] cancel",
             LineKind::Dim,
         ).hit(Hit::Shortcuts));
         body.push(line("", LineKind::Normal));
         for (i, c) in ed.cols.iter().enumerate() {
             let f = &ed.fields[i];
+            let focused = ed.focus == i;
             let nullbox = if c.nullable {
                 if f.is_null {
                     "[x] NULL"
@@ -2471,21 +2657,20 @@ impl<D: BlockDevice> App<D> {
                 "        "
             };
             let shown = if f.is_null { String::new() } else { f.value.clone() };
-            let caret = if ed.focus == i { "_" } else { "" };
-            // Every field can be filled through the structured builder (`→`).
-            let parts_hint = " →";
-            let s = format!(
-                "{:<16} {:<14}{} {} : {}{}",
-                c.name,
-                c.ty.name(),
-                parts_hint,
-                nullbox,
-                trunc(&shown, 48),
-                caret
-            );
+            // The builder is on PgDn now that `→` moves the caret. The fixed
+            // prefix (name/type/null-box) is measured rather than assumed, so a
+            // long column name still places the caret over the right glyph.
+            let prefix = format!("{:<16} {:<14} {} : ", c.name, c.ty.name(), nullbox);
+            let view = if focused {
+                let (v, col) = field_view(&shown, f.caret, 48);
+                cursor = Some((body.len(), prefix.chars().count() + col));
+                v
+            } else {
+                trunc(&shown, 48)
+            };
             body.push(line(
-                &s,
-                if ed.focus == i {
+                &format!("{prefix}{view}"),
+                if focused {
                     LineKind::Selected
                 } else {
                     LineKind::Normal
@@ -2521,6 +2706,7 @@ impl<D: BlockDevice> App<D> {
             body,
             status,
             cell_hls: Vec::new(),
+            cursor,
         }
     }
 
@@ -2529,11 +2715,15 @@ impl<D: BlockDevice> App<D> {
             unreachable!()
         };
         let mut body = Vec::new();
+        let mut cursor = None;
+        // Every part line is `"<label:14> : <value>"`, so the value (and the
+        // caret) begins at this fixed column; continuation lines align under it.
+        const HEAD: usize = 17;
         body.push(line(
             if b.has_now() {
-                "[Tab/↑↓] move  type to edit  [n] = current value  [Enter] OK  [Esc] cancel"
+                "[Tab/↑↓] field  [←→ Home/End] caret  type to edit  [n] = current value  [Enter] OK  [Esc] cancel"
             } else {
-                "[Tab/↑↓] move  type to edit  [Enter] OK  [Esc] cancel"
+                "[Tab/↑↓] field  [←→ Home/End] caret  type to edit  [Enter] OK  [Esc] cancel"
             },
             LineKind::Dim,
         ).hit(Hit::Shortcuts));
@@ -2549,11 +2739,14 @@ impl<D: BlockDevice> App<D> {
             } else {
                 LineKind::Normal
             };
-            let caret = if focused { "_" } else { "" };
-            // Sign toggles are a single character; render them on one line.
+            // Sign toggles are a single character; render them on one line. A
+            // focused sign part carries the cursor right after the sign.
             if f.id.is_sign() {
                 let shown = if f.neg { "-" } else { "+" };
-                body.push(line(&format!("{:<14} : {}{}", f.label, shown, caret), kind).hit(Hit::Focus(i)));
+                if focused {
+                    cursor = Some((body.len(), HEAD + shown.chars().count()));
+                }
+                body.push(line(&format!("{:<14} : {}", f.label, shown), kind).hit(Hit::Focus(i)));
                 continue;
             }
             // Everything else (integer/decimal digits, free text, year,
@@ -2563,15 +2756,25 @@ impl<D: BlockDevice> App<D> {
             let prefix = if f.id == PartId::Year && f.neg { "-" } else { "" };
             let full = format!("{}{}", prefix, f.buf);
             let chunks = wrap(&full, BUILDER_WRAP);
-            let last = chunks.len() - 1;
+            if focused {
+                // Place the cursor on the wrapped line/column its char index
+                // falls on (clamped to the last line at a wrap boundary).
+                let pos = prefix.chars().count() + f.caret;
+                let mut chunk_i = pos / BUILDER_WRAP;
+                let mut col = pos % BUILDER_WRAP;
+                if chunk_i >= chunks.len() {
+                    chunk_i = chunks.len() - 1;
+                    col = BUILDER_WRAP;
+                }
+                cursor = Some((body.len() + chunk_i, HEAD + col));
+            }
             for (ci, chunk) in chunks.iter().enumerate() {
                 let head = if ci == 0 {
-                    format!("{:<14} : ", f.label)
+                    format!("{:<14} : ", f.label) // 14 label + " : " = HEAD
                 } else {
-                    " ".repeat(17) // align under the value (14 label + " : ")
+                    " ".repeat(HEAD) // align continuation under the value
                 };
-                let tail = if ci == last { caret } else { "" };
-                body.push(line(&format!("{head}{chunk}{tail}"), kind).hit(Hit::Focus(i)));
+                body.push(line(&format!("{head}{chunk}"), kind).hit(Hit::Focus(i)));
             }
         }
         body.push(line("", LineKind::Normal));
@@ -2617,6 +2820,7 @@ impl<D: BlockDevice> App<D> {
             body,
             status,
             cell_hls: Vec::new(),
+            cursor,
         }
     }
 
@@ -2628,18 +2832,23 @@ impl<D: BlockDevice> App<D> {
         let t = self.store.get_table(&table).ok();
         let mut body = Vec::new();
         body.push(line(
-            "[a]dd [r]ename [x]drop col [u]niq [,/.] reorder [k]add fk [K]drop fk [R]ef cols [D]rop table [Esc]back",
+            "[a]dd [r]ename [x]drop col [u]niq [w]idth [,/.] reorder [k]add fk [K]drop fk [R]ef cols [D]rop table [Esc]back",
             LineKind::Dim,
         ).hit(Hit::Shortcuts));
         body.push(line("", LineKind::Normal));
         if let Some(t) = &t {
             for (i, c) in t.columns.iter().enumerate() {
+                let width = c
+                    .display_width
+                    .map(|w| w.to_string())
+                    .unwrap_or_else(|| "default".into());
                 let s = format!(
-                    "{:<20} {:<14} {} {}",
+                    "{:<20} {:<14} {} {:<6} w:{}",
                     c.name,
                     c.ty.name(),
                     if c.nullable { "NULL    " } else { "NOT NULL" },
-                    if c.unique { "UNIQUE" } else { "" }
+                    if c.unique { "UNIQUE" } else { "" },
+                    width,
                 );
                 body.push(line(
                     &s,
@@ -2668,6 +2877,7 @@ impl<D: BlockDevice> App<D> {
             body,
             status,
             cell_hls: Vec::new(),
+            cursor: None,
         }
     }
 
@@ -2732,12 +2942,13 @@ impl<D: BlockDevice> App<D> {
             body,
             status,
             cell_hls: Vec::new(),
+            cursor: None,
         }
     }
 
     fn frame_prompt(&mut self, status: String) -> Frame {
-        let (title, buf) = match self.top() {
-            Screen::Prompt { title, buf, .. } => (title.clone(), buf.clone()),
+        let (title, buf, caret) = match self.top() {
+            Screen::Prompt { title, buf, caret, .. } => (title.clone(), buf.clone(), *caret),
             _ => unreachable!(),
         };
         Frame {
@@ -2746,12 +2957,14 @@ impl<D: BlockDevice> App<D> {
             body: alloc::vec![
                 line("", LineKind::Normal),
                 line(&title, LineKind::Accent),
-                line(&format!("> {buf}_"), LineKind::Normal),
+                line(&format!("> {buf}"), LineKind::Normal),
                 line("", LineKind::Normal),
-                line("[Enter] accept   [Esc] cancel", LineKind::Dim).hit(Hit::Shortcuts),
+                line("[←→ Home/End] move   [Enter] accept   [Esc] cancel", LineKind::Dim).hit(Hit::Shortcuts),
             ],
             status,
             cell_hls: Vec::new(),
+            // Input line is body index 2; the "> " prefix is 2 cells wide.
+            cursor: Some((2, 2 + caret)),
         }
     }
 
@@ -2786,6 +2999,7 @@ impl<D: BlockDevice> App<D> {
             body,
             status,
             cell_hls: Vec::new(),
+            cursor: None,
         }
     }
 
@@ -2805,6 +3019,7 @@ impl<D: BlockDevice> App<D> {
             ],
             status,
             cell_hls: Vec::new(),
+            cursor: None,
         }
     }
 
@@ -2834,6 +3049,7 @@ impl<D: BlockDevice> App<D> {
             body,
             status,
             cell_hls: Vec::new(),
+            cursor: None,
         }
     }
 
@@ -2977,6 +3193,7 @@ impl<D: BlockDevice> App<D> {
             body,
             status,
             cell_hls: Vec::new(),
+            cursor: None,
         }
     }
 
@@ -3021,6 +3238,7 @@ impl<D: BlockDevice> App<D> {
                 body,
                 status,
                 cell_hls: Vec::new(),
+                cursor: None,
             };
         }
         body.push(line("", LineKind::Normal));
@@ -3501,6 +3719,7 @@ impl<D: BlockDevice> App<D> {
             body,
             status,
             cell_hls: Vec::new(),
+            cursor: None,
         }
     }
 
@@ -3560,6 +3779,7 @@ impl<D: BlockDevice> App<D> {
             body,
             status,
             cell_hls: Vec::new(),
+            cursor: None,
         }
     }
 
@@ -3620,6 +3840,7 @@ impl<D: BlockDevice> App<D> {
             body,
             status,
             cell_hls: Vec::new(),
+            cursor: None,
         }
     }
 
@@ -3641,6 +3862,7 @@ impl<D: BlockDevice> App<D> {
             body,
             status,
             cell_hls: Vec::new(),
+            cursor: None,
         }
     }
 }
@@ -3844,6 +4066,8 @@ fn key_for_token(tok: &str) -> Option<Key> {
         "Esc" => return Some(Key::Esc),
         "Del" => return Some(Key::Delete),
         "Tab" => return Some(Key::Tab),
+        "PgDn" => return Some(Key::PageDown),
+        "PgUp" => return Some(Key::PageUp),
         "Space" => return Some(Key::Char(' ')),
         "→" => return Some(Key::Right),
         "←" => return Some(Key::Left),
@@ -3871,6 +4095,10 @@ struct Frame {
     /// Painted on top of any row strip and underneath the text, so the text
     /// stays readable. Used to make the Table Browser's column cursor visible.
     cell_hls: Vec<(usize, usize, usize, Rgb)>,
+    /// Text-input caret, `(body_line_idx, char_col_from_BODY_X)`. Drawn as a
+    /// blinking vertical bar at that cell — an overlay that doesn't displace
+    /// text, unlike inserting a glyph. Only the focused text screens set it.
+    cursor: Option<(usize, usize)>,
 }
 
 fn screen_tag(s: &Screen) -> u8 {
@@ -4062,6 +4290,69 @@ fn push_drive_card(body: &mut Vec<TextLine>, d: &DriveInfo, selected: bool, idx:
     body.push(line("", LineKind::Normal));
 }
 
+// ---- single-line text-field editing --------------------------------------
+//
+// The three text inputs (Row Editor fields, the builder's typed parts, the
+// input Prompt) share a `(text, caret)` model where `caret` is a char index in
+// `0..=text.chars().count()`, so the arrow keys navigate identically in each.
+// All work in char units, not bytes, so a stored multi-byte value is safe.
+
+/// Byte offset of char index `idx` in `s` (clamped to `s.len()` at the end).
+fn byte_of(s: &str, idx: usize) -> usize {
+    s.char_indices().nth(idx).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+/// Insert `c` at the caret and step past it.
+fn ce_insert(text: &mut String, caret: &mut usize, c: char) {
+    let at = (*caret).min(text.chars().count());
+    text.insert(byte_of(text, at), c);
+    *caret = at + 1;
+}
+
+/// Delete the char before the caret (Backspace).
+fn ce_backspace(text: &mut String, caret: &mut usize) {
+    let at = (*caret).min(text.chars().count());
+    if at > 0 {
+        text.remove(byte_of(text, at - 1));
+        *caret = at - 1;
+    }
+}
+
+/// Delete the char at the caret (forward Delete).
+fn ce_delete(text: &mut String, caret: &mut usize) {
+    let n = text.chars().count();
+    let at = (*caret).min(n);
+    if at < n {
+        text.remove(byte_of(text, at));
+        *caret = at;
+    }
+}
+
+/// Step the caret one char left.
+fn ce_left(text: &str, caret: &mut usize) {
+    *caret = (*caret).min(text.chars().count()).saturating_sub(1);
+}
+
+/// Step the caret one char right.
+fn ce_right(text: &str, caret: &mut usize) {
+    *caret = (*caret + 1).min(text.chars().count());
+}
+
+/// Window a single-line value to at most `width` glyphs around the caret,
+/// returning `(visible text, caret column within it)`. The caret itself is a
+/// separate blinking overlay, so no glyph is inserted and nothing shifts. The
+/// window right-anchors on the caret once the value overflows, so typing at the
+/// end keeps the tail in view; `caret_col` can equal `width` (just past the
+/// last visible glyph, at the right edge).
+fn field_view(text: &str, caret: usize, width: usize) -> (String, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let caret = caret.min(n);
+    let start = if caret > width { caret - width } else { 0 };
+    let end = (start + width).min(n);
+    (chars[start..end].iter().collect(), caret - start)
+}
+
 fn trunc(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
@@ -4070,6 +4361,20 @@ fn trunc(s: &str, n: usize) -> String {
         out.push('…');
         out
     }
+}
+
+/// Render one Table Browser cell: truncate `s` to `content_w` characters (an
+/// over-long value gets a trailing `…`), then pad with spaces to `content_w + 1`
+/// so adjacent columns keep a one-char gap. The result is always exactly
+/// `content_w + 1` columns wide, which is what the column-cursor geometry and
+/// the fixed-width header assume.
+fn cell_pad(s: &str, content_w: usize) -> String {
+    let mut out = trunc(s, content_w);
+    let pad = (content_w + 1).saturating_sub(out.chars().count());
+    for _ in 0..pad {
+        out.push(' ');
+    }
+    out
 }
 
 fn wrap(s: &str, n: usize) -> Vec<String> {

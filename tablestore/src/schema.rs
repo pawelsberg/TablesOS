@@ -17,6 +17,11 @@ pub struct Column {
     pub ty: Type,
     pub nullable: bool,
     pub unique: bool,
+    /// Display width (in characters) for the Table Browser column, or `None`
+    /// for the default width. Purely presentational: stored values are never
+    /// affected — a value wider than this is simply truncated when rendered in
+    /// the browser grid.
+    pub display_width: Option<u16>,
 }
 
 /// `from_col -> to_table.to_col`. `name` is auto-derived but user-visible.
@@ -129,11 +134,26 @@ impl Table {
             put_str(&mut out, &f.to_table);
             put_str(&mut out, &f.to_col);
         }
-        // Reference columns are appended last so an older schema image (which
-        // ends here) decodes with an empty list — see `decode`.
+        // Reference columns are appended after the FKs so an older schema image
+        // (which ends there) decodes with an empty list — see `decode`.
         put_uvarint(&mut out, self.ref_cols.len() as u64);
         for c in &self.ref_cols {
             put_str(&mut out, c);
+        }
+        // Display widths are appended last, as a sparse `(column index, width)`
+        // list — only columns with a width set appear. An image written before
+        // this field ends right after the ref-cols block and decodes with every
+        // width unset.
+        let widths: Vec<(usize, u16)> = self
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| c.display_width.map(|w| (i, w)))
+            .collect();
+        put_uvarint(&mut out, widths.len() as u64);
+        for (i, w) in widths {
+            put_uvarint(&mut out, i as u64);
+            put_uvarint(&mut out, w as u64);
         }
         out
     }
@@ -157,6 +177,7 @@ impl Table {
                 ty,
                 nullable,
                 unique,
+                display_width: None,
             });
         }
         let nfks = get_uvarint(buf, &mut pos)? as usize;
@@ -179,6 +200,19 @@ impl Table {
                 ref_cols.push(get_str(buf, &mut pos)?);
             }
         }
+        // Display widths: a sparse `(column index, width)` list appended after
+        // the ref-cols block. Absent in older images (EOF here), in which case
+        // every width stays unset.
+        if pos < buf.len() {
+            let nw = get_uvarint(buf, &mut pos)? as usize;
+            for _ in 0..nw {
+                let ci = get_uvarint(buf, &mut pos)? as usize;
+                let w = get_uvarint(buf, &mut pos)?;
+                if let Some(c) = columns.get_mut(ci) {
+                    c.display_width = Some(w as u16);
+                }
+            }
+        }
         Ok(Table {
             name,
             columns,
@@ -196,9 +230,9 @@ mod tests {
         Table {
             name: "person".into(),
             columns: alloc::vec![
-                Column { name: "id".into(), ty: Type::UnsignedInteger, nullable: false, unique: true },
-                Column { name: "name".into(), ty: Type::String, nullable: false, unique: false },
-                Column { name: "boss".into(), ty: Type::UnsignedInteger, nullable: true, unique: false },
+                Column { name: "id".into(), ty: Type::UnsignedInteger, nullable: false, unique: true, display_width: None },
+                Column { name: "name".into(), ty: Type::String, nullable: false, unique: false, display_width: None },
+                Column { name: "boss".into(), ty: Type::UnsignedInteger, nullable: true, unique: false, display_width: None },
             ],
             fks: alloc::vec![ForeignKey {
                 name: "boss_fk".into(),
@@ -227,6 +261,30 @@ mod tests {
         let decoded = Table::decode(&bytes).unwrap();
         assert!(decoded.ref_cols.is_empty());
         assert_eq!(decoded.columns, t.columns);
+    }
+
+    #[test]
+    fn display_width_roundtrips() {
+        let mut t = person();
+        t.columns[1].display_width = Some(24); // name
+        t.columns[2].display_width = Some(6); // boss
+        let decoded = Table::decode(&t.encode()).unwrap();
+        assert_eq!(decoded.columns[0].display_width, None);
+        assert_eq!(decoded.columns[1].display_width, Some(24));
+        assert_eq!(decoded.columns[2].display_width, Some(6));
+        assert_eq!(decoded, t);
+    }
+
+    #[test]
+    fn decode_pre_display_width_image_yields_none() {
+        // Simulate an image written before display widths existed: it ends right
+        // after the ref-cols block. Truncate the trailing (empty) width block.
+        let t = person(); // no widths set → width block is a single `0` byte
+        let mut bytes = t.encode();
+        bytes.pop(); // drop the `display_widths.len() == 0` varint byte
+        let decoded = Table::decode(&bytes).unwrap();
+        assert!(decoded.columns.iter().all(|c| c.display_width.is_none()));
+        assert_eq!(decoded.ref_cols, t.ref_cols);
     }
 
     #[test]

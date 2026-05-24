@@ -69,6 +69,10 @@ Cursor selects a single cell.
   A column carrying a foreign key is marked. A foreign-key cell shows the
   referenced row's **reference label** (e.g. `id:5 name:John`) rather than the
   bare key value.
+- Each column is rendered at a fixed width — the **display width** set per
+  column in the Schema Editor, or a default. A value wider than its column is
+  truncated here (with a trailing `…`); the stored value is unchanged, and the
+  full text is still visible in **Row View**.
 - Rows are listed in retrieval order, or in the user-selected sort
   order.
 - `NULL` renders as a dimmed literal `NULL`, distinct from an empty
@@ -113,12 +117,19 @@ View allows also to go back to previous view.
 
 Similar to Row view.
 
-- Move between fields.
+- Move between fields with `Tab` / `↑↓`.
+- Within the focused field, edit the text with a caret: `←` / `→` move it,
+  `Home` / `End` jump to the start / end, typing inserts at the caret,
+  `Backspace` deletes the character before it. The caret is a **blinking
+  vertical bar** drawn as an overlay at its position — it does not shift the
+  surrounding text. For a value longer than the field the view scrolls so the
+  caret stays visible.
 - Each field is validated against its column type **on commit** - on view exit
-- A nullable column has a `[ ] NULL` toggle.
+- A nullable column has a `[ ] NULL` toggle, switched with `Del`.
 - Type visible
 - Any field can be filled part-by-part with a **structured builder**: pressing
-  `→` opens a builder with a separate field per component. The parts depend on
+  `PgDn` opens a builder with a separate field per component (the arrow keys now
+  move the caret, so the builder moved off `→`). The parts depend on
   the column type:
   - **numbers** — sign, digits (and, for `decimal`, an integer part and a
     fraction);
@@ -131,7 +142,9 @@ Similar to Row view.
   The builder shows a live preview, validates on commit, and writes the
   canonical value back into the field. A long value (e.g. a big integer or a
   multi-line string) is shown **in full, wrapped across lines** — never
-  truncated — in both the field and the preview.
+  truncated — in both the field and the preview. Each typed part edits with the
+  same caret as the main editor (`←→`, `Home`/`End`, `Backspace`, `Del`); on a
+  sign part `←`/`→` flip the sign instead.
 
 On commit the editor surfaces, inline at the offending field:
 
@@ -160,6 +173,7 @@ nullability, `UNIQUE` flag, and any foreign key.
 | Add foreign key — pick a target table, then a `UNIQUE` column. |
 | Drop a foreign key. |
 | Toggle `UNIQUE` on the selected column (add / remove unique). |
+| Set the column's **display width** (`w`) — prompts for a character count (blank clears it back to the default). Presentational only: it controls how wide the column is in the Table Browser, never what is stored. |
 | Set **reference columns** (`R`) — opens a picker to choose and order the columns that label this table's rows when referenced. |
 | Drop the whole table (confirmation required). |
 | Back to **Table Browser**. |

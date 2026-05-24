@@ -82,7 +82,16 @@ fn col(name: &str, ty: Type, unique: bool) -> Column {
         ty,
         nullable: !unique,
         unique,
+        display_width: None,
     }
+}
+
+/// Give a column an explicit Table Browser display width (characters). Lets the
+/// seeded tables ship with sensible widths: narrow `id` columns, and wider
+/// foreign-key columns whose cells show a referenced row's label.
+fn w(mut c: Column, width: u16) -> Column {
+    c.display_width = Some(width);
+    c
 }
 
 /// Populate `store` with the test dataset. The store must be freshly formatted
@@ -90,8 +99,8 @@ fn col(name: &str, ty: Type, unique: bool) -> Column {
 pub fn seed<D: BlockDevice>(store: &mut Store<D>) -> Result<SeedStats, StoreError> {
     // --- addresses: the table every foreign key points at -----------------
     store.create_table("addresses")?;
-    store.add_column("addresses", col("id", Type::UnsignedInteger, true))?;
-    store.add_column("addresses", col("name", Type::String, false))?;
+    store.add_column("addresses", w(col("id", Type::UnsignedInteger, true), 6))?;
+    store.add_column("addresses", w(col("name", Type::String, false), 22))?;
     // Wherever an address is referenced (e.g. a person's `address_id`), show
     // its name as the label.
     store.set_reference_columns("addresses", vec!["name".to_string()])?;
@@ -102,10 +111,11 @@ pub fn seed<D: BlockDevice>(store: &mut Store<D>) -> Result<SeedStats, StoreErro
 
     // --- people: one foreign key into addresses ---------------------------
     store.create_table("people")?;
-    store.add_column("people", col("id", Type::UnsignedInteger, true))?;
-    store.add_column("people", col("firstname", Type::String, false))?;
-    store.add_column("people", col("surname", Type::String, false))?;
-    store.add_column("people", col("address_id", Type::UnsignedInteger, false))?;
+    store.add_column("people", w(col("id", Type::UnsignedInteger, true), 6))?;
+    store.add_column("people", w(col("firstname", Type::String, false), 12))?;
+    store.add_column("people", w(col("surname", Type::String, false), 12))?;
+    // Foreign key: its cells render the address's name label, so give it room.
+    store.add_column("people", w(col("address_id", Type::UnsignedInteger, false), 22))?;
     store.add_fk("people", "address_id", "addresses", "id")?;
     // A person is labelled by their full name wherever referenced.
     store.set_reference_columns("people", vec!["firstname".to_string(), "surname".to_string()])?;
@@ -121,10 +131,11 @@ pub fn seed<D: BlockDevice>(store: &mut Store<D>) -> Result<SeedStats, StoreErro
 
     // --- distances: two foreign keys into the same target -----------------
     store.create_table("distances")?;
-    store.add_column("distances", col("id", Type::UnsignedInteger, true))?;
-    store.add_column("distances", col("from_address_id", Type::UnsignedInteger, false))?;
-    store.add_column("distances", col("to_address_id", Type::UnsignedInteger, false))?;
-    store.add_column("distances", col("distance_miles", Type::Decimal, false))?;
+    store.add_column("distances", w(col("id", Type::UnsignedInteger, true), 6))?;
+    // Both foreign keys show an address name; the column names are long too.
+    store.add_column("distances", w(col("from_address_id", Type::UnsignedInteger, false), 22))?;
+    store.add_column("distances", w(col("to_address_id", Type::UnsignedInteger, false), 22))?;
+    store.add_column("distances", w(col("distance_miles", Type::Decimal, false), 14))?;
     store.add_fk("distances", "from_address_id", "addresses", "id")?;
     store.add_fk("distances", "to_address_id", "addresses", "id")?;
     // Label a distance by its mileage wherever it is referenced.
@@ -142,9 +153,10 @@ pub fn seed<D: BlockDevice>(store: &mut Store<D>) -> Result<SeedStats, StoreErro
 
     // --- notes: free text + a timestamp, no references --------------------
     store.create_table("notes")?;
-    store.add_column("notes", col("id", Type::UnsignedInteger, true))?;
-    store.add_column("notes", col("note", Type::String, false))?;
-    store.add_column("notes", col("timestamp", Type::DateTime, false))?;
+    store.add_column("notes", w(col("id", Type::UnsignedInteger, true), 6))?;
+    store.add_column("notes", w(col("note", Type::String, false), 36))?;
+    // A full DateTime is 19 chars — the default would clip the seconds.
+    store.add_column("notes", w(col("timestamp", Type::DateTime, false), 20))?;
     for i in 0..NOTES {
         let note = format!("Note #{}: {}", i + 1, SENTENCE[i % SENTENCE.len()]);
         // Spread across a few years and the full clock; day ≤ 28 so every

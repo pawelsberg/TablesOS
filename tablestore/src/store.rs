@@ -845,6 +845,24 @@ impl<D: BlockDevice> Store<D> {
         )
     }
 
+    /// Set (or clear, with `None`) a column's Table Browser display width, in
+    /// characters. Purely presentational — stored values are untouched; a value
+    /// wider than this is truncated only when rendered in the browser grid.
+    pub fn set_display_width(&mut self, table: &str, col: &str, width: Option<u16>) -> Result<()> {
+        let col = col.to_string();
+        self.put_schema(
+            table,
+            move |t| {
+                let ci = t
+                    .column_index(&col)
+                    .ok_or_else(|| StoreError::NotFound(format!("column '{col}'")))?;
+                t.columns[ci].display_width = width;
+                Ok(())
+            },
+            None,
+        )
+    }
+
     // ---- data operations -----------------------------------------------------
 
     pub fn insert(&mut self, table: &str, cells: Vec<Option<Value>>) -> Result<RowId> {
@@ -1022,6 +1040,7 @@ mod tests {
             ty: t,
             nullable: nul,
             unique: uniq,
+            display_width: None,
         }
     }
     fn iv(s: &str) -> Option<Value> {

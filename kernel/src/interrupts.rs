@@ -56,6 +56,12 @@ fn eoi(irq: u8) {
     unsafe { PICS.lock().notify_end_of_interrupt(irq) }
 }
 
+/// Monotonic PIT tick count (~18.2 Hz). The timer IRQ also locks `TICKS`, so
+/// the read masks interrupts to avoid deadlocking against a tick on this core.
+pub fn ticks() -> u64 {
+    x86_64::instructions::interrupts::without_interrupts(|| *TICKS.lock())
+}
+
 extern "x86-interrupt" fn breakpoint(f: InterruptStackFrame) {
     serial_println!("breakpoint: {:?}", f);
 }
