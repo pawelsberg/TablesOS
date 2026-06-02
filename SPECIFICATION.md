@@ -20,9 +20,9 @@ Characteristics:
 5. **Crash safety.** The pendrive may be removed at any instant; the store is
    never left structurally inconsistent.
 6. **SSD safe** system uses SSD in a safe manner - taking into account nature of
-   flash memmory. Preventing physical damage of the medium.
-7. **Graphic user interface** (VESA) allows to interact with operating system.
-8. **No partition tables. No partitions** - Custom MBR - contains: system id, operating system bios version, data location  
+   flash memory. Preventing physical damage of the medium.
+7. **Graphical user interface** (VESA) allows to interact with operating system.
+8. **No partition tables. No partitions** - Custom MBR - contains: system id, operating system instance version, data location
 
 ---
 
@@ -30,8 +30,7 @@ Characteristics:
 
 The store holds **tables**. A table has an ordered list of **columns**; each
 column has a name and a **type** and may be nullable. A table holds an
-unordered multiset of **rows**. A column may carry a **foreign key** that
-references a column in another (or the same) table.
+unordered multiset of **rows**. A column may carry a **foreign key** that references a column in another (or the same) table.
 
 There is no implicit primary key. A foreign key may target any column that
 carries a uniqueness guarantee (a `UNIQUE` column).
@@ -65,7 +64,7 @@ if there are none.
 ### Declaration
 
 A column may declare a foreign key referencing a unique column of any table,
-including its own table (self-reference). The referenced column must be `UNIQUE`
+including its own table (self-reference). The referenced column must be `UNIQUE`;
 this is checked at definition time.
 
 ---
@@ -88,7 +87,7 @@ row's identity directly rather than a bare key.
 | `Add column <name> <type> [null\|not null] [unique]` | Append a column. Existing rows get NULL (column must be nullable) . |
 | `Drop column <name>` | Remove a column. Rejected if it carries or is targeted by a FK. |
 | `Rename column <name> <new-name>` | Rename a column; any foreign key naming it is updated to match. |
-| `Move column <name> <new-location>` | Reorder column.  |
+| `Move column <name> <new-location>` | Reorder column. |
 | `Add fk <col> -> <table>.<col>` | Define a foreign key. |
 | `Drop fk <fk-name>` | Remove a foreign key |
 | `Add unique` | Add unique to a column |
@@ -110,6 +109,7 @@ row's identity directly rather than a bare key.
 | Operation | Effect |
 |---|---|
 | `shutdown` | Shut down the computer. |
+| `New operating system on USB storage device` | Create a new (empty) TablesOS operating system on another USB storage device. |
 
 ---
 
@@ -119,6 +119,17 @@ The pendrive may be removed at any moment. System uses **write-ahead journaling*
 to guarantee that the store is always recoverable to a consistent state.
 After any power loss, mounting recovers a consistent store with at most the last 
 uncommitted transaction lost.
+
+---
+
+## Boot medium identity
+
+During boot the system reads the **unique id** of the medium (in MBR) it is booting
+from. Once boot has finished, the system guarantees that every write is
+directed only to the disk carrying the unique id captured during boot; a
+foreign or swapped disk is never written to. The sole exception is the
+explicit *New operating system on USB storage device* maintenance operation,
+which deliberately writes a fresh system to a different, user-chosen device.
 
 ---
 
@@ -150,5 +161,4 @@ Build emits an image that can be written to a pendrive of any size.
 It represents TableOS without any tables. OS claims the rest of the pendrive during runtime.
 
 OS is written in Rust. 
-
 ---
