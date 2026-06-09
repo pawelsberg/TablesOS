@@ -747,13 +747,32 @@ impl<D: BlockDevice> App<D> {
     // ---- input -----------------------------------------------------------
 
     fn on_key(&mut self, k: Key) {
-        match screen_tag(self.top()) {
-            5 => return self.key_prompt(k),
-            6 => return self.key_pick(k),
-            7 => return self.key_confirm(k),
-            3 => return self.key_editor(k),
-            13 => return self.key_builder(k),
-            _ => {}
+        // Screens with a dedicated key handler that re-borrows `self` (the
+        // store) internally. Matching on the variant — rather than an integer
+        // tag that has to be kept in sync by hand — means adding a new `Screen`
+        // forces a decision here at compile time instead of silently falling
+        // through to the generic `dispatch` path below.
+        match self.top() {
+            Screen::Prompt { .. } => return self.key_prompt(k),
+            Screen::Pick { .. } => return self.key_pick(k),
+            Screen::Confirm { .. } => return self.key_confirm(k),
+            Screen::Editor(_) => return self.key_editor(k),
+            Screen::Builder(_) => return self.key_builder(k),
+            // Everything else is handled by the generic `dispatch` path below.
+            // Listed explicitly (no `_`) so adding a `Screen` forces a choice:
+            // give it a dedicated handler here, or let it fall to `dispatch`.
+            Screen::List { .. }
+            | Screen::Browser { .. }
+            | Screen::RowView { .. }
+            | Screen::Schema { .. }
+            | Screen::RefCols { .. }
+            | Screen::Drives { .. }
+            | Screen::Pci { .. }
+            | Screen::Xhci { .. }
+            | Screen::CreateOsPick { .. }
+            | Screen::InstallResult { .. }
+            | Screen::About { .. }
+            | Screen::FkPick { .. } => {}
         }
         // Pull the current screen out so screen logic can freely borrow
         // `self` (the store). It is put back *before* any navigation, so a
@@ -1533,7 +1552,16 @@ impl<D: BlockDevice> App<D> {
                 }
                 Screen::Xhci { info, dev }
             }
-            other => other,
+            // Handled before `dispatch` is reached, by the variant match in
+            // `on_key` that routes to their dedicated `key_*` handlers. Listed
+            // explicitly (returning the screen unchanged) so this match stays
+            // exhaustive: a new `Screen` must be wired into input handling here
+            // or in `on_key`, the same way `build_frame` forces a render arm.
+            scr @ (Screen::Prompt { .. }
+            | Screen::Pick { .. }
+            | Screen::Confirm { .. }
+            | Screen::Editor(_)
+            | Screen::Builder(_)) => scr,
         };
         (scr, nav)
     }
@@ -2633,28 +2661,45 @@ impl<D: BlockDevice> App<D> {
 
     fn build_frame(&mut self) -> Frame {
         let status = self.status.clone();
-        // We must not hold a borrow of self.stack while calling store methods,
-        // so copy the screen description into owned data first.
-        let screen_kind = self.stack.last().map(screen_tag).unwrap_or(0);
-        match screen_kind {
-            0 => self.frame_list(status),
-            1 => self.frame_browser(status),
-            2 => self.frame_rowview(status),
-            3 => self.frame_editor(status),
-            4 => self.frame_schema(status),
-            5 => self.frame_prompt(status),
-            6 => self.frame_pick(status),
-            7 => self.frame_confirm(status),
-            8 => self.frame_drives(status),
-            9 => self.frame_pci(status),
-            10 => self.frame_xhci(status),
-            11 => self.frame_create_os_pick(status),
-            12 => self.frame_fk_pick(status),
-            13 => self.frame_install_result(status),
-            15 => self.frame_refcols(status),
-            16 => self.frame_about(status),
-            _ => self.frame_builder(status),
-        }
+        // Match on the screen variant so every `Screen` is mapped to a frame
+        // explicitly: adding a new variant becomes a compile error here rather
+        // than silently rendering as the `_` fallback. The scrutinee's shared
+        // borrow of `self.stack` ends before each arm's `&mut self` call, so the
+        // store methods are free to re-borrow as needed.
+        let mut frame = match self.stack.last() {
+            None | Some(Screen::List { .. }) => self.frame_list(status),
+            Some(Screen::Browser { .. }) => self.frame_browser(status),
+            Some(Screen::RowView { .. }) => self.frame_rowview(status),
+            Some(Screen::Editor(_)) => self.frame_editor(status),
+            Some(Screen::Schema { .. }) => self.frame_schema(status),
+            Some(Screen::Prompt { .. }) => self.frame_prompt(status),
+            Some(Screen::Pick { .. }) => self.frame_pick(status),
+            Some(Screen::Confirm { .. }) => self.frame_confirm(status),
+            Some(Screen::Drives { .. }) => self.frame_drives(status),
+            Some(Screen::Pci { .. }) => self.frame_pci(status),
+            Some(Screen::Xhci { .. }) => self.frame_xhci(status),
+            Some(Screen::CreateOsPick { .. }) => self.frame_create_os_pick(status),
+            Some(Screen::FkPick { .. }) => self.frame_fk_pick(status),
+            Some(Screen::InstallResult { .. }) => self.frame_install_result(status),
+            Some(Screen::Builder(_)) => self.frame_builder(status),
+            Some(Screen::RefCols { .. }) => self.frame_refcols(status),
+            Some(Screen::About { .. }) => self.frame_about(status),
+        };
+        // Reflow the key-hint / options bars to the current resolution so they
+        // never run off a narrow screen — done once here rather than in every
+        // `frame_*`, and before `render` snapshots the hitmap, so the wrapped
+        // lines stay clickable.
+        wrap_shortcut_bars(&mut frame, self.body_cols());
+        frame
+    }
+
+    /// Character cells available for body text at the current resolution: from
+    /// the panel's left text inset (`BODY_X`) to its right edge (`PANEL_X`
+    /// inset), less a one-cell gap so a wrapped bar never touches the bracket
+    /// chrome. Drives [`wrap_shortcut_bars`].
+    fn body_cols(&self) -> usize {
+        let w = fbm::with(|d| d.width()).unwrap_or(0);
+        w.saturating_sub(BODY_X + PANEL_X + CELL_W) / CELL_W
     }
 
     fn frame_list(&mut self, status: String) -> Frame {
@@ -4436,28 +4481,6 @@ struct Frame {
     cursor: Option<(usize, usize)>,
 }
 
-fn screen_tag(s: &Screen) -> u8 {
-    match s {
-        Screen::List { .. } => 0,
-        Screen::Browser { .. } => 1,
-        Screen::RowView { .. } => 2,
-        Screen::Editor(_) => 3,
-        Screen::Schema { .. } => 4,
-        Screen::Prompt { .. } => 5,
-        Screen::Pick { .. } => 6,
-        Screen::Confirm { .. } => 7,
-        Screen::Drives { .. } => 8,
-        Screen::Pci { .. } => 9,
-        Screen::Xhci { .. } => 10,
-        Screen::CreateOsPick { .. } => 11,
-        Screen::FkPick { .. } => 12,
-        Screen::InstallResult { .. } => 13,
-        Screen::Builder(_) => 14,
-        Screen::RefCols { .. } => 15,
-        Screen::About { .. } => 16,
-    }
-}
-
 fn visible_rows() -> usize {
     // Rows that fit in the body region: from `BODY_TOP` (already below the top
     // emblems) down to above the status bar and the bottom corner emblems,
@@ -4719,6 +4742,106 @@ fn wrap(s: &str, n: usize) -> Vec<String> {
         return alloc::vec![String::new()];
     }
     chars.chunks(n).map(|c| c.iter().collect()).collect()
+}
+
+/// Reflow every key-hint / options bar in `frame` so it fits within `max_cols`
+/// character cells, wrapping any over-wide bar across extra lines. Breaks land
+/// only between options (never inside one — see [`wrap_options`]), and each
+/// produced line keeps `Hit::Shortcuts`, so per-line click resolution still
+/// works. Line-index references in `cell_hls`/`cursor` are shifted to track the
+/// lines we insert. A no-op at wide resolutions, where every bar already fits.
+fn wrap_shortcut_bars(frame: &mut Frame, max_cols: usize) {
+    if max_cols == 0
+        || !frame
+            .body
+            .iter()
+            .any(|l| matches!(l.hit, Hit::Shortcuts) && l.text.chars().count() > max_cols)
+    {
+        return;
+    }
+    let mut new_body: Vec<TextLine> = Vec::with_capacity(frame.body.len() + 4);
+    // `extra[i]` = lines inserted *before* original body line `i`, so a
+    // reference to line `i` moves to `i + extra[i]`.
+    let mut extra: Vec<usize> = Vec::with_capacity(frame.body.len());
+    let mut acc = 0usize;
+    for l in frame.body.drain(..) {
+        extra.push(acc);
+        if matches!(l.hit, Hit::Shortcuts) {
+            let chunks = wrap_options(&l.text, max_cols);
+            acc += chunks.len().saturating_sub(1);
+            for c in chunks {
+                new_body.push(line(&c, l.kind).hit(Hit::Shortcuts));
+            }
+        } else {
+            new_body.push(l);
+        }
+    }
+    let last = extra.last().copied().unwrap_or(0);
+    let shift = |li: usize| li + extra.get(li).copied().unwrap_or(last);
+    for hl in &mut frame.cell_hls {
+        hl.0 = shift(hl.0);
+    }
+    if let Some((cl, cc)) = frame.cursor {
+        frame.cursor = Some((shift(cl), cc));
+    }
+    frame.body = new_body;
+}
+
+/// Pack an options bar into the fewest lines that each fit `max_cols`, breaking
+/// only between options. An *option* is a run of text delimited by two-or-more
+/// spaces; single spaces live *inside* an option (e.g. `[n]ew OS on USB`), so a
+/// break never lands mid-option. Options on the same line are rejoined with the
+/// two-space separator. A lone option wider than `max_cols` still gets its own
+/// line rather than being cut.
+fn wrap_options(text: &str, max_cols: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for seg in split_options(text) {
+        let seg_len = seg.chars().count();
+        if cur.is_empty() {
+            cur = seg;
+        } else if cur.chars().count() + 2 + seg_len <= max_cols {
+            cur.push_str("  ");
+            cur.push_str(&seg);
+        } else {
+            lines.push(core::mem::take(&mut cur));
+            cur = seg;
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// Split an options bar into its individual options, breaking on runs of two or
+/// more spaces and preserving the single spaces that live inside an option.
+fn split_options(text: &str) -> Vec<String> {
+    let mut segs: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut spaces = 0usize;
+    for ch in text.chars() {
+        if ch == ' ' {
+            spaces += 1;
+            continue;
+        }
+        if spaces >= 2 {
+            if !cur.is_empty() {
+                segs.push(core::mem::take(&mut cur));
+            }
+        } else if spaces == 1 && !cur.is_empty() {
+            cur.push(' ');
+        }
+        spaces = 0;
+        cur.push(ch);
+    }
+    if !cur.is_empty() {
+        segs.push(cur);
+    }
+    segs
 }
 
 fn describe(e: &StoreError) -> String {
