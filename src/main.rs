@@ -188,6 +188,11 @@ fn main() {
             ),
         ])
         .args(["-device", "usb-storage,bus=xhci.0,drive=usbstick"])
+        // A USB-HID boot mouse on the same xHCI bus, so the HID input path is
+        // exercised in QEMU. It reports relative motion in boot protocol, which
+        // the kernel polls via the xHCI interrupt-IN endpoint. Unlike usb-kbd,
+        // attaching a usb-mouse does not steal PS/2 keyboard input.
+        .args(["-device", "usb-mouse,bus=xhci.0"])
         .args(["-serial", "stdio"])
         .args(["-vga", "std"])
         .arg("-no-reboot")

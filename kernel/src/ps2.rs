@@ -299,18 +299,30 @@ pub fn on_mouse_byte(byte: u8) {
         dx = 0;
         dy = 0;
     }
-    m.x = (m.x + dx).clamp(0, m.max_x);
-    m.y = (m.y - dy).clamp(0, m.max_y); // screen Y grows downward
-    let (px, py) = (m.x as usize, m.y as usize);
-
     let left = flags & 0x01 != 0;
     let right = flags & 0x02 != 0;
-    let left_edge = left && !m.left_was_down;
-    let right_edge = right && !m.right_was_down;
-    m.left_was_down = left;
-    m.right_was_down = right;
     drop(m);
 
+    // PS/2 reports dy positive = up; the screen's Y grows downward, so negate
+    // into the shared screen-space apply path.
+    apply_motion(dx, -dy, left, right);
+}
+
+/// Apply a pointer delta (screen coordinates: `dy_down` positive = downward),
+/// update the absolute position + button-edge state, and enqueue the resulting
+/// [`Event`]s. Shared by the PS/2 IRQ path and the USB-HID feed below, so both
+/// input sources move the same cursor and post to the same queue.
+fn apply_motion(dx: i32, dy_down: i32, left: bool, right: bool) {
+    let (px, py, left_edge, right_edge) = {
+        let mut m = MOUSE.lock();
+        m.x = (m.x + dx).clamp(0, m.max_x);
+        m.y = (m.y + dy_down).clamp(0, m.max_y);
+        let left_edge = left && !m.left_was_down;
+        let right_edge = right && !m.right_was_down;
+        m.left_was_down = left;
+        m.right_was_down = right;
+        (m.x as usize, m.y as usize, left_edge, right_edge)
+    };
     push(Event::MouseMove(px, py));
     if left_edge {
         push(Event::Click(px, py));
@@ -318,4 +330,14 @@ pub fn on_mouse_byte(byte: u8) {
     if right_edge {
         push(Event::RightClick);
     }
+}
+
+/// Inject a pointer delta from an external source — the USB-HID boot mouse,
+/// which is polled cooperatively from the UI loop rather than via an IRQ (the
+/// xHCI transfer path allocates, which an interrupt handler must never do, per
+/// the heap-free-IRQ invariant). `dy` is in screen coordinates (positive =
+/// downward), matching the HID boot-mouse convention. Masks interrupts because
+/// it touches the same `MOUSE`/`QUEUE` state the PS/2 IRQ handler does.
+pub fn feed_mouse_delta(dx: i32, dy: i32, left: bool, right: bool) {
+    no_irq(|| apply_motion(dx, dy, left, right));
 }

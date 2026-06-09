@@ -29,7 +29,7 @@ The rest records how `SPECIFICATION.md` / `UI.md` were realised and — honestly
 | Layer | Crate | Notes |
 |---|---|---|
 | Relational engine | `tablestore` | `no_std + alloc`, no `unsafe`, host-unit-tested (`cargo test -p tablestore`). |
-| Kernel / drivers / GUI | `kernel` | `no_std`, BIOS entry, VBE framebuffer, PS/2, ATA, GUI. |
+| Kernel / drivers / GUI | `kernel` | `no_std`, BIOS entry, VBE framebuffer, PS/2 + USB-HID input, ATA, xHCI/USB-MSC, GUI. |
 | Image builder | workspace root | Wraps the kernel into a BIOS disk image with `bootloader`. |
 
 The engine reaches storage only through `BlockDevice`, so identical
@@ -145,6 +145,33 @@ relational/journalling code runs in the kernel and under host tests.
    spec; the kernel re-checks and also hard-fails on a bad/absent mode.
 8. **No graphics mode / no disk** → boot fails with a message (serial, and
    on-screen when possible), as `UI.md` requires; the UI never runs degraded.
+
+## Input (PS/2 + USB-HID mouse)
+
+Two pointer/key sources feed **one** cursor and **one** event queue (`ps2.rs`):
+
+- **PS/2** (8042): IRQ1/IRQ12 → ports 0x60/0x64. Serves QEMU and any genuine
+  PS/2 device (a laptop's internal keyboard is usually wired to the EC as
+  i8042, so the keyboard keeps working even when the pointer is USB).
+- **USB-HID boot mouse** (`usb/xhci::probe_hid_mouse`/`setup_mouse`/`pump_mouse`):
+  the same xHCI enumerate/configure machinery as USB-MSC, plus a boot-protocol
+  mouse interface (class 0x03 / subclass 0x01 / protocol 0x02). `SET_PROTOCOL(0)`
+  gives a fixed 3-byte report `[buttons, dX, dY]` (no report-descriptor parsing);
+  one interrupt-IN TRB is kept armed and polled cooperatively from the UI loop,
+  feeding `ps2::feed_mouse_delta` so the UI drains it like any PS/2 event.
+
+**Why USB-HID exists at all (and must not be removed):** on real hardware the
+USB boot disk forces a BIOS→OS xHCI ownership handoff that switches off the
+BIOS's SMM PS/2 emulation of USB pointers — so without our own HID driver the
+mouse is dead. Owning xHCI for the boot disk and keeping BIOS HID emulation are
+mutually exclusive. Full root-cause + the **regression invariants** (don't
+re-enable BIOS emulation; never poll USB from an IRQ — the heap-free-IRQ rule;
+keep the periodic-endpoint Interval in `configure_endpoints`; one shared cursor;
+the UI idle path can't `hlt` forever when a USB mouse is present) are in
+`solved-issues/USB mouse on real hardware.md`. A `usb-mouse` is attached to the
+QEMU xHCI bus (`src/main.rs`) so this path is exercised on every `cargo run`.
+A USB-HID **keyboard** is a cheap follow-on (protocol 0x01) but is not yet
+implemented; PS/2 still serves the keyboard everywhere we've run.
 
 ## Verified
 

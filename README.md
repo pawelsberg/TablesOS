@@ -2,8 +2,9 @@
 
 A bootable, BIOS-booted **x86-64 operating system whose entire interface is a
 relational table store** — written in Rust. It boots from bare metal (or QEMU),
-brings up its own two-stage bootloader, a VESA-framebuffer GUI, PS/2 keyboard +
-mouse and an ATA disk driver, and presents a browser/editor for tables, rows,
+brings up its own two-stage bootloader, a VESA-framebuffer GUI, a PS/2 keyboard,
+a PS/2-**or**-USB-HID mouse and an ATA disk driver, and presents a
+browser/editor for tables, rows,
 schemas and foreign keys backed by a write-ahead-journalled, crash-safe store.
 
 There is **no partition table and no filesystem** — the whole device is one raw

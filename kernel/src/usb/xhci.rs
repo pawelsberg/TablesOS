@@ -299,6 +299,10 @@ struct XhciState {
     addressed: Vec<AddressedDevice>,
     /// Most recent USB-MSC probe results.
     msc: Vec<MscProbe>,
+    /// The USB-HID boot mouse, if `probe_hid_mouse` found and armed one. Polled
+    /// cooperatively from the UI loop (never from an IRQ — xHCI transfers
+    /// allocate). `None` until set up; absent on machines with no USB mouse.
+    mouse: Option<MouseDevice>,
 }
 
 /// Per-slot allocations needed for Address Device and subsequent control
@@ -340,6 +344,34 @@ struct EndpointState {
     tr_ring: u64,
     tr_enqueue: usize,
     tr_pcs: u8,
+}
+
+/// A bound USB-HID boot-protocol mouse. We keep exactly one interrupt-IN
+/// transfer TRB armed at all times; each completion accumulates a relative
+/// delta + button state here (so no motion is lost between UI polls) and the
+/// poll re-arms. The pointer position itself lives in `ps2` so USB and PS/2
+/// share one cursor.
+#[derive(Clone)]
+struct MouseDevice {
+    /// Index into `slots`.
+    slot_idx: usize,
+    /// Index into `slots[slot_idx].endpoints` of the interrupt-IN endpoint.
+    ep_idx: usize,
+    slot_id: u8,
+    /// Leaked, identity-mapped DMA buffer the controller writes each report into.
+    report_buf: u64,
+    /// Bytes requested per transfer (endpoint max packet, clamped to 4..=8).
+    report_len: u32,
+    /// True while a TRB is queued (guards against arming two at once).
+    armed: bool,
+    /// Set when a completion came back halted; the next poll resets the endpoint
+    /// (done there, not inside an event drain, to avoid re-entrant command waits).
+    needs_reset: bool,
+    /// Accumulated movement + latest button bitmap since the last UI poll.
+    accum_dx: i32,
+    accum_dy: i32,
+    buttons: u8,
+    dirty: bool,
 }
 
 #[derive(Clone)]
@@ -447,6 +479,52 @@ pub fn current_enumeration() -> Option<EnumResult> {
 /// R/S = 1. Idempotent: if it has already been run, returns the cached
 /// `BringUpInfo` and touches no hardware. Errors leave the controller
 /// halted and harmless.
+/// BIOS->OS ownership handoff (xHCI USB Legacy Support Capability, ID 1). On
+/// real hardware the firmware owns the controller — it just used it to boot the
+/// USB stick — and starting it without claiming ownership wedges, because the
+/// BIOS SMI handler still has it. `xecp` is the extended-capability pointer (in
+/// dwords, from HCCPARAMS1). Walk the list for cap ID 1, set HC OS Owned, wait
+/// for HC BIOS Owned to clear, then disable the controller's BIOS SMI sources.
+/// QEMU's firmware never owns the controller, so this is a no-op there.
+fn bios_handoff(mmio: u64, xecp: u32) {
+    if xecp == 0 {
+        crate::boot_status("bu: handoff: no xECP");
+        return;
+    }
+    let mut cap_ptr = mmio + (xecp as u64) * 4;
+    // Bounded walk so a malformed list can't loop forever.
+    for _ in 0..64 {
+        let cap = unsafe { read_volatile(cap_ptr as *const u32) };
+        let id = cap & 0xFF;
+        if id == 0 {
+            break;
+        }
+        if id == 1 {
+            // USBLEGSUP: bit 16 = HC BIOS Owned, bit 24 = HC OS Owned.
+            unsafe { write_volatile(cap_ptr as *mut u32, cap | (1 << 24)) };
+            let released = poll_until(cap_ptr as *const u32, 1 << 16, 0, 1_000_000);
+            // USBLEGCTLSTS (cap+4): clear the SMI *enable* bits (low word) so the
+            // BIOS stops trapping; the high-word status bits are RW1C and written
+            // back as read, which clears any pending ones.
+            let ctl = cap_ptr + 4;
+            let v = unsafe { read_volatile(ctl as *const u32) };
+            unsafe { write_volatile(ctl as *mut u32, v & 0xFFFF_0000) };
+            crate::boot_status(if released {
+                "bu: handoff OK"
+            } else {
+                "bu: handoff TIMEOUT (BIOS kept it)"
+            });
+            return;
+        }
+        let next = (cap >> 8) & 0xFF;
+        if next == 0 {
+            break;
+        }
+        cap_ptr += (next as u64) * 4;
+    }
+    crate::boot_status("bu: handoff: no legacy cap");
+}
+
 pub fn bring_up(dev: &PciDevice, info: &XhciInfo) -> Result<BringUpInfo, &'static str> {
     let mut guard = STATE.lock();
     if let Some(existing) = &*guard {
@@ -462,8 +540,18 @@ pub fn bring_up(dev: &PciDevice, info: &XhciInfo) -> Result<BringUpInfo, &'stati
     let runtime = (mmio + info.rtsoff as u64) as *mut u8;
 
     serial_println!("xhci: bring-up starting (mmio=0x{:X})", mmio);
+    crate::boot_status(&alloc::format!(
+        "bu: params slots={} scratch={}",
+        info.max_slots,
+        info.max_scratchpad
+    ));
+
+    // Claim the controller from the BIOS before touching it (real-hardware
+    // requirement; harmless under QEMU).
+    bios_handoff(mmio, info.xecp_dword);
 
     // ---- 1. Halt ---------------------------------------------------------
+    crate::boot_status("bu: 1 halt");
     let usbcmd = unsafe { read_volatile(op as *const u32) };
     unsafe { write_volatile(op as *mut u32, usbcmd & !0x1) };
     if !poll_until(unsafe { op.add(0x04) } as *const u32, 0x1, 0x1, 100_000) {
@@ -472,6 +560,7 @@ pub fn bring_up(dev: &PciDevice, info: &XhciInfo) -> Result<BringUpInfo, &'stati
     serial_println!("xhci: halted");
 
     // ---- 2. Reset --------------------------------------------------------
+    crate::boot_status("bu: 2 reset");
     unsafe { write_volatile(op as *mut u32, 0x2) }; // HCRST = 1
     if !poll_until(op as *const u32, 0x2, 0x0, 1_000_000) {
         return Err("HCRST did not self-clear");
@@ -499,6 +588,11 @@ pub fn bring_up(dev: &PciDevice, info: &XhciInfo) -> Result<BringUpInfo, &'stati
 
     // ---- 6. Scratchpad buffers (if the HC asked for any) ----------------
     let scratchpad_count = info.max_scratchpad;
+    crate::boot_status(&alloc::format!(
+        "bu: 3 scratchpad alloc n={} pgsz={}",
+        scratchpad_count,
+        page_size
+    ));
     let mut scratchpad_arr_addr = 0u64;
     if scratchpad_count > 0 {
         let arr = alloc_dma(scratchpad_count as usize * 8, 4096);
@@ -523,6 +617,7 @@ pub fn bring_up(dev: &PciDevice, info: &XhciInfo) -> Result<BringUpInfo, &'stati
     unsafe { write_volatile(op.add(0x30) as *mut u64, dcbaa as u64) };
 
     // ---- 8. Command ring (256 TRBs, last is a Link back to start) -------
+    crate::boot_status("bu: 4 rings");
     const RING_TRBS: usize = 256;
     let cmd_ring = alloc_dma(RING_TRBS * 16, 4096);
     unsafe {
@@ -558,8 +653,13 @@ pub fn bring_up(dev: &PciDevice, info: &XhciInfo) -> Result<BringUpInfo, &'stati
     }
 
     // ---- 10. Start -------------------------------------------------------
+    crate::boot_status("bu: 5 start R/S");
     unsafe { write_volatile(op as *mut u32, 0x1) }; // R/S = 1
-    if !poll_until(unsafe { op.add(0x04) } as *const u32, 0x1, 0x0, 1_000_000) {
+    crate::boot_status("bu: 5a polling HCH");
+    let started =
+        poll_until(unsafe { op.add(0x04) } as *const u32, 0x1, 0x0, 1_000_000);
+    crate::boot_status(if started { "bu: 5b running" } else { "bu: 5b start TIMEOUT" });
+    if !started {
         return Err("controller did not start (USBSTS.HCH stayed set)");
     }
     serial_println!(
@@ -593,6 +693,7 @@ pub fn bring_up(dev: &PciDevice, info: &XhciInfo) -> Result<BringUpInfo, &'stati
         slots: Vec::new(),
         addressed: Vec::new(),
         msc: Vec::new(),
+        mouse: None,
     });
     Ok(bringup)
 }
@@ -935,53 +1036,132 @@ struct Event {
 /// found, or the deadline elapses. Every consumed TRB advances the
 /// dequeue + writes ERDP with EHB cleared, so the ring doesn't lock up
 /// even if unrelated events arrive first.
+/// Consume one event TRB if the controller has produced one (its cycle bit
+/// matches our consumer state); otherwise return `None` immediately. Advances
+/// the dequeue pointer and writes ERDP (EHB cleared) so the ring never locks up.
+/// The single non-blocking primitive under both the blocking `drain_event` and
+/// the cooperative mouse poll.
+fn try_consume_event(info: &XhciInfo, st: &mut XhciState) -> Option<Event> {
+    let event_ring = st.bringup.event_ring_addr as *mut u8;
+    let runtime = (info.mmio_base + info.rtsoff as u64) as *mut u8;
+    let erdp_ptr = unsafe { runtime.add(0x20 + 0x18) } as *mut u64;
+
+    let trb = unsafe { event_ring.add(st.rings.event_dequeue * 16) };
+    let control = unsafe { read_volatile(trb.add(12) as *const u32) };
+    let cycle = (control & 1) as u8;
+    if cycle != st.rings.event_ccs {
+        return None;
+    }
+    let trb_type = ((control >> 10) & 0x3F) as u8;
+    let status = unsafe { read_volatile(trb.add(8) as *const u32) };
+    let parameter = unsafe { read_volatile(trb as *const u64) };
+    let ev = Event {
+        trb_type,
+        completion_code: ((status >> 24) & 0xFF) as u8,
+        slot_id: ((control >> 24) & 0xFF) as u8,
+        parameter,
+        transfer_length: status & 0x00FF_FFFF,
+    };
+    st.rings.event_dequeue += 1;
+    if st.rings.event_dequeue == 256 {
+        st.rings.event_dequeue = 0;
+        st.rings.event_ccs ^= 1;
+    }
+    let new_erdp =
+        st.bringup.event_ring_addr + (st.rings.event_dequeue as u64) * 16;
+    unsafe { write_volatile(erdp_ptr, new_erdp | 0x8) };
+    Some(ev)
+}
+
+/// Drain TRBs from the event ring until one with `trb_type == want` is found, or
+/// the deadline elapses. Transfer completions on the HID mouse's slot are
+/// serviced inline (accumulate the report; the poll re-arms) and skipped — so a
+/// mouse that moves mid-transfer can never be mistaken for the command/bulk
+/// event this drain is waiting for. Every consumed TRB advances the dequeue, so
+/// the ring doesn't lock up even when unrelated events arrive first.
 fn drain_event(
     info: &XhciInfo,
     st: &mut XhciState,
     want: u8,
     max_us: u64,
 ) -> Result<Event, &'static str> {
-    let event_ring = st.bringup.event_ring_addr as *mut u8;
-    let runtime = (info.mmio_base + info.rtsoff as u64) as *mut u8;
-    let erdp_ptr = unsafe { runtime.add(0x20 + 0x18) } as *mut u64;
-
     let per = time::tsc_per_us().max(1);
     let start = unsafe { core::arch::x86_64::_rdtsc() };
-
     loop {
-        let trb = unsafe { event_ring.add(st.rings.event_dequeue * 16) };
-        let control = unsafe { read_volatile(trb.add(12) as *const u32) };
-        let cycle = (control & 1) as u8;
-        if cycle != st.rings.event_ccs {
-            let now = unsafe { core::arch::x86_64::_rdtsc() };
-            if (now - start) / per > max_us {
-                return Err("event-ring deadline elapsed");
+        match try_consume_event(info, st) {
+            Some(ev) => {
+                if ev.trb_type == 32 && is_mouse_slot(st, ev.slot_id) {
+                    service_mouse(st, ev.completion_code);
+                    continue;
+                }
+                if ev.trb_type == want {
+                    return Ok(ev);
+                }
+                // Unrelated event — skip and keep draining.
             }
-            core::hint::spin_loop();
-            continue;
+            None => {
+                let now = unsafe { core::arch::x86_64::_rdtsc() };
+                if (now - start) / per > max_us {
+                    return Err("event-ring deadline elapsed");
+                }
+                core::hint::spin_loop();
+            }
         }
-        let trb_type = ((control >> 10) & 0x3F) as u8;
-        let status = unsafe { read_volatile(trb.add(8) as *const u32) };
-        let parameter = unsafe { read_volatile(trb as *const u64) };
-        let ev = Event {
-            trb_type,
-            completion_code: ((status >> 24) & 0xFF) as u8,
-            slot_id: ((control >> 24) & 0xFF) as u8,
-            parameter,
-            transfer_length: status & 0x00FF_FFFF,
-        };
-        st.rings.event_dequeue += 1;
-        if st.rings.event_dequeue == 256 {
-            st.rings.event_dequeue = 0;
-            st.rings.event_ccs ^= 1;
+    }
+}
+
+/// Does this transfer-event slot belong to the armed HID mouse? Its slot only
+/// ever produces events from our interrupt-IN poll once `st.mouse` is set (we
+/// finish all control transfers to it before recording it), so a slot match is
+/// definitive.
+fn is_mouse_slot(st: &XhciState, slot_id: u8) -> bool {
+    st.mouse.as_ref().map_or(false, |m| m.slot_id == slot_id)
+}
+
+/// Handle one completed interrupt-IN transfer for the HID mouse. Parses the
+/// boot-protocol report (byte0 = buttons, byte1 = dX i8, byte2 = dY i8 with
+/// positive = down) and accumulates it; marks the TRB consumed so the next poll
+/// re-arms. A non-Success/Short completion means the endpoint halted — flag it
+/// for reset by the poll (not here, to avoid a re-entrant command drain).
+fn service_mouse(st: &mut XhciState, cc: u8) {
+    let buf = match st.mouse.as_ref() {
+        Some(m) => m.report_buf,
+        None => return,
+    };
+    let (b0, b1, b2) = unsafe {
+        (
+            read_volatile(buf as *const u8),
+            read_volatile((buf as *const u8).add(1)),
+            read_volatile((buf as *const u8).add(2)),
+        )
+    };
+    if let Some(m) = st.mouse.as_mut() {
+        m.armed = false; // its TRB was consumed
+        if cc == 1 || cc == 13 {
+            m.accum_dx += (b1 as i8) as i32;
+            m.accum_dy += (b2 as i8) as i32;
+            m.buttons = b0;
+            m.dirty = true;
+        } else {
+            m.needs_reset = true;
         }
-        let new_erdp = st.bringup.event_ring_addr
-            + (st.rings.event_dequeue as u64) * 16;
-        unsafe { write_volatile(erdp_ptr, new_erdp | 0x8) };
-        if trb_type == want {
-            return Ok(ev);
-        }
-        // Other event type — keep going.
+    }
+}
+
+/// Queue one interrupt-IN transfer for the HID mouse and ring its doorbell, so
+/// the controller delivers the next report into the report buffer. Guarded by
+/// `armed` so we never queue two at once. Does no draining, so it is safe to
+/// call from inside an event drain.
+fn arm_mouse(info: &XhciInfo, st: &mut XhciState) {
+    let (slot_idx, ep_idx, buf, len) = match st.mouse.as_ref() {
+        Some(m) if !m.armed => (m.slot_idx, m.ep_idx, m.report_buf, m.report_len),
+        _ => return,
+    };
+    let (slot_id, dci) = post_normal_trb(st, slot_idx, ep_idx, buf, len);
+    let db = (info.mmio_base + info.dboff as u64 + 4 * slot_id as u64) as *mut u32;
+    unsafe { write_volatile(db, dci as u32) };
+    if let Some(m) = st.mouse.as_mut() {
+        m.armed = true;
     }
 }
 
@@ -1105,6 +1285,13 @@ pub fn address_enabled_slots(
         };
 
         if addr_cc == 1 {
+            // USB 2.0 §9.2.6.3: a device needs a recovery interval (>=2 ms) after
+            // its address is set before it reliably accepts further requests.
+            // Cheap high-speed flash drives wedge if talked to too soon — the
+            // first request may appear to work but the next transaction-errors
+            // (observed on a real Alcor 058f:6387). QEMU has zero latency so it
+            // never needs this. Use a generous margin.
+            time::delay_ms(20);
             let mut res_mut = res.clone();
             match get_device_descriptor(info, st, &mut res_mut) {
                 Ok((cc, bytes)) => {
@@ -1251,7 +1438,129 @@ fn advance_cmd_enqueue(st: &mut XhciState) {
 /// and consume the resulting Transfer Event. Used for every standard
 /// control request: GET_DESCRIPTOR, SET_CONFIGURATION, SET_ADDRESS-style
 /// follow-ups, etc.
+/// Control transfer with automatic recovery. On a transaction error / stall
+/// (any completion code other than Success=1 or Short-Packet=13) xHCI leaves the
+/// control endpoint HALTED, so further transfers on it also fail. Recover per the
+/// spec — Reset Endpoint, then Set TR Dequeue Pointer to where the next attempt
+/// will write — and retry. Real high-speed devices (e.g. an Alcor 058f:6387)
+/// transaction-error on a control transfer that QEMU accepts; this makes the
+/// stack resilient. QEMU never errors, so the recovery path stays dormant there.
 fn control_transfer(
+    info: &XhciInfo,
+    st: &mut XhciState,
+    res: &mut SlotResources,
+    request_type: u8,
+    request: u8,
+    value: u16,
+    index: u16,
+    length: u16,
+) -> Result<(u8, Vec<u8>), &'static str> {
+    let mut attempt = 0u8;
+    loop {
+        let (cc, bytes) = control_transfer_once(
+            info, st, res, request_type, request, value, index, length,
+        )?;
+        if cc == 1 || cc == 13 || attempt >= 2 {
+            return Ok((cc, bytes));
+        }
+        attempt += 1;
+        serial_println!(
+            "xhci: slot {} control xfer cc={} -> reset EP0 + retry {}",
+            res.slot_id, cc, attempt
+        );
+        // EP0 (DCI 1) is halted after the error: clear it, repoint its ring at
+        // our current enqueue position, settle briefly, then retry.
+        let _ = reset_endpoint(info, st, res.slot_id, 1);
+        let _ = set_tr_dequeue(info, st, res, 1);
+        time::delay_ms(2);
+    }
+}
+
+/// Reset Endpoint command (TRB type 14) — clears a halted endpoint's state.
+fn reset_endpoint(
+    info: &XhciInfo,
+    st: &mut XhciState,
+    slot_id: u8,
+    ep_dci: u8,
+) -> Result<u8, &'static str> {
+    let cmd_ring = st.bringup.cmd_ring_addr as *mut u8;
+    let trb = unsafe { cmd_ring.add(st.rings.cmd_enqueue * 16) };
+    let control: u32 = (14u32 << 10)
+        | (st.rings.cmd_pcs as u32)
+        | ((ep_dci as u32) << 16)
+        | ((slot_id as u32) << 24);
+    unsafe {
+        write_volatile(trb as *mut u64, 0);
+        write_volatile(trb.add(8) as *mut u32, 0);
+        write_volatile(trb.add(12) as *mut u32, control);
+    }
+    advance_cmd_enqueue(st);
+    let db = (info.mmio_base + info.dboff as u64) as *mut u32;
+    unsafe { write_volatile(db, 0) };
+    let ev = drain_event(info, st, 33, 1_000_000)?;
+    Ok(ev.completion_code)
+}
+
+/// Set TR Dequeue Pointer command (TRB type 16) — point an endpoint's transfer
+/// ring at `dequeue` (a ring address ORed with the live cycle state), so the
+/// next TRBs the host writes there are what the controller consumes.
+fn set_tr_dequeue_raw(
+    info: &XhciInfo,
+    st: &mut XhciState,
+    slot_id: u8,
+    ep_dci: u8,
+    dequeue: u64,
+) -> Result<u8, &'static str> {
+    let cmd_ring = st.bringup.cmd_ring_addr as *mut u8;
+    let trb = unsafe { cmd_ring.add(st.rings.cmd_enqueue * 16) };
+    let control: u32 = (16u32 << 10)
+        | (st.rings.cmd_pcs as u32)
+        | ((ep_dci as u32) << 16)
+        | ((slot_id as u32) << 24);
+    unsafe {
+        write_volatile(trb as *mut u64, dequeue);
+        write_volatile(trb.add(8) as *mut u32, 0);
+        write_volatile(trb.add(12) as *mut u32, control);
+    }
+    advance_cmd_enqueue(st);
+    let db = (info.mmio_base + info.dboff as u64) as *mut u32;
+    unsafe { write_volatile(db, 0) };
+    let ev = drain_event(info, st, 33, 1_000_000)?;
+    Ok(ev.completion_code)
+}
+
+/// Set TR Dequeue Pointer for the control endpoint (EP0), using `res`'s ring
+/// position + cycle state.
+fn set_tr_dequeue(
+    info: &XhciInfo,
+    st: &mut XhciState,
+    res: &SlotResources,
+    ep_dci: u8,
+) -> Result<u8, &'static str> {
+    let dequeue: u64 =
+        (res.tr_ring + (res.tr_enqueue as u64) * 16) | (res.tr_pcs as u64);
+    set_tr_dequeue_raw(info, st, res.slot_id, ep_dci, dequeue)
+}
+
+/// Clear a halted bulk endpoint and repoint its ring at the current enqueue
+/// position. Used for MSC Bulk-Only Transport error recovery: a stall on a data
+/// or status stage leaves the endpoint halted, and every later command on it
+/// fails until it's reset. Best-effort (errors swallowed — nothing better to do).
+fn reset_bulk_endpoint(info: &XhciInfo, st: &mut XhciState, slot_idx: usize, ep_idx: usize) {
+    let (slot_id, dci, dequeue) = {
+        let ep = &st.slots[slot_idx].endpoints[ep_idx];
+        (
+            st.slots[slot_idx].slot_id,
+            ep.dci,
+            (ep.tr_ring + (ep.tr_enqueue as u64) * 16) | (ep.tr_pcs as u64),
+        )
+    };
+    let _ = reset_endpoint(info, st, slot_id, dci);
+    let _ = set_tr_dequeue_raw(info, st, slot_id, dci, dequeue);
+}
+
+/// One control transfer attempt (Setup / optional Data / Status), no recovery.
+fn control_transfer_once(
     info: &XhciInfo,
     st: &mut XhciState,
     res: &mut SlotResources,
@@ -1479,6 +1788,9 @@ pub fn fetch_configurations(
             }
         }
 
+        // Settle between control transfers; real HS devices can transaction-
+        // error on a back-to-back request that QEMU accepts instantly.
+        time::delay_ms(5);
         // ---- Get Configuration Descriptor (9-byte header) ---------
         let (cc1, hdr) =
             match control_transfer(info, st, &mut res, 0x80, 6, 0x0200, 0, 9) {
@@ -1671,6 +1983,32 @@ fn xhci_ep_type(usb_transfer_type: u8, direction_in: bool) -> u8 {
     }
 }
 
+/// xHCI EP-context Interval encoding (spec §6.2.3.6): a value `N` meaning the
+/// endpoint is serviced every `2^N × 125 µs`. Only periodic (Interrupt/Isoch)
+/// endpoints use it; everything else returns 0.
+fn xhci_interval(speed: u8, transfer_type: u8, b_interval: u8) -> u8 {
+    if transfer_type != 3 && transfer_type != 1 {
+        return 0; // Control/Bulk: Interval is ignored.
+    }
+    match speed {
+        1 | 2 => {
+            // Full(1)/Low(2) speed: bInterval is in 1 ms frames. Convert to
+            // 125 µs units (×8), take floor(log2), clamp to the legal [3,10].
+            let microframes = (b_interval.max(1) as u32) * 8;
+            let mut n: u8 = 0;
+            while (1u32 << (n + 1)) <= microframes && n < 10 {
+                n += 1;
+            }
+            n.clamp(3, 10)
+        }
+        _ => {
+            // High/Super speed: bInterval already encodes 2^(bInterval-1)
+            // microframes, so the xHCI Interval is bInterval-1, clamped [0,15].
+            (b_interval.max(1) - 1).min(15)
+        }
+    }
+}
+
 /// For every addressed device with a parsed Configuration, build the EP
 /// contexts for every endpoint of its first interface, issue Configure
 /// Endpoint (TRB type 12), and then SET_CONFIGURATION (control OUT,
@@ -1742,9 +2080,12 @@ pub fn configure_endpoints(
             for off in (0..entry_size).step_by(4) {
                 unsafe { write_volatile(ep_ctx.add(off) as *mut u32, 0) };
             }
-            // DW0 stays 0 (Interval = 0 is fine for Bulk; Interrupt would
-            // need the speed-specific interval encoding — left for later
-            // since usb-storage has no interrupt endpoints).
+            // DW0: Interval [23:16] for periodic (Interrupt/Isoch) endpoints so
+            // the controller actually schedules them — a HID mouse's interrupt-IN
+            // EP needs this. Bulk/Control ignore Interval, so it stays 0 for the
+            // MSC path. Max ESIT Payload Hi [31:24] left 0 (HID reports are tiny).
+            let interval = xhci_interval(res.speed, ep.transfer_type, ep.interval);
+            unsafe { write_volatile(ep_ctx as *mut u32, (interval as u32) << 16) };
             // DW1: CErr=3 in [2:1], EP Type in [5:3], Max Packet Size in [31:16].
             let dw1: u32 = (3u32 << 1)
                 | ((ep_type as u32) << 3)
@@ -1752,11 +2093,17 @@ pub fn configure_endpoints(
             unsafe { write_volatile(ep_ctx.add(4) as *mut u32, dw1) };
             // DW2..3 (u64): TR Dequeue Pointer | DCS=1.
             unsafe { write_volatile(ep_ctx.add(8) as *mut u64, tr as u64 | 1) };
-            // DW4: Average TRB Length — bandwidth-scheduling hint.
+            // DW4: Average TRB Length [15:0]; for periodic endpoints also Max
+            // ESIT Payload Lo [31:16], so the controller reserves bandwidth.
+            let esit: u32 = if ep.transfer_type == 3 || ep.transfer_type == 1 {
+                ep.max_packet_size as u32
+            } else {
+                0
+            };
             unsafe {
                 write_volatile(
                     ep_ctx.add(16) as *mut u32,
-                    ep.max_packet_size as u32,
+                    (ep.max_packet_size as u32) | (esit << 16),
                 )
             };
 
@@ -2144,6 +2491,47 @@ pub fn probe_mass_storage(
 /// Issue one Normal Transfer TRB on `st.slots[slot_idx].endpoints[ep_idx]`'s
 /// transfer ring, ring the slot's doorbell with the endpoint's DCI, and
 /// drain the matching Transfer Event. Returns `(completion_code, residue)`.
+/// Enqueue one Normal Transfer TRB (Cycle | ISP | IOC, type 1) on
+/// `slots[slot_idx].endpoints[ep_idx]`'s ring, handling Link-TRB wrap, and
+/// return `(slot_id, dci)` so the caller can ring the doorbell. Does not drain —
+/// shared by `bulk_transfer` (which then waits for completion) and the mouse arm
+/// (which leaves the TRB pending and checks for it on a later poll).
+fn post_normal_trb(
+    st: &mut XhciState,
+    slot_idx: usize,
+    ep_idx: usize,
+    buf: u64,
+    length: u32,
+) -> (u8, u8) {
+    let slot_id = st.slots[slot_idx].slot_id;
+    let ep = &mut st.slots[slot_idx].endpoints[ep_idx];
+    let dci = ep.dci;
+    let tr_ring = ep.tr_ring as *mut u8;
+    let trb = unsafe { tr_ring.add(ep.tr_enqueue * 16) };
+    unsafe {
+        write_volatile(trb as *mut u64, buf);
+        // Status: length in [16:0], TD Size = 0, Interrupter = 0.
+        write_volatile(trb.add(8) as *mut u32, length);
+        // Control: Cycle | ISP=1 | IOC=1 | TRB type=1 (Normal).
+        write_volatile(
+            trb.add(12) as *mut u32,
+            (ep.tr_pcs as u32) | (1u32 << 2) | (1u32 << 5) | (1u32 << 10),
+        );
+    }
+    ep.tr_enqueue += 1;
+    if ep.tr_enqueue == 255 {
+        let link = unsafe { tr_ring.add(255 * 16) };
+        unsafe {
+            let ctl = read_volatile(link.add(12) as *const u32);
+            let new_ctl = (ctl & !1) | ep.tr_pcs as u32;
+            write_volatile(link.add(12) as *mut u32, new_ctl);
+        }
+        ep.tr_enqueue = 0;
+        ep.tr_pcs ^= 1;
+    }
+    (slot_id, dci)
+}
+
 fn bulk_transfer(
     info: &XhciInfo,
     st: &mut XhciState,
@@ -2152,36 +2540,8 @@ fn bulk_transfer(
     buf: *mut u8,
     length: u32,
 ) -> Result<(u8, u32), &'static str> {
-    let slot_id = st.slots[slot_idx].slot_id;
-    let dci;
-    {
-        let ep = &mut st.slots[slot_idx].endpoints[ep_idx];
-        dci = ep.dci;
-        let tr_ring = ep.tr_ring as *mut u8;
-        let trb = unsafe { tr_ring.add(ep.tr_enqueue * 16) };
-        unsafe {
-            write_volatile(trb as *mut u64, buf as u64);
-            // Status: length in [16:0], TD Size = 0, Interrupter = 0.
-            write_volatile(trb.add(8) as *mut u32, length);
-            // Control: Cycle | ISP=1 | IOC=1 | TRB type=1 (Normal).
-            write_volatile(
-                trb.add(12) as *mut u32,
-                (ep.tr_pcs as u32) | (1u32 << 2) | (1u32 << 5) | (1u32 << 10),
-            );
-        }
-        ep.tr_enqueue += 1;
-        if ep.tr_enqueue == 255 {
-            let link = unsafe { tr_ring.add(255 * 16) };
-            unsafe {
-                let ctl = read_volatile(link.add(12) as *const u32);
-                let new_ctl = (ctl & !1) | ep.tr_pcs as u32;
-                write_volatile(link.add(12) as *mut u32, new_ctl);
-            }
-            ep.tr_enqueue = 0;
-            ep.tr_pcs ^= 1;
-        }
-    }
-    // Ring doorbell after the &mut borrow on `ep` is dropped.
+    let (slot_id, dci) = post_normal_trb(st, slot_idx, ep_idx, buf as u64, length);
+    // Ring the doorbell after the &mut borrow inside `post_normal_trb` is dropped.
     let db = (info.mmio_base + info.dboff as u64 + 4 * slot_id as u64) as *mut u32;
     unsafe { write_volatile(db, dci as u32) };
     let ev = drain_event(info, st, 32, 2_000_000)?;
@@ -2236,6 +2596,8 @@ fn msc_command(
     // ---- CBW transfer (bulk OUT) ----------------------------------
     let (cc, _) = bulk_transfer(info, st, slot_idx, bulk_out_idx, cbw.ptr(), CBW_LEN as u32)?;
     if cc != 1 {
+        // Clear the endpoint so the next command isn't blocked by a halt.
+        reset_bulk_endpoint(info, st, slot_idx, bulk_out_idx);
         return Err("CBW transfer xHCI cc != Success");
     }
 
@@ -2244,14 +2606,26 @@ fn msc_command(
         let ep_idx = if dir_in { bulk_in_idx } else { bulk_out_idx };
         let (cc, _) = bulk_transfer(info, st, slot_idx, ep_idx, data_buf, data_len)?;
         if cc != 1 && cc != 13 {
-            return Err("data stage xHCI cc != Success/Short Packet");
+            // BOT recovery: a stalled data stage halts this endpoint, but the
+            // device still owes us a CSW — clear the halt and read it below.
+            reset_bulk_endpoint(info, st, slot_idx, ep_idx);
         }
     }
 
-    // ---- CSW transfer (bulk IN) -----------------------------------
+    // ---- CSW transfer (bulk IN), with one stall-recovery retry ----
     let csw = DmaBuffer::new(CSW_LEN, 4096);
-    let (cc, _) = bulk_transfer(info, st, slot_idx, bulk_in_idx, csw.ptr(), CSW_LEN as u32)?;
-    if cc != 1 && cc != 13 {
+    let mut got_csw = false;
+    for _ in 0..2 {
+        let (cc, _) =
+            bulk_transfer(info, st, slot_idx, bulk_in_idx, csw.ptr(), CSW_LEN as u32)?;
+        if cc == 1 || cc == 13 {
+            got_csw = true;
+            break;
+        }
+        // Stall/error on the status stage: clear it and retry once.
+        reset_bulk_endpoint(info, st, slot_idx, bulk_in_idx);
+    }
+    if !got_csw {
         return Err("CSW transfer xHCI cc != Success/Short Packet");
     }
 
@@ -2548,6 +2922,215 @@ pub fn usb_drives_with_slots(booted_sys_guid: &[u8; 16]) -> Vec<(u8, DriveInfo)>
 /// Configure Endpoint + SET_CONFIGURATION → MSC probe) and return the
 /// resulting USB drives. Each step is idempotent, so calling this
 /// repeatedly is safe and only does new work as devices appear.
+// =====================================================================
+// USB-HID boot mouse. Built on the same enumeration/transfer machinery as
+// the mass-storage path: once a device's interrupt-IN endpoint is wired up
+// (configure_endpoints), put it in Boot Protocol and keep one interrupt
+// transfer armed, polling cooperatively from the UI loop.
+// See solved-issues/USB mouse on real hardware.md.
+// =====================================================================
+
+/// Relative movement + current button state, returned by `poll_mouse_delta`.
+#[derive(Clone, Copy)]
+pub struct MouseDelta {
+    pub dx: i32,
+    pub dy: i32,
+    pub left: bool,
+    pub right: bool,
+}
+
+/// Find an addressed + configured device exposing a HID **boot mouse** interface
+/// (class 0x03 / subclass 0x01 / protocol 0x02) with a configured interrupt-IN
+/// endpoint, put it in Boot Protocol (fixed 3-byte report — no HID report
+/// descriptor parsing needed), request idle-on-change, and arm the first
+/// transfer. Records it as `st.mouse`. Returns whether a mouse was set up.
+/// Idempotent: a second call with a mouse already bound is a no-op success.
+pub fn probe_hid_mouse(dev: &PciDevice, info: &XhciInfo) -> Result<bool, &'static str> {
+    let _ = dev;
+    let mut guard = STATE.lock();
+    let st = guard.as_mut().ok_or("bring up the controller first")?;
+    if !info.mmio_accessible {
+        return Err("MMIO not accessible");
+    }
+    if st.mouse.is_some() {
+        return Ok(true);
+    }
+
+    // A configured device whose interface is a boot mouse.
+    let candidate = st
+        .addressed
+        .iter()
+        .filter(|d| d.set_config_cc == 1)
+        .find_map(|d| {
+            d.config.as_ref().and_then(|c| {
+                c.interfaces.iter().find_map(|ifd| {
+                    (ifd.class == 0x03 && ifd.subclass == 0x01 && ifd.protocol == 0x02)
+                        .then_some((d.slot_id, ifd.number))
+                })
+            })
+        });
+    let (slot_id, interface_number) = match candidate {
+        Some(c) => c,
+        None => return Ok(false),
+    };
+    let slot_idx = match st.slots.iter().position(|s| s.slot_id == slot_id) {
+        Some(i) => i,
+        None => return Ok(false),
+    };
+    // The interrupt-IN endpoint (configure_endpoints wired interface 0's EPs).
+    let ep_idx = match st.slots[slot_idx]
+        .endpoints
+        .iter()
+        .position(|e| e.direction_in && e.transfer_type == 3)
+    {
+        Some(i) => i,
+        None => {
+            serial_println!("xhci: slot {} HID mouse but no interrupt-IN ep", slot_id);
+            return Ok(false);
+        }
+    };
+
+    // SET_PROTOCOL(Boot): class request (bmRequestType 0x21) to the interface.
+    let mut res = st.slots[slot_idx].clone();
+    match control_transfer(info, st, &mut res, 0x21, 0x0B, 0, interface_number as u16, 0) {
+        Ok((cc, _)) => {
+            serial_println!("xhci: slot {} SET_PROTOCOL(boot) cc={}", slot_id, cc)
+        }
+        Err(e) => {
+            serial_println!("xhci: slot {} SET_PROTOCOL failed: {}", slot_id, e);
+            st.slots[slot_idx] = res;
+            return Ok(false);
+        }
+    }
+    // SET_IDLE(0): report only on change. Best-effort — many devices stall it.
+    match control_transfer(info, st, &mut res, 0x21, 0x0A, 0, interface_number as u16, 0) {
+        Ok((cc, _)) => serial_println!("xhci: slot {} SET_IDLE cc={}", slot_id, cc),
+        Err(e) => serial_println!("xhci: slot {} SET_IDLE: {}", slot_id, e),
+    }
+    st.slots[slot_idx] = res;
+
+    // Persistent report buffer; record + arm.
+    let report_len =
+        (st.slots[slot_idx].endpoints[ep_idx].max_packet_size as u32).clamp(4, 8);
+    let report_buf = alloc_dma(report_len as usize, 64) as u64;
+    let dci = st.slots[slot_idx].endpoints[ep_idx].dci;
+    st.mouse = Some(MouseDevice {
+        slot_idx,
+        ep_idx,
+        slot_id,
+        report_buf,
+        report_len,
+        armed: false,
+        needs_reset: false,
+        accum_dx: 0,
+        accum_dy: 0,
+        buttons: 0,
+        dirty: false,
+    });
+    arm_mouse(info, st);
+    serial_println!(
+        "xhci: HID boot mouse armed (slot {}, if {}, ep dci {}, {} B reports)",
+        slot_id, interface_number, dci, report_len
+    );
+    Ok(true)
+}
+
+/// Bring up xHCI if needed, ensure devices are enumerated, then find + arm a HID
+/// boot mouse. Called once at boot before the UI. On a USB-booted machine the
+/// enumeration pipeline already ran during boot-disk discovery, so it is skipped
+/// here (re-running port reset could disturb the open boot disk) and we only
+/// probe. On an ATA-booted machine (QEMU) nothing has touched USB yet, so the
+/// full, idempotent pipeline runs first. Returns whether a mouse was armed.
+pub fn setup_mouse() -> bool {
+    let devices = pci::enumerate();
+    for dev in devices
+        .iter()
+        .filter(|d| d.class == 0x0C && d.subclass == 0x03 && d.prog_if == 0x30)
+    {
+        let info = match inspect(dev) {
+            Some(i) => i,
+            None => continue,
+        };
+        if current_addressed().is_empty() {
+            let _ = bring_up(dev, &info);
+            let _ = reset_and_enable_slots(dev, &info);
+            let _ = address_enabled_slots(dev, &info);
+            let _ = fetch_configurations(dev, &info);
+            let _ = configure_endpoints(dev, &info);
+        }
+        if let Ok(true) = probe_hid_mouse(dev, &info) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Is a USB-HID mouse bound? The UI uses this to choose its idle wait strategy
+/// (a USB mouse has no IRQ, so the loop must poll rather than `hlt` indefinitely).
+pub fn mouse_present() -> bool {
+    STATE.lock().as_ref().map_or(false, |s| s.mouse.is_some())
+}
+
+/// Cooperatively poll the HID mouse: consume every interrupt-IN completion the
+/// controller posted (each accumulates a report; we keep exactly one TRB armed),
+/// then return the net movement + buttons since the last poll. `None` if no mouse
+/// is bound or nothing changed. Cheap when idle (one event-ring peek). Called
+/// from the UI loop — never an IRQ (it takes the heap-backed xHCI lock).
+pub fn poll_mouse_delta() -> Option<MouseDelta> {
+    let mut guard = STATE.lock();
+    let st = guard.as_mut()?;
+    st.mouse.as_ref()?;
+    let info = st.info.clone();
+
+    // Recover an endpoint that halted during a prior event drain (deferred to
+    // here so we never issue a command wait from inside another drain).
+    if st.mouse.as_ref().map_or(false, |m| m.needs_reset) {
+        let (slot_idx, ep_idx) = {
+            let m = st.mouse.as_ref().unwrap();
+            (m.slot_idx, m.ep_idx)
+        };
+        reset_bulk_endpoint(&info, st, slot_idx, ep_idx);
+        if let Some(m) = st.mouse.as_mut() {
+            m.needs_reset = false;
+            m.armed = false;
+        }
+    }
+
+    // Consume everything ready; mouse completions are serviced inline.
+    while let Some(ev) = try_consume_event(&info, st) {
+        if ev.trb_type == 32 && is_mouse_slot(st, ev.slot_id) {
+            service_mouse(st, ev.completion_code);
+        }
+        // Stray non-mouse events shouldn't occur at idle (MSC drains its own
+        // transfers synchronously under the same lock); dropping them is harmless.
+    }
+    // Guarantee a TRB is always pending for the next report.
+    arm_mouse(&info, st);
+
+    let m = st.mouse.as_mut()?;
+    if !m.dirty {
+        return None;
+    }
+    let d = MouseDelta {
+        dx: m.accum_dx,
+        dy: m.accum_dy,
+        left: m.buttons & 0x01 != 0,
+        right: m.buttons & 0x02 != 0,
+    };
+    m.accum_dx = 0;
+    m.accum_dy = 0;
+    m.dirty = false;
+    Some(d)
+}
+
+/// Poll the HID mouse and forward any movement/buttons into the shared input
+/// queue, so the existing PS/2-shaped UI event loop drains it with no changes.
+pub fn pump_mouse() {
+    if let Some(d) = poll_mouse_delta() {
+        crate::ps2::feed_mouse_delta(d.dx, d.dy, d.left, d.right);
+    }
+}
+
 pub fn autopilot_usb_drives(booted_sys_guid: &[u8; 16]) -> Vec<DriveInfo> {
     let devices = pci::enumerate();
     for dev in devices.iter().filter(|d| {
@@ -2628,6 +3211,17 @@ pub fn completion_code_name(cc: u8) -> &'static str {
 
 use tablestore::block::SECTOR;
 use tablestore::{BlockDevice as TsBlockDevice, Result as TsResult, StoreError};
+
+/// Last low-level MSC failure detail, surfaced in the UI's otherwise-generic
+/// "I/O error" (the laptop has no serial console). Set on any read/write/flush
+/// failure; the UI takes and displays it.
+static LAST_MSC_ERR: Mutex<Option<alloc::string::String>> = Mutex::new(None);
+fn record_msc_err(detail: &str) {
+    *LAST_MSC_ERR.lock() = Some(alloc::string::String::from(detail));
+}
+pub fn take_last_msc_err() -> Option<alloc::string::String> {
+    LAST_MSC_ERR.lock().take()
+}
 
 /// Several public methods + the `block_size` field are part of the
 /// future-mount API (USB-booted TablesOS volume) and not consumed yet
@@ -2716,6 +3310,7 @@ impl UsbMscDevice {
         let tag = self.next_tag();
         msc_read_sector(self.slot_id, 0, &mut mbr, tag).map_err(|e| {
             serial_println!("UsbMscDevice: identity check READ(10) failed: {}", e);
+            record_msc_err(e);
             self.poisoned = true;
             StoreError::Io
         })?;
@@ -2747,7 +3342,11 @@ impl TsBlockDevice for UsbMscDevice {
             return Err(StoreError::Io);
         }
         let tag = self.next_tag();
-        msc_read_sector(self.slot_id, lba as u32, buf, tag).map_err(|_| StoreError::Io)
+        msc_read_sector(self.slot_id, lba as u32, buf, tag)
+            .map_err(|e| {
+                record_msc_err(e);
+                StoreError::Io
+            })
     }
 
     fn write_sector(&mut self, lba: u64, buf: &[u8]) -> TsResult<()> {
@@ -2761,7 +3360,11 @@ impl TsBlockDevice for UsbMscDevice {
         // we're still talking to the originally-booted disk.
         self.verify_identity()?;
         let tag = self.next_tag();
-        msc_write_sector(self.slot_id, lba as u32, buf, tag).map_err(|_| StoreError::Io)
+        msc_write_sector(self.slot_id, lba as u32, buf, tag)
+            .map_err(|e| {
+                record_msc_err(e);
+                StoreError::Io
+            })
     }
 
     fn flush(&mut self) -> TsResult<()> {
@@ -2769,7 +3372,15 @@ impl TsBlockDevice for UsbMscDevice {
             return Err(StoreError::Io);
         }
         let tag = self.next_tag();
-        msc_sync_cache(self.slot_id, tag).map_err(|_| StoreError::Io)
+        // SYNCHRONIZE CACHE is optional in USB Bulk-Only Transport; cheap sticks
+        // stall or Fail it. The endpoint is recovered by msc_command, and writes
+        // on these devices are write-through, so treat a failure as a no-op
+        // rather than failing the whole operation.
+        if let Err(e) = msc_sync_cache(self.slot_id, tag) {
+            record_msc_err(e);
+            serial_println!("UsbMscDevice: SYNC CACHE best-effort failed: {}", e);
+        }
+        Ok(())
     }
 }
 
@@ -2839,23 +3450,20 @@ fn msc_write_sector(
     let st = guard.as_mut().ok_or("xhci not brought up")?;
     let info = st.info.clone();
     let (slot_idx, bulk_in_idx, bulk_out_idx) = msc_resolve_bulk(st, slot_id)?;
-    let status = scsi_write10(
-        &info,
-        st,
-        slot_idx,
-        bulk_in_idx,
-        bulk_out_idx,
-        0,
-        lba,
-        1,
-        SECTOR as u32,
-        data,
-        tag,
-    )?;
-    if status != 0 {
-        return Err("WRITE(10) CSW status != 0");
+    // Retry once: a transient bulk stall on the first attempt halts the endpoint,
+    // which msc_command then clears (Reset Endpoint), so the second attempt lands.
+    let mut last: Result<(), &'static str> = Err("WRITE(10) not attempted");
+    for _ in 0..2 {
+        match scsi_write10(
+            &info, st, slot_idx, bulk_in_idx, bulk_out_idx, 0, lba, 1, SECTOR as u32,
+            data, tag,
+        ) {
+            Ok(0) => return Ok(()),
+            Ok(_) => last = Err("WRITE(10) CSW status != 0"),
+            Err(e) => last = Err(e),
+        }
     }
-    Ok(())
+    last
 }
 
 fn msc_sync_cache(slot_id: u8, tag: u32) -> Result<(), &'static str> {

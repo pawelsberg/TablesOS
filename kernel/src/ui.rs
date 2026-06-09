@@ -551,8 +551,15 @@ pub fn run<D: BlockDevice>(
         cursor_on: true,
         last_blink: interrupts::ticks(),
     };
+    // A USB-HID mouse delivers no IRQ — it is polled cooperatively below — so the
+    // idle path can't simply `hlt` and wait for one. Cache its presence once (it
+    // is bound at boot, before the UI starts).
+    let usb_mouse = xhci::mouse_present();
     app.render();
     loop {
+        // Pull any USB-HID mouse movement into the shared input queue first, so
+        // the drain below treats it exactly like a PS/2 event.
+        xhci::pump_mouse();
         // A full repaint blits the whole framebuffer, so doing one per input
         // event makes fast key-repeat (held arrows) enqueue faster than we can
         // draw — the screen appears to freeze under the backlog. Instead drain
@@ -604,6 +611,12 @@ pub fn run<D: BlockDevice>(
             app.render();
         } else if let Some((x, y)) = moved_to {
             app.draw_cursor(x, y);
+        } else if usb_mouse {
+            // A USB mouse has no IRQ to wake `hlt`, and the ~18 Hz timer alone
+            // would make the pointer crawl. Briefly pause (so the core isn't in a
+            // tight spin) and loop to poll it again — ~125 Hz when idle. Keyboard
+            // IRQs still enqueue and are picked up on the next iteration.
+            time::delay_ms(8);
         } else {
             // Idle: sleep until the next IRQ (input or the ~18 Hz timer tick,
             // which paces the blink).
@@ -4387,7 +4400,10 @@ fn wrap(s: &str, n: usize) -> Vec<String> {
 
 fn describe(e: &StoreError) -> String {
     match e {
-        StoreError::Io => "I/O error".into(),
+        StoreError::Io => match crate::usb::xhci::take_last_msc_err() {
+            Some(detail) => format!("I/O error: {detail}"),
+            None => "I/O error".into(),
+        },
         StoreError::Corrupt(m) => format!("corrupt store: {m}"),
         StoreError::OutOfSpace => "out of space (or transaction too large)".into(),
         StoreError::Parse(m) => m.clone(),
