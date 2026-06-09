@@ -176,6 +176,19 @@ enum Screen {
     About {
         top: usize,
     },
+    /// Pick a value from the target table of a foreign key. Reached from the Row
+    /// Editor when opening the builder (PgDn) on an FK field. Shows all rows
+    /// from the target table with their reference labels. On selection, the
+    /// target column's value is extracted and filled back into the FK field.
+    FkPick {
+        field_idx: usize,         // Index in the Editor's fields to fill on selection
+        from_col: String,         // Name of the FK source column (for feedback)
+        to_table: String,         // Target table name
+        to_col: String,           // Target column to extract (the column the FK references)
+        rows: Vec<(RowId, String)>, // (row id in target table, reference label)
+        sel: usize,               // Selected row index
+        top: usize,               // For scrolling if many rows
+    },
 }
 
 struct Field {
@@ -264,8 +277,13 @@ struct FieldBuilder {
     col_name: String,
     ty: Type,
     fields: Vec<PartField>,
-    focus: usize, // 0..fields.len() = fields, then [Now,] OK, Cancel
+    focus: usize, // 0..fields.len() = fields, then [Now,] [Next,] OK, Cancel
     error: Option<String>,
+    /// Canonical text of `max + 1` over the column's existing values, when this
+    /// is an *insert* into a UNIQUE integer/unsigned column. `Some` enables the
+    /// "[ Next ]" shortcut that fills a fresh, non-colliding key; `None`
+    /// otherwise (edits, non-unique columns, non-integer types).
+    next_value: Option<String>,
 }
 
 /// Does this type carry calendar/clock components (and thus a "fill current
@@ -352,12 +370,19 @@ impl FieldBuilder {
             fields,
             focus: 0,
             error: None,
+            next_value: None,
         }
     }
 
     /// Does this builder offer the "fill current value" action?
     fn has_now(&self) -> bool {
         is_datetime(self.ty)
+    }
+
+    /// Does this builder offer the "fill max+1" action (UNIQUE integer/unsigned
+    /// column on insert)?
+    fn has_next(&self) -> bool {
+        self.next_value.is_some()
     }
 
     /// Focus index of the `[ Now ]` button, if present.
@@ -368,8 +393,18 @@ impl FieldBuilder {
             None
         }
     }
+    /// Focus index of the `[ Next ]` button, if present. It follows `[ Now ]`
+    /// (the two are mutually exclusive in practice — a column is never both a
+    /// date/time and an integer — but the layout stays well-defined regardless).
+    fn next_index(&self) -> Option<usize> {
+        if self.has_next() {
+            Some(self.fields.len() + self.has_now() as usize)
+        } else {
+            None
+        }
+    }
     fn ok_index(&self) -> usize {
-        self.fields.len() + self.has_now() as usize
+        self.fields.len() + self.has_now() as usize + self.has_next() as usize
     }
     fn cancel_index(&self) -> usize {
         self.ok_index() + 1
@@ -455,6 +490,19 @@ impl FieldBuilder {
         self.set(PartId::OffSign, String::new(), false);
         self.set(PartId::OffHour, num2(0), false);
         self.set(PartId::OffMin, num2(0), false);
+        true
+    }
+
+    /// Fill the sign/digits parts from the precomputed `next_value` (`max + 1`).
+    /// A no-op unless [`has_next`](FieldBuilder::has_next). The unsigned type has
+    /// no `Sign` part, so that `set` is silently ignored there.
+    fn fill_next(&mut self) -> bool {
+        let Some(text) = self.next_value.clone() else {
+            return false;
+        };
+        let (neg, int, _frac) = split_number(&text);
+        self.set(PartId::Sign, String::new(), neg);
+        self.set(PartId::IntDigits, int, false);
         true
     }
 
@@ -1264,6 +1312,56 @@ impl<D: BlockDevice> App<D> {
                 }
                 Screen::CreateOsPick { candidates, sel }
             }
+            Screen::FkPick { field_idx, from_col, to_table, to_col, rows, mut sel, mut top } => {
+                let n = rows.len();
+                if sel >= n {
+                    sel = n.saturating_sub(1);
+                }
+                let visible = visible_rows().max(1);
+                match k {
+                    Key::Esc => nav = Nav::Pop,
+                    Key::Up if sel > 0 => {
+                        sel -= 1;
+                        if sel < top {
+                            top = sel;
+                        }
+                    }
+                    Key::Down if sel + 1 < n => {
+                        sel += 1;
+                        if sel >= top + visible {
+                            top = sel - visible + 1;
+                        }
+                    }
+                    Key::PageUp => {
+                        sel = sel.saturating_sub(visible);
+                        top = top.saturating_sub(visible);
+                    }
+                    Key::PageDown => {
+                        sel = (sel + visible).min(n.saturating_sub(1));
+                        top = (top + visible).min(n.saturating_sub(visible));
+                    }
+                    Key::Enter if !rows.is_empty() => {
+                        let (selected_id, _label) = rows[sel].clone();
+                        // Extract the to_col value from the selected row and fill
+                        // it back. Only close the picker if it succeeded; on
+                        // failure stay open so the error status survives (a
+                        // `Nav::Pop` clears the status).
+                        if self.fk_select(field_idx, selected_id, to_table.clone(), to_col.clone()) {
+                            nav = Nav::Pop;
+                        }
+                    }
+                    _ => {}
+                }
+                Screen::FkPick {
+                    field_idx,
+                    from_col,
+                    to_table,
+                    to_col,
+                    rows,
+                    sel,
+                    top,
+                }
+            }
             Screen::InstallResult { report } => {
                 if matches!(k, Key::Esc | Key::Enter) {
                     nav = Nav::PopToList;
@@ -1801,27 +1899,170 @@ impl<D: BlockDevice> App<D> {
     }
 
     /// Open the structured value builder for editor field `fi`, seeded from its
-    /// current text when that parses as the column's type.
+    /// current text when that parses as the column's type. For FK fields,
+    /// opens a picker instead of the part-based builder.
     fn open_builder(&mut self, fi: usize) {
-        let Screen::Editor(ed) = self.top() else {
-            return;
+        let (ty, col_name, table, unique, is_insert) = {
+            let Screen::Editor(ed) = self.top() else {
+                return;
+            };
+            let col = &ed.cols[fi];
+            (col.ty, col.name.clone(), ed.table.clone(), col.unique, ed.id.is_none())
         };
-        let ty = ed.cols[fi].ty;
-        let col_name = ed.cols[fi].name.clone();
+        // After releasing the borrow, check if this column is a FK source.
+        let fk_target = self.store.get_table(&table)
+            .ok()
+            .and_then(|t| {
+                t.fks
+                    .iter()
+                    .find(|fk| fk.from_col == col_name)
+                    .map(|fk| (fk.to_table.clone(), fk.to_col.clone()))
+            });
+        // FK fields: open a picker instead of the part-based builder.
+        if let Some((to_table, to_col)) = fk_target {
+            self.open_fk_picker(fi, &col_name, &to_table, &to_col);
+            return;
+        }
         let mut b = FieldBuilder::new(fi, col_name, ty);
-        let f = &ed.fields[fi];
-        if !f.is_null && !f.value.is_empty() {
-            if let Ok(v) = Value::parse(ty, &f.value) {
-                b.load_from(&v);
+        // Seed from existing value if present and parseable.
+        {
+            let Screen::Editor(ed) = self.top() else {
+                return;
+            };
+            let f = &ed.fields[fi];
+            if !f.is_null && !f.value.is_empty() {
+                if let Ok(v) = Value::parse(ty, &f.value) {
+                    b.load_from(&v);
+                }
             }
         }
+        // On insert into a UNIQUE integer/unsigned column, offer the "[ Next ]"
+        // shortcut that fills max+1 — a fresh, non-colliding key.
+        if is_insert && unique {
+            b.next_value = self.next_unique_value(&table, fi, ty);
+        }
         self.push(Screen::Builder(b));
+    }
+
+    /// Open an FK value picker for the source column `from_col`, which targets
+    /// `to_table.to_col`. Loads all rows from the target table and shows their
+    /// reference labels.
+    fn open_fk_picker(&mut self, field_idx: usize, from_col: &str, to_table: &str, to_col: &str) {
+        let rows = match self.store.scan(to_table) {
+            Ok(r) => r,
+            Err(e) => {
+                self.err(e);
+                return;
+            }
+        };
+        let schema = match self.store.get_table(to_table) {
+            Ok(s) => s,
+            Err(e) => {
+                self.err(e);
+                return;
+            }
+        };
+        // Extract rows as (id, reference_label) pairs. Skip rows where to_col is NULL.
+        let mut fk_rows: Vec<(RowId, String)> = Vec::new();
+        for (id, row) in rows {
+            let label = schema.reference_label(&row);
+            fk_rows.push((id, label));
+        }
+        // If empty, warn but don't crash — let the user cancel and retry.
+        if fk_rows.is_empty() {
+            self.status = format!("no rows in '{to_table}' to pick from");
+            return;
+        }
+        self.push(Screen::FkPick {
+            field_idx,
+            from_col: from_col.to_string(),
+            to_table: to_table.to_string(),
+            to_col: to_col.to_string(),
+            rows: fk_rows,
+            sel: 0,
+            top: 0,
+        });
+    }
+
+    /// Canonical text of `max(col) + 1` for a UNIQUE integer/unsigned column,
+    /// used to seed the Row Editor's "[ Next ]" shortcut. Returns `None` for
+    /// other types or when the table can't be scanned. An empty (or all-NULL)
+    /// column seeds at `"1"`, so the first generated key is 1.
+    fn next_unique_value(&mut self, table: &str, col: usize, ty: Type) -> Option<String> {
+        if ty != Type::Integer && ty != Type::UnsignedInteger {
+            return None;
+        }
+        let rows = self.store.scan(table).ok()?;
+        let max = rows
+            .iter()
+            .filter_map(|(_, r)| r.get(col).and_then(|c| c.as_ref()))
+            .max();
+        Some(match max {
+            Some(Value::Unsigned(u)) => Value::Unsigned(u.succ()).display(),
+            Some(Value::Integer(i)) => Value::Integer(i.succ()).display(),
+            _ => String::from("1"),
+        })
+    }
+
+    /// Extract the selected FK value from the target row and fill it back into
+    /// the Editor field. Returns `true` on success (so the caller pops the
+    /// picker); on failure it sets `self.status` and returns `false` so the
+    /// picker stays open with the message visible (a `Nav::Pop` would clear it).
+    fn fk_select(&mut self, field_idx: usize, selected_id: RowId, to_table: String, to_col: String) -> bool {
+        // Get the column index in the target table.
+        let Some(target_schema) = self.store.get_table(&to_table).ok() else {
+            self.status = format!("could not load '{to_table}'");
+            return false;
+        };
+        let Some(col_idx) = target_schema.column_index(&to_col) else {
+            self.status = format!("column '{to_col}' not found in '{to_table}'");
+            return false;
+        };
+        // Get the selected row and extract the value.
+        let Ok(row) = self.store.get_row(&to_table, selected_id) else {
+            self.status = "could not load selected row".into();
+            return false;
+        };
+        let value_text = match row.get(col_idx) {
+            Some(Some(v)) => v.display(),
+            Some(None) => {
+                // Target column is NULL — not valid for FK assignment.
+                self.status = "selected row has NULL in the target column".into();
+                return false;
+            }
+            None => {
+                self.status = "column index out of range".into();
+                return false;
+            }
+        };
+        // Write the value into the Row Editor. We're called from inside
+        // `dispatch`, where the FkPick screen has been temporarily moved out and
+        // a placeholder put on `top()`; the Editor is the screen *beneath* it.
+        // Reach down to the nearest Editor on the stack rather than `top()`
+        // (which is the placeholder, not the Editor).
+        let editor = self.stack.iter_mut().rev().find_map(|s| match s {
+            Screen::Editor(ed) => Some(ed),
+            _ => None,
+        });
+        let Some(ed) = editor else {
+            return false;
+        };
+        let Some(f) = ed.fields.get_mut(field_idx) else {
+            return false;
+        };
+        f.caret = value_text.chars().count();
+        f.value = value_text;
+        f.is_null = false;
+        ed.error = None;
+        ed.focus = field_idx;
+        true
     }
 
     fn key_builder(&mut self, k: Key) {
         let mut want_cancel = false;
         let mut want_commit = false;
         let mut want_now = false;
+        let mut want_next = false;
         {
             let Screen::Builder(b) = self.top() else {
                 return;
@@ -1829,6 +2070,7 @@ impl<D: BlockDevice> App<D> {
             let nf = b.fields.len();
             let total = b.total();
             let now_i = b.now_index();
+            let next_i = b.next_index();
             let cancel_i = b.cancel_index();
             match k {
                 Key::Esc => want_cancel = true,
@@ -1837,6 +2079,10 @@ impl<D: BlockDevice> App<D> {
                 // `n` fills the current value — but only for the date/time
                 // types; for a string field `n` is a literal to be typed.
                 Key::Char('n') | Key::Char('N') if b.has_now() => want_now = true,
+                // For a UNIQUE integer/unsigned column `n` instead fills max+1
+                // (the two never coexist — a column isn't both a date and an
+                // integer). Digits don't reach this arm, so it can't shadow them.
+                Key::Char('n') | Key::Char('N') if b.has_next() => want_next = true,
                 // On a sign part ←/→ flip the sign; on a typed part they move
                 // the caret. (The sign arm is listed first so it wins.)
                 Key::Left | Key::Right if b.focus < nf && b.fields[b.focus].id.is_sign() => {
@@ -1882,6 +2128,8 @@ impl<D: BlockDevice> App<D> {
                 Key::Enter => {
                     if Some(b.focus) == now_i {
                         want_now = true;
+                    } else if Some(b.focus) == next_i {
+                        want_next = true;
                     } else if b.focus == cancel_i {
                         want_cancel = true;
                     } else {
@@ -1901,6 +2149,13 @@ impl<D: BlockDevice> App<D> {
                     self.status = "filled current date/time".into();
                 } else {
                     self.status = "RTC unavailable — enter the value manually".into();
+                }
+            }
+        } else if want_next {
+            if let Screen::Builder(b) = self.top() {
+                if b.fill_next() {
+                    b.error = None;
+                    self.status = "filled next unique value (max+1)".into();
                 }
             }
         } else if want_commit {
@@ -2200,6 +2455,7 @@ impl<D: BlockDevice> App<D> {
             Screen::Drives { sel, .. } => *sel = i,
             Screen::Pci { sel, .. } => *sel = i,
             Screen::CreateOsPick { sel, .. } => *sel = i,
+            Screen::FkPick { sel, .. } => *sel = i,
             Screen::Editor(ed) => ed.focus = i,
             Screen::Builder(b) => b.focus = i,
             _ => {}
@@ -2393,9 +2649,10 @@ impl<D: BlockDevice> App<D> {
             9 => self.frame_pci(status),
             10 => self.frame_xhci(status),
             11 => self.frame_create_os_pick(status),
-            12 => self.frame_install_result(status),
-            14 => self.frame_refcols(status),
-            15 => self.frame_about(status),
+            12 => self.frame_fk_pick(status),
+            13 => self.frame_install_result(status),
+            15 => self.frame_refcols(status),
+            16 => self.frame_about(status),
             _ => self.frame_builder(status),
         }
     }
@@ -2735,6 +2992,8 @@ impl<D: BlockDevice> App<D> {
         body.push(line(
             if b.has_now() {
                 "[Tab/↑↓] field  [←→ Home/End] caret  type to edit  [n] = current value  [Enter] OK  [Esc] cancel"
+            } else if b.has_next() {
+                "[Tab/↑↓] field  [←→ Home/End] caret  type to edit  [n] = max+1  [Enter] OK  [Esc] cancel"
             } else {
                 "[Tab/↑↓] field  [←→ Home/End] caret  type to edit  [Enter] OK  [Esc] cancel"
             },
@@ -2810,6 +3069,22 @@ impl<D: BlockDevice> App<D> {
                     LineKind::Accent
                 },
             ).hit(Hit::Activate(ni)));
+        }
+        if let Some(xi) = b.next_index() {
+            // The generated value rides along in the label so a glance (or a
+            // hover) shows exactly what will be filled in.
+            let label = match &b.next_value {
+                Some(v) => format!("[ Next: {v} ]"),
+                None => String::from("[ Next ]"),
+            };
+            body.push(line(
+                &label,
+                if b.focus == xi {
+                    LineKind::Selected
+                } else {
+                    LineKind::Accent
+                },
+            ).hit(Hit::Activate(xi)));
         }
         body.push(line(
             "[ OK ]",
@@ -3796,6 +4071,53 @@ impl<D: BlockDevice> App<D> {
         }
     }
 
+    fn frame_fk_pick(&mut self, status: String) -> Frame {
+        let (from_col, to_table, to_col, rows, sel, top) = match self.top() {
+            Screen::FkPick { from_col, to_table, to_col, rows, sel, top, .. } => {
+                (from_col.clone(), to_table.clone(), to_col.clone(), rows.clone(), *sel, *top)
+            }
+            _ => unreachable!(),
+        };
+        let mut body = Vec::new();
+        body.push(line(
+            "[↑↓] select  [PgUp/Dn] page  [Enter] pick  [Esc] cancel",
+            LineKind::Dim,
+        ).hit(Hit::Shortcuts));
+        body.push(line("", LineKind::Normal));
+        body.push(line(
+            &format!("Pick a {to_table} for '{from_col}' (references {to_col})"),
+            LineKind::Accent,
+        ));
+        body.push(line("", LineKind::Normal));
+        let visible = visible_rows().max(1);
+        for (i, (_id, label)) in rows.iter().enumerate() {
+            if i < top {
+                continue;
+            }
+            if i >= top + visible {
+                break;
+            }
+            let kind = if i == sel {
+                LineKind::Selected
+            } else {
+                LineKind::Normal
+            };
+            body.push(line(label, kind).hit(Hit::Activate(i)));
+        }
+        // If the list is empty, show a message.
+        if rows.is_empty() {
+            body.push(line("(no rows to pick from)", LineKind::Dim));
+        }
+        Frame {
+            title: format!("FK Picker — {}", to_table),
+            bg: fbm::C_BG_EDIT,
+            body,
+            status,
+            cell_hls: Vec::new(),
+            cursor: None,
+        }
+    }
+
     fn frame_install_result(&mut self, status: String) -> Frame {
         let report = match self.top() {
             Screen::InstallResult { report } => report.clone(),
@@ -4128,10 +4450,11 @@ fn screen_tag(s: &Screen) -> u8 {
         Screen::Pci { .. } => 9,
         Screen::Xhci { .. } => 10,
         Screen::CreateOsPick { .. } => 11,
-        Screen::InstallResult { .. } => 12,
-        Screen::Builder(_) => 13,
-        Screen::RefCols { .. } => 14,
-        Screen::About { .. } => 15,
+        Screen::FkPick { .. } => 12,
+        Screen::InstallResult { .. } => 13,
+        Screen::Builder(_) => 14,
+        Screen::RefCols { .. } => 15,
+        Screen::About { .. } => 16,
     }
 }
 
@@ -4434,17 +4757,61 @@ fn column_for_error(cols: &[Column], fks: &[ForeignKey], e: &StoreError) -> usiz
         .unwrap_or(0)
 }
 
-/// Power off. QEMU/Bochs expose ACPI-ish poweroff I/O ports; we try the
-/// common ones, then fall back to halting (the spec's "switches off the
-/// power" — real ACPI/APM on arbitrary hardware is out of scope, documented).
+/// Power off the machine.
+///
+/// Order matters and is the fix for the "shutdown hangs on real hardware" bug
+/// (`solved-issues/Shutdown on real hardware.md`): the old code wrote only the
+/// QEMU/Bochs/virt emulator power ports, which are unconnected on a physical PC,
+/// so it silently fell into the `hlt` loop and the machine appeared to freeze.
+///
+///   1. **ACPI S5 soft-off** ([`crate::acpi::poweroff`]) — the correct,
+///      universal power-off and the only thing that works on real hardware. It
+///      also powers off QEMU (whose FADT puts PM1a_CNT at 0x604 with
+///      SLP_TYPa=0), so this path is exercised in the emulator on every run.
+///      It returns only if it could *not* power off.
+///   2. **Emulator magic ports** — kept as a belt-and-suspenders fall-back in
+///      case ACPI-table discovery ever fails. No-ops on real hardware.
+///   3. **Halt with an explicit on-screen message** — so a machine that truly
+///      can't self-power-off shows "safe to turn off" plus the ACPI failure
+///      reason, instead of a frozen-looking UI (the laptop has no serial).
 fn shutdown() -> ! {
     use x86_64::instructions::port::Port;
+
+    // No more input; mask interrupts so nothing races the power-off sequence.
+    x86_64::instructions::interrupts::disable();
+
+    // A frozen UI looks like a crash — tell the user we're on our way out.
+    fbm::with(|d| {
+        let (w, h) = (d.width(), d.height());
+        d.fill_rect(0, 0, w, h, fbm::C_BAR);
+        let x = MARGIN * 2;
+        d.draw_text_glow(x, h / 2 - CELL_H, "TABLESOS - SHUTTING DOWN", fbm::C_FG, fbm::C_GLOW, Font::Display);
+        d.draw_text(x, h / 2 + CELL_H, "Powering off...", fbm::C_DIM, Font::Body);
+        d.blit();
+    });
+
+    // 1. The real fix: ACPI S5 soft-off (works on physical hardware and QEMU).
+    let why = crate::acpi::poweroff();
+
+    // 2. Fall-back for emulators if ACPI discovery failed; no-ops on real iron.
     unsafe {
         Port::<u16>::new(0x604).write(0x2000); // QEMU >= 2.0
         Port::<u16>::new(0xB004).write(0x2000); // older QEMU / Bochs
         Port::<u16>::new(0x4004).write(0x3400); // virt
     }
-    serial_println!("shutdown requested; halting");
+
+    // 3. Nothing cut the power. Say so plainly (with the diagnostic reason) and
+    //    halt, so it's safe to hold the hardware power button.
+    serial_println!("shutdown: could not power off ({why}); halted");
+    fbm::with(|d| {
+        let (w, h) = (d.width(), d.height());
+        d.fill_rect(0, 0, w, h, fbm::C_BAR);
+        let x = MARGIN * 2;
+        d.draw_text_glow(x, h / 2 - CELL_H, "IT IS NOW SAFE TO TURN OFF YOUR COMPUTER", fbm::C_FG, fbm::C_GLOW, Font::Display);
+        d.draw_text(x, h / 2 + CELL_H, "Automatic power-off is unavailable on this machine.", fbm::C_DIM, Font::Body);
+        d.draw_text(x, h / 2 + CELL_H * 2, why, fbm::C_DIM, Font::Body);
+        d.blit();
+    });
     loop {
         x86_64::instructions::hlt();
     }

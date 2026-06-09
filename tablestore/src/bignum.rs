@@ -99,6 +99,53 @@ impl BigUint {
     pub fn digit_count(&self) -> usize {
         self.digits.len()
     }
+
+    /// `self + 1`, computed directly on the decimal digits (we keep no binary
+    /// representation). Used only by the UI's "next unique value" shortcut —
+    /// the engine itself still performs no arithmetic on stored values.
+    pub fn succ(&self) -> BigUint {
+        let mut digits = self.digits.clone(); // most-significant-first
+        let mut i = digits.len();
+        loop {
+            if i == 0 {
+                digits.insert(0, 1); // carry rippled off the top (…9 -> 1 0…, or 0 -> 1)
+                break;
+            }
+            i -= 1;
+            if digits[i] == 9 {
+                digits[i] = 0; // carry
+            } else {
+                digits[i] += 1;
+                break;
+            }
+        }
+        let mut v = BigUint { digits };
+        v.normalize();
+        v
+    }
+
+    /// `self - 1`, saturating at zero (`0.pred() == 0`). Companion to
+    /// [`succ`](BigUint::succ); used to take the successor of a negative
+    /// [`BigInt`] (whose magnitude *decreases* as the value increases).
+    pub fn pred(&self) -> BigUint {
+        let mut digits = self.digits.clone();
+        let mut i = digits.len();
+        loop {
+            if i == 0 {
+                break; // self was zero — saturate
+            }
+            i -= 1;
+            if digits[i] == 0 {
+                digits[i] = 9; // borrow
+            } else {
+                digits[i] -= 1;
+                break;
+            }
+        }
+        let mut v = BigUint { digits };
+        v.normalize();
+        v
+    }
 }
 
 impl PartialOrd for BigUint {
@@ -170,6 +217,18 @@ impl BigInt {
         s.push_str(&self.mag.to_dec_string());
         s
     }
+
+    /// `self + 1`. For a non-negative value the magnitude grows by one; for a
+    /// negative value it *shrinks* (`-3 -> -2`, `-1 -> 0`). `from_parts` drops
+    /// any resulting "negative zero". Backs the UI's "next unique value"
+    /// shortcut on signed-integer columns.
+    pub fn succ(&self) -> BigInt {
+        if self.negative {
+            BigInt::from_parts(true, self.mag.pred())
+        } else {
+            BigInt::from_parts(false, self.mag.succ())
+        }
+    }
 }
 
 impl PartialOrd for BigInt {
@@ -228,6 +287,33 @@ mod tests {
         assert!(BigInt::parse("-1").unwrap() < BigInt::parse("1").unwrap());
         assert!(BigInt::parse("lol").is_none());
         assert!(BigInt::parse("-").is_none());
+    }
+
+    #[test]
+    fn unsigned_succ_and_pred() {
+        let s = |x: &str| BigUint::parse(x).unwrap().succ().to_dec_string();
+        let p = |x: &str| BigUint::parse(x).unwrap().pred().to_dec_string();
+        assert_eq!(s("0"), "1");
+        assert_eq!(s("9"), "10");
+        assert_eq!(s("199"), "200");
+        assert_eq!(s(&"9".repeat(50)), format!("1{}", "0".repeat(50)));
+        assert_eq!(p("1"), "0");
+        assert_eq!(p("10"), "9");
+        assert_eq!(p("200"), "199");
+        assert_eq!(p("0"), "0"); // saturates
+    }
+
+    #[test]
+    fn signed_succ() {
+        let s = |x: &str| BigInt::parse(x).unwrap().succ().to_dec_string();
+        assert_eq!(s("0"), "1");
+        assert_eq!(s("41"), "42");
+        assert_eq!(s("-1"), "0");
+        assert_eq!(s("-3"), "-2");
+        assert_eq!(s(&format!("-{}", "1".to_string() + &"0".repeat(20))), {
+            // -100…0 + 1 = -99…9
+            format!("-{}", "9".repeat(20))
+        });
     }
 
     #[test]

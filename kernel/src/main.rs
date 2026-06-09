@@ -13,6 +13,7 @@
 
 extern crate alloc;
 
+mod acpi;
 mod allocator;
 mod assets;
 mod ata;
