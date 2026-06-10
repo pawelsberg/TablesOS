@@ -442,13 +442,18 @@ fn split_tz(s: &str) -> Option<(&str, i16)> {
     if let Some(stripped) = s.strip_suffix('Z').or_else(|| s.strip_suffix('z')) {
         return Some((stripped, 0));
     }
-    // Find the offset sign that starts the +HH:MM / -HH:MM suffix (6 chars).
+    // Find the offset sign that starts the +HH:MM / -HH:MM suffix (6 bytes).
+    // `cut` is a byte index; if it lands inside a multi-byte character the
+    // suffix cannot be an ASCII offset (and slicing there would panic), so
+    // check the boundary first.
     if s.len() >= 6 {
         let cut = s.len() - 6;
-        let tail = &s[cut..];
-        if (tail.starts_with('+') || tail.starts_with('-')) && tail.as_bytes()[3] == b':' {
-            if let Some(off) = parse_offset(tail) {
-                return Some((&s[..cut], off));
+        if s.is_char_boundary(cut) {
+            let tail = &s[cut..];
+            if (tail.starts_with('+') || tail.starts_with('-')) && tail.as_bytes()[3] == b':' {
+                if let Some(off) = parse_offset(tail) {
+                    return Some((&s[..cut], off));
+                }
             }
         }
     }
@@ -540,5 +545,17 @@ mod tests {
             p(Type::DateTimeTz, "2024-01-01T12:00:00+00:00")
                 != p(Type::DateTimeTz, "2024-01-01T13:00:00+01:00")
         );
+    }
+
+    #[test]
+    fn zoned_parse_rejects_multibyte_garbage_without_panic() {
+        // "€€a" is 7 bytes; `len - 6` lands inside the first '€'. This used to
+        // panic on the char-boundary slice in `split_tz`; it must just Err.
+        assert!(Value::parse(Type::DateTimeTz, "€€a").is_err());
+        assert!(Value::parse(Type::DateTz, "€€a").is_err());
+        assert!(Value::parse(Type::DateTimeTz, "a\u{e9}\u{e9}\u{e9}\u{e9}").is_err());
+        // A valid offset after multi-byte garbage still reaches the date/time
+        // parser (and is rejected there), not the slicing code.
+        assert!(Value::parse(Type::DateTimeTz, "€€+01:00").is_err());
     }
 }

@@ -410,6 +410,10 @@ impl<D: BlockDevice> Store<D> {
             }
         }
         // Foreign keys — referenced value must exist (non-NULL) in target.
+        // When the target table is this table and the row being updated
+        // (`exclude`) is scanned, the pending `cells` stand in for its stored
+        // values: a self-referencing row may change its key and its reference
+        // together, and is checked against the state the update will produce.
         for fk in &t.fks {
             let fi = t
                 .column_index(&fk.from_col)
@@ -420,10 +424,21 @@ impl<D: BlockDevice> Store<D> {
             let tcol = tt
                 .column_index(&fk.to_col)
                 .ok_or_else(|| StoreError::Corrupt("fk target column"))?;
-            let exists = self
-                .all_values_in(&cat[tj].clone(), tcol)?
-                .into_iter()
-                .any(|ov| ov.as_ref() == Some(v));
+            let mut exists = false;
+            for (rid, head) in self.index_collect(cat[tj].data_head)? {
+                let val = if tj == ti && Some(rid) == exclude {
+                    cells.get(tcol).cloned().flatten()
+                } else {
+                    decode_row(&self.read_chain(head)?)?
+                        .get(tcol)
+                        .cloned()
+                        .flatten()
+                };
+                if val.as_ref() == Some(v) {
+                    exists = true;
+                    break;
+                }
+            }
             if !exists {
                 return Err(StoreError::ForeignKeyViolation {
                     fk: fk.name.clone(),
@@ -879,6 +894,10 @@ impl<D: BlockDevice> Store<D> {
         })
     }
 
+    /// Update a row in place. Like [`delete`](Store::delete) this restricts on
+    /// inbound references: changing a value in a foreign-key *target* column is
+    /// refused while any other live row still references the old value, so an
+    /// update can never leave a dangling reference.
     pub fn update(&mut self, table: &str, id: RowId, cells: Vec<Option<Value>>) -> Result<()> {
         self.tx(|s| {
             let cat = s.load_catalog()?;
@@ -886,6 +905,38 @@ impl<D: BlockDevice> Store<D> {
             let t = s.schema_of(&cat[i].clone())?;
             s.validate(&cat, i, &t, &cells, Some(id))?;
             let old = s.row_head_at(id)?;
+            // Restrict: for every FK targeting this table, a changed key must
+            // not orphan the rows that reference its old value. The row being
+            // updated is skipped — its own reference is replaced by `cells`
+            // and was validated above.
+            let old_row = s.decode_row_fitted(old, t.columns.len())?;
+            for (j, e) in cat.clone().iter().enumerate() {
+                let ot = s.schema_of(&e.clone())?;
+                for fk in &ot.fks {
+                    if fk.to_table != table {
+                        continue;
+                    }
+                    let tci = t.column_index(&fk.to_col).unwrap();
+                    let Some(old_key) = old_row.get(tci).cloned().flatten() else {
+                        continue;
+                    };
+                    if cells.get(tci).cloned().flatten().as_ref() == Some(&old_key) {
+                        continue; // key unchanged — references stay valid
+                    }
+                    let fci = ot.column_index(&fk.from_col).unwrap();
+                    for (rid, rh) in s.index_collect(cat[j].data_head)? {
+                        if j == i && rid == id {
+                            continue;
+                        }
+                        let orow = decode_row(&s.read_chain(rh)?)?;
+                        if orow.get(fci).cloned().flatten().as_ref() == Some(&old_key) {
+                            return Err(StoreError::ForeignKeyViolation {
+                                fk: fk.name.clone(),
+                            });
+                        }
+                    }
+                }
+            }
             let new = s.write_chain(&encode_row(&cells))?;
             s.index_set(id.index_page, id.slot, new)?;
             s.free_chain(old)?;
@@ -1098,6 +1149,78 @@ mod tests {
 
         // Persist + remount.
         st.sync().unwrap();
+    }
+
+    #[test]
+    fn update_restricts_referenced_key_changes() {
+        let mut st = Store::format(dev()).unwrap();
+        st.create_table("person").unwrap();
+        st.add_column("person", col("id", Type::UnsignedInteger, false, true))
+            .unwrap();
+        st.add_column("person", col("name", Type::String, true, false))
+            .unwrap();
+        st.add_column("person", col("boss", Type::UnsignedInteger, true, false))
+            .unwrap();
+        st.add_fk("person", "boss", "person", "id").unwrap();
+
+        let alice = st
+            .insert("person", alloc::vec![iv("1"), sv("Alice"), None])
+            .unwrap();
+        let bob = st
+            .insert("person", alloc::vec![iv("2"), sv("Bob"), iv("1")])
+            .unwrap();
+
+        // Bob references id 1, so changing Alice's id would dangle — refused.
+        assert!(matches!(
+            st.update("person", alice, alloc::vec![iv("5"), sv("Alice"), None]),
+            Err(StoreError::ForeignKeyViolation { .. })
+        ));
+        // Non-key cells of a referenced row may still change freely.
+        st.update("person", alice, alloc::vec![iv("1"), sv("Alicia"), None])
+            .unwrap();
+        // Re-point Bob elsewhere, then Alice's key is free to change.
+        st.update("person", bob, alloc::vec![iv("2"), sv("Bob"), iv("2")])
+            .unwrap();
+        st.update("person", alice, alloc::vec![iv("5"), sv("Alicia"), None])
+            .unwrap();
+
+        // No dangling reference may exist afterwards.
+        let rows = st.scan("person").unwrap();
+        let ids: alloc::vec::Vec<Value> =
+            rows.iter().filter_map(|(_, r)| r[0].clone()).collect();
+        for (_, r) in &rows {
+            if let Some(boss) = &r[2] {
+                assert!(ids.contains(boss), "dangling boss reference");
+            }
+        }
+    }
+
+    #[test]
+    fn update_self_reference_can_move_key_and_reference_together() {
+        let mut st = Store::format(dev()).unwrap();
+        st.create_table("person").unwrap();
+        st.add_column("person", col("id", Type::UnsignedInteger, false, true))
+            .unwrap();
+        st.add_column("person", col("boss", Type::UnsignedInteger, true, false))
+            .unwrap();
+        st.add_fk("person", "boss", "person", "id").unwrap();
+
+        // A row becomes its own boss (validated against its stored key).
+        let carol = st.insert("person", alloc::vec![iv("3"), None]).unwrap();
+        st.update("person", carol, alloc::vec![iv("3"), iv("3")])
+            .unwrap();
+        // Key and self-reference move together; the post-update state is
+        // consistent, so this must be accepted.
+        st.update("person", carol, alloc::vec![iv("4"), iv("4")])
+            .unwrap();
+        let rows = st.scan("person").unwrap();
+        assert_eq!(rows[0].1[0], iv("4"));
+        assert_eq!(rows[0].1[1], iv("4"));
+        // But the key may not run away from its own reference.
+        assert!(matches!(
+            st.update("person", carol, alloc::vec![iv("9"), iv("4")]),
+            Err(StoreError::ForeignKeyViolation { .. })
+        ));
     }
 
     #[test]
