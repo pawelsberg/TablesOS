@@ -30,6 +30,7 @@
 
 use crate::serial_println;
 use crate::time;
+use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::instructions::port::Port;
 
 /// The bootloader (`boot/stage2.s`) identity-maps only the first **4 GiB** of
@@ -89,10 +90,28 @@ fn checksum_ok(pa: u64, len: u64) -> bool {
 
 const RSDP_SIG: [u8; 8] = *b"RSD PTR ";
 
-/// Locate the RSDP. Per the ACPI spec it lives in one of two BIOS regions: the
-/// first KiB of the EBDA, or the BIOS read-only area `0xE0000..0x100000`, on a
-/// 16-byte boundary, with a valid 20-byte checksum.
+/// RSDP physical address handed over by the bootloader (`BootInfo.rsdp_addr`),
+/// or 0. The UEFI loader reads it from the EFI configuration table — on UEFI
+/// systems the RSDP need not appear in either legacy BIOS scan region.
+static RSDP_HINT: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_rsdp_hint(pa: u64) {
+    RSDP_HINT.store(pa, Ordering::Relaxed);
+}
+
+/// Locate the RSDP. A bootloader-provided address (validated, not trusted
+/// blindly) wins; otherwise scan the two legacy BIOS regions the ACPI spec
+/// names: the first KiB of the EBDA, and `0xE0000..0x100000`, on 16-byte
+/// boundaries, with a valid 20-byte checksum.
 fn find_rsdp() -> Option<u64> {
+    let hint = RSDP_HINT.load(Ordering::Relaxed);
+    if readable(hint, 20) {
+        let sig_ok = (0..8).all(|i| unsafe { rd_u8(hint + i) } == RSDP_SIG[i as usize]);
+        if sig_ok && checksum_ok(hint, 20) {
+            return Some(hint);
+        }
+        serial_println!("acpi: bootloader RSDP hint {:#x} invalid; scanning", hint);
+    }
     // The EBDA segment (a 16-byte paragraph) is stored at physical 0x40E.
     let ebda = (unsafe { rd_u16(0x40E) } as u64) << 4;
     if (0x400..0xA_0000).contains(&ebda) {

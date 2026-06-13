@@ -2,7 +2,7 @@
 //!
 //! Reads the booted disk's `[custom MBR | stage2 | kernel]` prefix
 //! verbatim via direct absolute-LBA ATA reads, stamps a fresh random
-//! 16-byte system GUID into the MBR header (offset 0x1DC), writes
+//! 16-byte system GUID into the MBR header (offset 0x1AC), writes
 //! everything to the chosen target, then formats an empty TablesOS
 //! volume at the target's data-location LBA. Verifies by re-reading
 //! sector 0 (MBR magic + new GUID) and re-mounting the volume.
@@ -105,7 +105,7 @@ fn refuse_if_same_disk(usb: &mut UsbMscDevice, booted: &[u8; 16]) -> Option<Stri
     if usb.read_sector(0, &mut buf).is_err() {
         return None; // Can't read; trust the caller's filtering.
     }
-    if &buf[0x1B0..0x1B8] == b"TBLSBOOT" && &buf[0x1DC..0x1DC + 16] == &booted[..] {
+    if &buf[0x180..0x188] == b"TBLSBOOT" && &buf[0x1AC..0x1AC + 16] == &booted[..] {
         return Some(
             "target's existing MBR system GUID matches the booted disk — refusing".into(),
         );
@@ -183,7 +183,7 @@ pub fn install_to_usb(
                 return report;
             }
             if lba + i == 0 {
-                sector[0x1DC..0x1DC + 16].copy_from_slice(&new_sys_guid);
+                sector[0x1AC..0x1AC + 16].copy_from_slice(&new_sys_guid);
             }
             let off = i as usize * SECTOR;
             chunk[off..off + SECTOR].copy_from_slice(&sector);
@@ -229,8 +229,8 @@ pub fn install_to_usb(
         report.message = "verify read MBR failed".into();
         return report;
     }
-    report.verify_mbr_ok = &mbr_check[0x1B0..0x1B8] == b"TBLSBOOT"
-        && &mbr_check[0x1DC..0x1DC + 16] == &new_sys_guid[..];
+    report.verify_mbr_ok = &mbr_check[0x180..0x188] == b"TBLSBOOT"
+        && &mbr_check[0x1AC..0x1AC + 16] == &new_sys_guid[..];
     if !report.verify_mbr_ok {
         report.message = "MBR re-read disagrees with what we wrote".into();
         return report;

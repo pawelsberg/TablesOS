@@ -1,0 +1,19 @@
+[package]
+name = "uefi-loader"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Built for `x86_64-unknown-uefi` (a PE/COFF binary) as an artifact dependency
+# of the image builder, which places it at \EFI\BOOT\BOOTX64.EFI inside the
+# FAT16 EFI System Partition of the disk image. No external dependencies —
+# the small UEFI FFI surface it needs is hand-written in src/efi.rs, in the
+# same "no third-party bootloader" spirit as boot/stage1.s / stage2.s.
+
+[[bin]]
+name = "uefi-loader"
+test = false
+bench = false
+
+[dependencies]

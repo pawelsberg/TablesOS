@@ -29,6 +29,7 @@ use crate::ps2::{self, Event, Key};
 use crate::rtc;
 use crate::serial_println;
 use crate::time;
+use crate::usb::ehci;
 use crate::usb::xhci::{self, XhciInfo};
 
 const MARGIN: usize = CELL_W; // one-cell border
@@ -599,15 +600,18 @@ pub fn run<D: BlockDevice>(
         cursor_on: true,
         last_blink: interrupts::ticks(),
     };
-    // A USB-HID mouse delivers no IRQ — it is polled cooperatively below — so the
+    // USB-HID input delivers no IRQ — it is polled cooperatively below — so the
     // idle path can't simply `hlt` and wait for one. Cache its presence once (it
-    // is bound at boot, before the UI starts).
-    let usb_mouse = xhci::mouse_present();
+    // is bound at boot, before the UI starts). EHCI HID is the keyboard+mouse
+    // path on pre-xHCI machines, where claiming the controller for the boot
+    // disk killed the BIOS's SMM legacy emulation.
+    let usb_poll = xhci::mouse_present() || ehci::hid_present();
     app.render();
     loop {
-        // Pull any USB-HID mouse movement into the shared input queue first, so
-        // the drain below treats it exactly like a PS/2 event.
+        // Pull any USB-HID input into the shared input queue first, so the
+        // drain below treats it exactly like a PS/2 event.
         xhci::pump_mouse();
+        ehci::pump_hid();
         // A full repaint blits the whole framebuffer, so doing one per input
         // event makes fast key-repeat (held arrows) enqueue faster than we can
         // draw — the screen appears to freeze under the backlog. Instead drain
@@ -659,11 +663,11 @@ pub fn run<D: BlockDevice>(
             app.render();
         } else if let Some((x, y)) = moved_to {
             app.draw_cursor(x, y);
-        } else if usb_mouse {
-            // A USB mouse has no IRQ to wake `hlt`, and the ~18 Hz timer alone
-            // would make the pointer crawl. Briefly pause (so the core isn't in a
-            // tight spin) and loop to poll it again — ~125 Hz when idle. Keyboard
-            // IRQs still enqueue and are picked up on the next iteration.
+        } else if usb_poll {
+            // USB-HID input has no IRQ to wake `hlt`, and the ~18 Hz timer alone
+            // would make the pointer crawl and a USB keyboard feel laggy. Briefly
+            // pause (so the core isn't in a tight spin) and loop to poll again —
+            // ~125 Hz when idle. Any PS/2 IRQs still enqueue in the meantime.
             time::delay_ms(8);
         } else {
             // Idle: sleep until the next IRQ (input or the ~18 Hz timer tick,

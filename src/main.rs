@@ -1,41 +1,54 @@
 //! TablesOS image builder / runner.
 //!
-//! No third-party bootloader, no partitions, no FAT (SPECIFICATION.md item 8).
-//! We assemble our own stage 1 (custom MBR) and stage 2, flatten the kernel
-//! ELF to a raw binary, and lay everything onto **one** disk image:
+//! No third-party bootloader. We assemble our own stage 1 (custom MBR) and
+//! stage 2 for the BIOS path, compile our own UEFI loader (BOOTX64.EFI) for
+//! the UEFI path, flatten the kernel ELF to a raw binary, and lay everything
+//! onto **one** hybrid disk image that boots both ways:
 //!
 //! ```text
-//! LBA 0      stage 1 / custom MBR (512 B, header patched here)
-//! LBA 1..    stage 2
+//! LBA 0      stage 1 / custom MBR (512 B): boot code, TBLSBOOT header @0x180,
+//!            partition table @0x1BE with one type-0xEF entry (the ESP)
+//! LBA 1..    stage 2                                    (BIOS path)
 //! LBA 64..   kernel (flat)
+//! LBA <esp>  FAT16 EFI System Partition with \EFI\BOOT\BOOTX64.EFI (UEFI path)
 //! LBA <data> TablesOS volume (rest of the device)
 //! ```
 //!
-//! `cargo run` builds the image and boots it as the single disk in QEMU.
+//! `cargo run` builds the image and boots it as the single disk in QEMU
+//! (legacy BIOS); `cargo run -- --uefi` boots it under OVMF/EDK2 instead.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod fat;
 mod seed;
 
 const KERNEL_ELF: &str = env!("CARGO_BIN_FILE_KERNEL_kernel");
+const UEFI_LOADER: &str = env!("CARGO_BIN_FILE_UEFI_LOADER");
 
 const SECTOR: usize = 512;
 const STAGE2_LBA: u32 = 1;
 const STAGE2_MAX_SECTORS: u32 = 63; // stage1 reads a fixed 63 sectors
 const KERNEL_LBA: u32 = 64;
-const KERNEL_LOAD: u32 = 0x0020_0000;
+// 16 MiB, not 2 MiB: the kernel footprint (image + 256 MiB .bss heap) must
+// clear the low-RAM islands UEFI firmware needs alive after boot (OVMF keeps
+// ACPI NVS at 8 MiB). Must match kernel/linker.ld.
+const KERNEL_LOAD: u32 = 0x0100_0000;
 const IMG_SECTORS: u64 = 64 * 1024 * 1024 / SECTOR as u64; // 64 MiB device
 
-// Custom MBR header field offsets (see boot/layout.md / boot/stage1.s).
-const H_DATA_LBA: usize = 0x1BC;
-const H_S2_LBA: usize = 0x1C4;
-const H_S2_SECS: usize = 0x1C8;
-const H_K_LBA: usize = 0x1CC;
-const H_K_SECS: usize = 0x1D0;
-const H_K_LOAD: usize = 0x1D4;
-const H_K_ENTRY: usize = 0x1D8;
-const H_SYS_GUID: usize = 0x1DC; // 16-byte unique system id
+// Custom MBR header field offsets, version 2 (see boot/layout.md /
+// boot/stage1.s). The header sits at 0x180 so the classic partition table
+// area at 0x1BE stays free for the ESP entry UEFI firmware needs.
+const H_DATA_LBA: usize = 0x18C;
+const H_S2_LBA: usize = 0x194;
+const H_S2_SECS: usize = 0x198;
+const H_K_MEM_MIB: usize = 0x19A; // kernel RAM footprint (image+bss+stack), MiB
+const H_K_LBA: usize = 0x19C;
+const H_K_SECS: usize = 0x1A0;
+const H_K_LOAD: usize = 0x1A4;
+const H_K_ENTRY: usize = 0x1A8;
+const H_SYS_GUID: usize = 0x1AC; // 16-byte unique system id
+const PART_TABLE: usize = 0x1BE; // classic MBR partition table (entry 1 = ESP)
 
 fn main() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -63,6 +76,10 @@ fn main() {
         kernel_bin.to_str().unwrap(),
     ]));
     let kernel = std::fs::read(&kernel_bin).expect("read kernel.bin");
+    let kernel_mem_mib = kernel_mem_mib(&std::fs::read(KERNEL_ELF).expect("read kernel ELF"));
+
+    // The UEFI loader PE binary, destined for \EFI\BOOT\BOOTX64.EFI.
+    let uefi_loader = std::fs::read(UEFI_LOADER).expect("read uefi-loader.efi");
 
     // 3. Lay out the single image.
     assert_eq!(stage1.len(), SECTOR, "stage1 must be exactly one sector");
@@ -72,10 +89,11 @@ fn main() {
         "stage2 is {s2_secs} sectors, max {STAGE2_MAX_SECTORS}"
     );
     let k_secs = sectors(kernel.len());
-    let data_lba = align_up(KERNEL_LBA as u64 + k_secs as u64, 2048); // 1 MiB
+    let esp_lba = align_up(KERNEL_LBA as u64 + k_secs as u64, 2048); // 1 MiB
+    let data_lba = align_up(esp_lba + fat::ESP_SECTORS, 2048);
     assert!(
         data_lba + 4096 < IMG_SECTORS,
-        "kernel too large; volume would be empty"
+        "kernel + ESP too large; volume would be empty"
     );
 
     let mut img = vec![0u8; IMG_SECTORS as usize * SECTOR];
@@ -83,6 +101,7 @@ fn main() {
     put_u64(&mut img, H_DATA_LBA, data_lba);
     put_u32(&mut img, H_S2_LBA, STAGE2_LBA);
     put_u16(&mut img, H_S2_SECS, s2_secs as u16);
+    put_u16(&mut img, H_K_MEM_MIB, kernel_mem_mib);
     put_u32(&mut img, H_K_LBA, KERNEL_LBA);
     put_u32(&mut img, H_K_SECS, k_secs);
     put_u32(&mut img, H_K_LOAD, KERNEL_LOAD);
@@ -94,10 +113,27 @@ fn main() {
     let guid = random_guid();
     img[H_SYS_GUID..H_SYS_GUID + 16].copy_from_slice(&guid);
 
+    // Partition-table entry 1: the EFI System Partition (type 0xEF). This is
+    // what lets UEFI firmware discover the FAT16 volume and run BOOTX64.EFI;
+    // the BIOS path and the kernel never read it. Entries 2-4 stay zero — the
+    // TablesOS volume remains raw, unpartitioned space described only by the
+    // TBLSBOOT header.
+    let pe = &mut img[PART_TABLE..PART_TABLE + 16];
+    pe[0] = 0x80; // bootable flag (ignored by UEFI, calms picky BIOSes)
+    pe[1..4].copy_from_slice(&[0xFE, 0xFF, 0xFF]); // CHS start: "use LBA"
+    pe[4] = 0xEF; // EFI System Partition
+    pe[5..8].copy_from_slice(&[0xFE, 0xFF, 0xFF]); // CHS end
+    pe[8..12].copy_from_slice(&(esp_lba as u32).to_le_bytes());
+    pe[12..16].copy_from_slice(&(fat::ESP_SECTORS as u32).to_le_bytes());
+
     let s2_off = STAGE2_LBA as usize * SECTOR;
     img[s2_off..s2_off + stage2.len()].copy_from_slice(&stage2);
     let k_off = KERNEL_LBA as usize * SECTOR;
     img[k_off..k_off + kernel.len()].copy_from_slice(&kernel);
+
+    let esp = fat::build_esp(&uefi_loader, esp_lba as u32);
+    let e_off = esp_lba as usize * SECTOR;
+    img[e_off..e_off + esp.len()].copy_from_slice(&esp);
 
     // Lay down an ALREADY-FORMATTED TablesOS volume (the OS never formats at
     // runtime — see SPECIFICATION.md). We format an in-memory volume of the
@@ -123,7 +159,7 @@ fn main() {
     let image = out.join("tablesos.img");
     std::fs::write(&image, &img).expect("write image");
     println!(
-        "single-device image: {} ({} MiB)\n  stage2 = {s2_secs} sectors, kernel = {k_secs} sectors, volume @ LBA {data_lba}",
+        "hybrid BIOS+UEFI image: {} ({} MiB)\n  stage2 = {s2_secs} sectors, kernel = {k_secs} sectors ({kernel_mem_mib} MiB in RAM), ESP @ LBA {esp_lba}, volume @ LBA {data_lba}",
         image.display(),
         img.len() / 1024 / 1024
     );
@@ -163,7 +199,36 @@ fn main() {
     }
 
     let qemu = find_qemu();
-    let status = Command::new(&qemu)
+    let mut cmd = Command::new(&qemu);
+
+    // `--uefi`: boot through OVMF/EDK2 firmware (ships with QEMU) instead of
+    // the legacy BIOS, exercising the BOOTX64.EFI path end to end. The vars
+    // flash is a per-checkout writable copy so firmware boot-order writes
+    // don't touch the QEMU installation.
+    if std::env::args().any(|a| a == "--uefi") {
+        let share = qemu
+            .parent()
+            .map(|p| p.join("share"))
+            .unwrap_or_else(|| PathBuf::from("share"));
+        let code = share.join("edk2-x86_64-code.fd");
+        let vars_src = share.join("edk2-i386-vars.fd");
+        let vars = out.join("uefi-vars.fd");
+        if !code.exists() {
+            eprintln!("UEFI firmware not found at {}", code.display());
+            eprintln!("Install a QEMU build that ships EDK2, or boot the image elsewhere.");
+            std::process::exit(1);
+        }
+        if !vars.exists() {
+            std::fs::copy(&vars_src, &vars).expect("copy EDK2 vars template");
+        }
+        cmd.args([
+            "-drive",
+            &format!("if=pflash,format=raw,readonly=on,file={}", code.display()),
+        ])
+        .args(["-drive", &format!("if=pflash,format=raw,file={}", vars.display())]);
+    }
+
+    let status = cmd
         .args(["-machine", "pc"])
         // TablesOS owns the whole machine and now keeps a 256 MiB heap (five
         // cached full-screen background composites + the engine working set),
@@ -239,6 +304,36 @@ fn random_guid() -> [u8; 16] {
 
 fn sectors(len: usize) -> u32 {
     ((len + SECTOR - 1) / SECTOR) as u32
+}
+
+/// The kernel's total RAM footprint in MiB (rounded up): the highest
+/// `p_vaddr + p_memsz` over the ELF's PT_LOAD segments, minus the 0x1000000
+/// load address. Unlike the flat binary this includes NOLOAD `.bss` — the
+/// 256 MiB heap and the boot stack — which the UEFI loader must reserve at
+/// the load address before handing over (the BIOS path just assumes the RAM
+/// is there).
+fn kernel_mem_mib(elf: &[u8]) -> u16 {
+    assert!(
+        elf.len() >= 64 && elf[..4] == [0x7F, b'E', b'L', b'F'] && elf[4] == 2 && elf[5] == 1,
+        "kernel is not a 64-bit little-endian ELF"
+    );
+    let phoff = u64::from_le_bytes(elf[0x20..0x28].try_into().unwrap()) as usize;
+    let phentsize = u16::from_le_bytes(elf[0x36..0x38].try_into().unwrap()) as usize;
+    let phnum = u16::from_le_bytes(elf[0x38..0x3A].try_into().unwrap()) as usize;
+    let mut end = 0u64;
+    for i in 0..phnum {
+        let p = phoff + i * phentsize;
+        let p_type = u32::from_le_bytes(elf[p..p + 4].try_into().unwrap());
+        if p_type != 1 {
+            continue; // not PT_LOAD
+        }
+        let vaddr = u64::from_le_bytes(elf[p + 0x10..p + 0x18].try_into().unwrap());
+        let memsz = u64::from_le_bytes(elf[p + 0x28..p + 0x30].try_into().unwrap());
+        end = end.max(vaddr + memsz);
+    }
+    assert!(end > KERNEL_LOAD as u64, "no PT_LOAD segments found");
+    let bytes = end - KERNEL_LOAD as u64;
+    u16::try_from((bytes + (1 << 20) - 1) >> 20).expect("kernel footprint exceeds 64 GiB")
 }
 fn align_up(v: u64, a: u64) -> u64 {
     (v + a - 1) / a * a

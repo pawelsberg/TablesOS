@@ -4,8 +4,8 @@
 
 - A **nightly** Rust toolchain. `rust-toolchain.toml` pins it and lists the
   required components (`rust-src`, `llvm-tools-preview`) and the bare-metal
-  target `x86_64-unknown-none`. `rustup` installs them automatically on first
-  build.
+  targets `x86_64-unknown-none` (kernel) and `x86_64-unknown-uefi` (UEFI
+  loader). `rustup` installs them automatically on first build.
 - [QEMU](https://www.qemu.org/) (`qemu-system-x86_64`) to run it without real
   hardware. Optional if you only want the flashable image.
 
@@ -14,14 +14,18 @@
 | Crate          | What it is                                                          |
 |----------------|---------------------------------------------------------------------|
 | `tablestore`   | The relational engine: types, bignum, schema, paging, journal. `no_std + alloc`, host-testable. |
-| `kernel`       | The OS itself: BIOS entry, VESA framebuffer, PS/2 input, ATA disk, GUI. `no_std`. |
-| (workspace root) | Image builder/runner. Assembles our custom MBR + stage 2, flattens the kernel ELF, lays out one raw device image, boots it in QEMU. |
+| `kernel`       | The OS itself: boot entry, framebuffer, PS/2 input, ATA + USB disk, GUI. `no_std`. |
+| `uefi-loader`  | Our UEFI boot loader (`BOOTX64.EFI`): GOP mode, raw-LBA kernel load, identity paging, ExitBootServices, kernel handoff. `no_std`, no dependencies. |
+| (workspace root) | Image builder/runner. Assembles our custom MBR + stage 2, compiles the UEFI loader, flattens the kernel ELF, lays out one hybrid device image, boots it in QEMU. |
 
 ## Commands
 
 ```sh
-# Build the single-device image and boot it in QEMU.
+# Build the single-device image and boot it in QEMU (legacy BIOS).
 cargo run
+
+# Same image, booted through UEFI firmware (OVMF/EDK2, ships with QEMU).
+cargo run -- --uefi
 
 # Only build the flashable image (no QEMU).
 cargo run -- --no-run
@@ -58,10 +62,12 @@ run` performs. A plain `cargo run` builds an **empty** volume; pass `--seed`
 whenever you want the data. The dataset logic lives in
 [`src/seed.rs`](src/seed.rs) — edit there to change counts or columns.
 
-The bootable image is written to `target/tablesos.img`. It is **one raw
-device** — `[custom MBR | stage 2 | kernel | TablesOS volume]`, no partition
-table, no FAT (SPECIFICATION.md item 8 / `boot/layout.md`). Flash the whole
-thing to a pendrive:
+The bootable image is written to `target/tablesos.img`. It is **one hybrid
+device** — `[custom MBR | stage 2 | kernel | FAT16 ESP | TablesOS volume]` —
+bootable by both BIOS and UEFI firmware. The only partition-table entry is the
+EFI System Partition the UEFI spec requires; the TablesOS volume stays raw
+(SPECIFICATION.md item 8 / `boot/layout.md`). Flash the whole thing to a
+pendrive:
 
 ```sh
 dd if=target/tablesos.img of=/dev/sdX bs=4M conv=fsync
@@ -90,18 +96,27 @@ is required.
 
 ## Boot firmware
 
-TablesOS boots via **legacy BIOS**, not UEFI (per `IMPLEMENTATION.md`). On a
-modern machine, enable "Legacy Boot" / "CSM" and disable Secure Boot in
-firmware setup, then boot from the pendrive.
+TablesOS boots via **legacy BIOS** (custom MBR + stage 2) and via **UEFI**
+(`\EFI\BOOT\BOOTX64.EFI` on the image's FAT16 ESP — see `boot/layout.md`).
+Secure Boot is **not** supported: the loader is unsigned, so disable Secure
+Boot in firmware setup before booting from the pendrive. CSM/"Legacy Boot" is
+no longer required on UEFI-only machines.
 
 ## Storage note
 
-The store is exposed through `tablestore::BlockDevice`. The kernel implements
-it with an **ATA PIO** driver on the **same disk it booted from** (primary IDE
-master). The TablesOS volume begins at the data-location LBA recorded in the
-custom MBR; the driver adds that base offset transparently, so the engine sees
-a volume at sector 0 and cannot touch the boot/kernel prefix. This covers the
-QEMU IDE disk and legacy SATA-in-IDE-mode hardware. A USB mass-storage stack
-(xHCI/EHCI + USB + Bulk-Only Transport) for booting from a USB pendrive on bare
-metal is the one documented seam: it drops in behind the same `BlockDevice`
-impl with no engine or GUI changes.
+The store is exposed through `tablestore::BlockDevice`, always on the **same
+disk the machine booted from**, found in this order:
+
+1. **ATA PIO** (primary IDE master) — QEMU's IDE disk, legacy SATA-in-IDE mode.
+2. **xHCI + USB mass storage** — real pendrives on USB 3.x controllers
+   (modern machines, BIOS or UEFI firmware).
+3. **EHCI + USB mass storage** — pre-xHCI machines (≈2008-2012) whose ports
+   are wired to the chipset USB 2.0 controller; includes standard hub
+   enumeration because those chipsets put a Rate-Matching Hub in front of
+   every port. High-Speed devices only (no split transactions).
+
+The TablesOS volume begins at the data-location LBA recorded in the custom
+MBR; each driver adds that base offset transparently, so the engine sees a
+volume at sector 0 and cannot touch the boot/kernel prefix, and every USB
+write is identity-gated to the booted disk's system GUID and issued with FUA
+for durability.

@@ -1,6 +1,23 @@
-# Boot investigation — legacy-BIOS disk read (TEMPORARY)
+# Boot investigation — legacy-BIOS disk read (HISTORICAL, RESOLVED)
 
-**Delete this file and revert the diagnostic `stage1.s` once the disk-read issue is fixed.**
+> **⚠️ Do not apply anything from this file to the current code.**
+>
+> This is the *closed* forensic log of the 2026-05 Byd Tracer BIOS bring-up
+> (resolved in commit `2bbd3c5 Running on Byd Tracer - real hardware`). The
+> diagnostic `stage1.s` it tells you to revert was already restored on
+> 2026-06-12 as part of the UEFI work.
+>
+> **Every sector-0 offset and every asm snippet below refers to the obsolete
+> header format v1** (header @ 0x1B0, GUID @ 0x1DC, *no partition table*).
+> The current on-disk format is **v2**: header @ 0x180, GUID @ 0x1AC, and a
+> real partition table @ 0x1BE whose single type-0xEF entry is what makes the
+> stick visible to UEFI firmware at all. Re-introducing any v1 layout or the
+> "real loader" snippet at the bottom of this file **silently overwrites the
+> partition table — UEFI machines then stop listing the pendrive entirely.**
+> `boot/layout.md` is the only authoritative layout document.
+>
+> The xHCI/USB findings (BIOS→OS handoff, EP0 reset+retry, bulk-stall
+> recovery) remain valid and are already in `kernel/src/usb/xhci.rs`.
 
 Tracking why the loader hangs on one legacy-BIOS PC while booting perfectly in QEMU.
 
@@ -456,7 +473,12 @@ Write down the `RD ...` line and the 16-byte row. Interpretation:
 
 ---
 
-## To restore the real loader after fixing
+## (HISTORICAL — already done; do NOT re-apply) To restore the real loader after fixing
+
+**This step was completed on 2026-06-12.** The snippet below uses the v1
+header offsets (`H_S2_SECS` @ 0x1C8 etc.) and predates the partition table at
+0x1BE; pasting it into today's `stage1.s` corrupts the UEFI boot path. Kept
+only as a record of what the investigation-era loader looked like.
 
 Revert `boot/stage1.s` to the loader (it currently lives only in the working tree, uncommitted). The working read routine — one INT 13h read of exactly the header sector count — was:
 

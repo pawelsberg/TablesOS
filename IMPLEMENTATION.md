@@ -2,17 +2,23 @@
 
 Governing directives (from this file), honoured throughout:
 
-- **Use BIOS (not UEFI)** — boots via legacy BIOS using **our own** two-stage
-  bootloader (no third-party crate): a custom 512-byte MBR (stage 1) loads
-  stage 2, which sets a VESA linear-framebuffer mode, loads the flat kernel to
-  2 MiB via unreal-mode INT 13h, builds page tables + a `BootInfo`, enters
-  long mode and jumps to the kernel. No UEFI. On modern firmware: enable
-  CSM / "Legacy Boot", disable Secure Boot.
-- **No partitions, no FAT (SPEC item 8)** — one raw device:
-  `[MBR | stage2 | kernel | TablesOS volume]`. The custom MBR header carries
-  the system id, OS/BIOS-loader version and the volume's data-location LBA;
-  there is **no partition table** (offset 0x1BE is repurposed for the header)
-  and no filesystem anywhere. See `boot/layout.md`.
+- **BIOS and UEFI, both with our own loaders** (no third-party crate, no
+  Secure Boot). BIOS: a custom 512-byte MBR (stage 1) loads stage 2, which
+  sets a VESA linear-framebuffer mode, loads the flat kernel to 16 MiB via
+  unreal-mode INT 13h, builds page tables + a `BootInfo`, enters long mode
+  and jumps to the kernel. UEFI: our `uefi-loader` crate
+  (`\EFI\BOOT\BOOTX64.EFI` on a small FAT16 ESP) does the equivalent with
+  GOP + Block I/O + ExitBootServices and jumps to the **same** kernel with
+  the same `BootInfo`. On UEFI firmware: disable Secure Boot (the loader is
+  unsigned); CSM is no longer needed.
+- **No general-purpose partitioning (SPEC item 8, minimally relaxed for
+  UEFI)** — one device: `[MBR | stage2 | kernel | FAT16 ESP | TablesOS
+  volume]`. The custom MBR header (at 0x180) carries the system id, OS-loader
+  format version and the volume's data-location LBA. The classic partition
+  table at 0x1BE holds exactly one entry — the type-0xEF EFI System Partition
+  that UEFI firmware requires to find the boot loader; the TablesOS volume
+  itself stays raw, unpartitioned space and nothing at runtime reads or
+  writes the ESP. See `boot/layout.md`.
 - **Use Rust** — engine and kernel are Rust (engine `#![forbid(unsafe_code)]`);
   the two boot stages are relocation-free GNU-`as` assembly (no ELF
   assembler/linker is available, so the load base is baked in as a constant
@@ -29,8 +35,9 @@ The rest records how `SPECIFICATION.md` / `UI.md` were realised and — honestly
 | Layer | Crate | Notes |
 |---|---|---|
 | Relational engine | `tablestore` | `no_std + alloc`, no `unsafe`, host-unit-tested (`cargo test -p tablestore`). |
-| Kernel / drivers / GUI | `kernel` | `no_std`, BIOS entry, VBE framebuffer, PS/2 + USB-HID input, ATA, xHCI/USB-MSC, GUI. |
-| Image builder | workspace root | Wraps the kernel into a BIOS disk image with `bootloader`. |
+| Kernel / drivers / GUI | `kernel` | `no_std`, single boot entry for both firmwares, VBE/GOP framebuffer, PS/2 + USB-HID input, ATA, xHCI/USB-MSC, GUI. |
+| UEFI loader | `uefi-loader` | `no_std`, dependency-free PE binary; GOP mode, raw-LBA kernel load, identity paging, ExitBootServices. |
+| Image builder | workspace root | Assembles stages 1+2, compiles the UEFI loader, builds the FAT16 ESP, lays out one hybrid BIOS+UEFI disk image. |
 
 The engine reaches storage only through `BlockDevice`, so identical
 relational/journalling code runs in the kernel and under host tests.
@@ -100,15 +107,22 @@ relational/journalling code runs in the kernel and under host tests.
    via **ATA PIO**. The TablesOS volume lives at the MBR's data-location LBA;
    the ATA driver hides that base offset, so the engine sees a volume starting
    at sector 0 and can never reach the boot/kernel region in front of it.
-   Correct for the QEMU IDE disk and legacy SATA-in-IDE-mode hardware; a
-   bare-metal USB mass-storage stack (xHCI/EHCI + USB + BOT) is the one
-   component left as a documented seam, dropping in behind the same
-   `BlockDevice` impl with zero changes above.
+   Correct for the QEMU IDE disk and legacy SATA-in-IDE-mode hardware. The
+   bare-metal USB stack exists for **both** controller generations behind the
+   same `BlockDevice` seam: xHCI (`usb/xhci.rs`, full stack incl. HID mouse
+   and install-to-USB) and EHCI (`usb/ehci.rs`, boot disk + HID keyboard/mouse
+   for pre-xHCI machines). EHCI does hub enumeration (chipset Rate-Matching
+   Hubs) and split transactions for the Full/Low-Speed kbd/mouse behind that
+   HS hub; HID is polled from the UI loop via GET_REPORT into the same input
+   queue as PS/2 (the EHCI BIOS→OS handoff disables the firmware's SMM
+   keyboard emulation, so the kernel must drive HID itself). Shared BOT/SCSI
+   wire formats live in `usb/bot.rs`. The Drives screen and install-to-USB
+   remain xHCI-only.
 
    **No runtime formatting + disk-identity gate (accidental-overwrite
    safety).** The builder writes an *already-formatted* volume into the
    image and stamps a unique random 16-byte **system GUID** into the MBR
-   (offset 0x1DC). At boot, stage 2 copies that GUID into `BootInfo`; the
+   (offset 0x1AC). At boot, the bootloader copies that GUID into `BootInfo`; the
    kernel re-reads sector 0 from the ATA device and **refuses to proceed
    unless the on-disk GUID equals the one captured in memory at boot**. There
    is *no* `Store::format` path in the kernel at all — a failed mount or a

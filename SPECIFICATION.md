@@ -12,7 +12,8 @@ The entire device is one custom-formatted volume.
 
 Characteristics:
 
-1. **Boot from any pendrive**, regardless of size, on commodity x86-64 hardware.
+1. **Boot from any pendrive**, regardless of size, on commodity x86-64 hardware
+   — both legacy BIOS and UEFI firmware (no Secure Boot).
 2. **All capacity is data capacity.**
 3. **Unlimited values.** Integers, decimals, strings and dates have no built-in
    width limit; a single value may take arbitrarily big space.
@@ -21,8 +22,14 @@ Characteristics:
    never left structurally inconsistent.
 6. **SSD safe** system uses SSD in a safe manner - taking into account nature of
    flash memory. Preventing physical damage of the medium.
-7. **Graphical user interface** (VESA) allows to interact with operating system.
-8. **No partition tables. No partitions** - Custom MBR - contains: system id, operating system instance version, data location
+7. **Graphical user interface** (VESA on BIOS, GOP on UEFI) allows to interact
+   with operating system.
+8. **No general-purpose partitioning.** Custom MBR — contains: system id,
+   operating system instance version, data location. The data volume is raw,
+   unpartitioned space. Sole exception (required by the UEFI specification to
+   boot at all): one partition-table entry describing a small FAT16 EFI System
+   Partition that carries only the boot loader; nothing at runtime reads or
+   writes it.
 
 ---
 

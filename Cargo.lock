@@ -99,10 +99,15 @@ version = "0.1.0"
 dependencies = [
  "kernel",
  "tablestore",
+ "uefi-loader",
 ]
 
 [[package]]
 name = "tablestore"
+version = "0.1.0"
+
+[[package]]
+name = "uefi-loader"
 version = "0.1.0"
 
 [[package]]

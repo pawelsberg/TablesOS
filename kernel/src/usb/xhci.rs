@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::fmt::Write as _;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use spin::Mutex;
 
 use crate::ata::{self, DriveInfo, MbrInfo};
@@ -79,9 +79,22 @@ pub fn inspect(dev: &PciDevice) -> Option<XhciInfo> {
     if !(dev.class == 0x0C && dev.subclass == 0x03 && dev.prog_if == 0x30) {
         return None;
     }
-    let mmio_base = pci::bar_address(dev, 0);
+    let mut mmio_base = pci::bar_address(dev, 0);
     if mmio_base == 0 {
         return None;
+    }
+    // UEFI firmware may park the 64-bit BAR above 4 GiB, beyond the kernel's
+    // identity map. The kernel owns the machine, so re-home the BAR into the
+    // 32-bit MMIO window instead of giving up on the controller.
+    if mmio_base >= MMIO_MAX {
+        if let Some(new_base) = pci::relocate_bar0_below_4g(dev) {
+            serial_println!(
+                "xhci: MMIO BAR relocated {:#x} -> {:#x} (was above 4 GiB)",
+                mmio_base,
+                new_base
+            );
+            mmio_base = new_base;
+        }
     }
     // Enable Memory Space + Bus Master before touching MMIO. Save the
     // previous command so we can show it in the UI.
@@ -462,17 +475,37 @@ pub struct DeviceDescriptor {
     pub num_configurations: u8,
 }
 
-/// Global one-shot. Bring-up is non-idempotent against the hardware
-/// (writes USBCMD, allocates leaked DMA buffers) so we only run it once
-/// and re-hand-out the same `BringUpInfo` on subsequent calls.
-static STATE: Mutex<Option<XhciState>> = Mutex::new(None);
+/// Per-controller one-shots, keyed by each controller's MMIO base. Bring-up
+/// is non-idempotent against the hardware (writes USBCMD, allocates leaked
+/// DMA buffers) so each controller is brought up once and its state cached.
+/// Real machines have several xHCI controllers (a PCH one carrying the
+/// physical ports plus e.g. a Thunderbolt one) — the previous single global
+/// state made the second controller silently reuse the first one's rings, so
+/// its Enable Slot commands never completed and its devices never appeared.
+static STATES: Mutex<Vec<XhciState>> = Mutex::new(Vec::new());
 
+/// The cached state for one controller.
+fn state_for(states: &mut Vec<XhciState>, mmio_base: u64) -> Option<&mut XhciState> {
+    states.iter_mut().find(|s| s.info.mmio_base == mmio_base)
+}
+
+/// The cached state holding a given addressed slot — the lookup for the
+/// slot-keyed I/O paths (`UsbMscDevice`, `msc_*`). First match wins: slot ids
+/// are per-controller, but only controllers that addressed devices can match,
+/// and every write is still behind the GUID identity gate.
+fn state_for_slot(states: &mut Vec<XhciState>, slot_id: u8) -> Option<&mut XhciState> {
+    states
+        .iter_mut()
+        .find(|s| s.addressed.iter().any(|a| a.slot_id == slot_id))
+}
+
+/// Diagnostics of the first brought-up controller (shown on the xHCI screen).
 pub fn current_bringup() -> Option<BringUpInfo> {
-    STATE.lock().as_ref().map(|s| s.bringup.clone())
+    STATES.lock().first().map(|s| s.bringup.clone())
 }
 
 pub fn current_enumeration() -> Option<EnumResult> {
-    STATE.lock().as_ref().and_then(|s| s.enumeration.clone())
+    STATES.lock().first().and_then(|s| s.enumeration.clone())
 }
 
 /// Halt → reset → allocate DCBAA/scratchpad/command-ring/event-ring →
@@ -525,9 +558,44 @@ fn bios_handoff(mmio: u64, xecp: u32) {
     crate::boot_status("bu: handoff: no legacy cap");
 }
 
+/// Bitmask (bit N = root port N, 1-based) of ports governed by a USB3
+/// Supported Protocol Capability (xECP cap ID 2, major revision 0x03).
+/// Warm Port Reset is only defined for these ports.
+fn usb3_port_mask(info: &XhciInfo) -> u64 {
+    if info.xecp_dword == 0 {
+        return 0;
+    }
+    let mut mask = 0u64;
+    let mut cap_ptr = info.mmio_base + (info.xecp_dword as u64) * 4;
+    // Bounded walk so a malformed list can't loop forever.
+    for _ in 0..64 {
+        let cap = unsafe { read_volatile(cap_ptr as *const u32) };
+        let id = cap & 0xFF;
+        if id == 0 {
+            break;
+        }
+        if id == 2 && (cap >> 24) as u8 == 0x03 {
+            let d2 = unsafe { read_volatile((cap_ptr + 8) as *const u32) };
+            let first = d2 & 0xFF; // compatible port offset, 1-based
+            let count = (d2 >> 8) & 0xFF;
+            for p in first..first + count {
+                if p <= 63 {
+                    mask |= 1 << p;
+                }
+            }
+        }
+        let next = (cap >> 8) & 0xFF;
+        if next == 0 {
+            break;
+        }
+        cap_ptr += (next as u64) * 4;
+    }
+    mask
+}
+
 pub fn bring_up(dev: &PciDevice, info: &XhciInfo) -> Result<BringUpInfo, &'static str> {
-    let mut guard = STATE.lock();
-    if let Some(existing) = &*guard {
+    let mut guard = STATES.lock();
+    if let Some(existing) = state_for(&mut guard, info.mmio_base) {
         return Ok(existing.bringup.clone());
     }
     if !info.mmio_accessible {
@@ -541,7 +609,9 @@ pub fn bring_up(dev: &PciDevice, info: &XhciInfo) -> Result<BringUpInfo, &'stati
 
     serial_println!("xhci: bring-up starting (mmio=0x{:X})", mmio);
     crate::boot_status(&alloc::format!(
-        "bu: params slots={} scratch={}",
+        "bu: {:04x}:{:04x} slots={} scratch={}",
+        dev.vendor,
+        dev.device,
         info.max_slots,
         info.max_scratchpad
     ));
@@ -549,6 +619,23 @@ pub fn bring_up(dev: &PciDevice, info: &XhciInfo) -> Result<BringUpInfo, &'stati
     // Claim the controller from the BIOS before touching it (real-hardware
     // requirement; harmless under QEMU).
     bios_handoff(mmio, info.xecp_dword);
+
+    // Older Intel PCHs mux the physical ports between EHCI and xHCI, and
+    // firmware may have booted with them routed to EHCI — every xHCI port
+    // then reads empty while the boot stick sits on a controller we don't
+    // drive. Route all switchable ports here. No-op on non-Intel parts and
+    // on machines already routed to xHCI.
+    match pci::intel_route_usb_ports_to_xhci(dev) {
+        Some((usb2, usb3)) => crate::boot_status(&alloc::format!(
+            "bu: Intel port routing -> xHCI (usb2={:#x} usb3={:#x})",
+            usb2, usb3
+        )),
+        None => crate::boot_status(if dev.vendor == 0x8086 {
+            "bu: port routing: no switchable ports"
+        } else {
+            "bu: port routing: not an Intel PCH xHCI"
+        }),
+    }
 
     // ---- 1. Halt ---------------------------------------------------------
     crate::boot_status("bu: 1 halt");
@@ -680,7 +767,7 @@ pub fn bring_up(dev: &PciDevice, info: &XhciInfo) -> Result<BringUpInfo, &'stati
         event_ring_addr: event_ring as u64,
         erst_addr: erst as u64,
     };
-    *guard = Some(XhciState {
+    guard.push(XhciState {
         info: info.clone(),
         bringup: bringup.clone(),
         rings: RingPositions {
@@ -699,10 +786,11 @@ pub fn bring_up(dev: &PciDevice, info: &XhciInfo) -> Result<BringUpInfo, &'stati
 }
 
 pub fn current_addressed() -> Vec<AddressedDevice> {
-    STATE.lock()
-        .as_ref()
-        .map(|s| s.addressed.clone())
-        .unwrap_or_default()
+    STATES
+        .lock()
+        .iter()
+        .flat_map(|s| s.addressed.iter().cloned())
+        .collect()
 }
 
 /// Page-aligned (or stronger), zeroed DMA buffer. Identity-mapped so the
@@ -813,6 +901,8 @@ fn poll_until(reg: *const u32, mask: u32, expect: u32, max_us: u64) -> bool {
 const PORTSC_CCS: u32 = 1 << 0;  // current connect status, RO
 const PORTSC_PED: u32 = 1 << 1;  // port enabled/disabled, RW1C
 const PORTSC_PR: u32 = 1 << 4;   // port reset, RW1S
+const PORTSC_PP: u32 = 1 << 9;   // port power, RW
+const PORTSC_WPR: u32 = 1 << 31; // warm port reset (USB3 only), RW1S
 const PORTSC_CSC: u32 = 1 << 17; // connect status change, RW1C
 const PORTSC_PEC: u32 = 1 << 18; // port enabled change, RW1C
 const PORTSC_WRC: u32 = 1 << 19; // warm reset change, RW1C
@@ -861,13 +951,79 @@ pub fn reset_and_enable_slots(
     info: &XhciInfo,
 ) -> Result<EnumResult, &'static str> {
     let _ = dev;
-    let mut guard = STATE.lock();
-    let st = guard.as_mut().ok_or("bring up the controller first ([b])")?;
+    let mut guard = STATES.lock();
+    let st =
+        state_for(&mut guard, info.mmio_base).ok_or("bring up the controller first ([b])")?;
     if !info.mmio_accessible {
         return Err("MMIO not accessible");
     }
     let mmio = info.mmio_base;
     let op = (mmio + info.cap_length as u64) as *mut u8;
+    let portsc_at =
+        |port: u8| unsafe { op.add(0x400 + (port as usize - 1) * 0x10) } as *mut u32;
+
+    // ---- Real-hardware port discovery (all no-ops under QEMU) ------------
+    // Right after the controller reset in `bring_up`, CCS=0 does not yet
+    // mean "no device":
+    //  - PPC=1 silicon comes out of HCRST with ports unpowered; nothing can
+    //    ever connect until software sets PP (QEMU reports PP already 1).
+    //  - Real devices need connect/debounce time; QEMU latches CCS instantly.
+    //  - A SuperSpeed stick the UEFI firmware was just booting from often
+    //    fails its post-reset link retrain (the device side is still in U0)
+    //    and parks in Compliance Mode (PLS=10, CCS=0); per xHCI 4.19.1.2.2
+    //    only a Warm Port Reset recovers it.
+    for port in 1..=info.max_ports {
+        let p = portsc_at(port);
+        let v = unsafe { read_volatile(p) };
+        if v & PORTSC_PP == 0 {
+            unsafe { write_volatile(p, (v & PORTSC_PRESERVE) | PORTSC_PP) };
+        }
+    }
+    // Wait (up to 1 s) for the first connect; costs nothing when a device is
+    // already visible. A late first connect gets a short extra settle so the
+    // remaining ports catch up too.
+    let mut waited_ms = 0u32;
+    loop {
+        let any = (1..=info.max_ports)
+            .any(|port| unsafe { read_volatile(portsc_at(port)) } & PORTSC_CCS != 0);
+        if any || waited_ms >= 1_000 {
+            break;
+        }
+        time::delay_ms(20);
+        waited_ms += 20;
+    }
+    if waited_ms > 0 {
+        time::delay_ms(150);
+        crate::boot_status(&alloc::format!("xHCI: connect settled after {} ms", waited_ms));
+    }
+    // Warm-reset USB3 ports whose link is stuck with no connect — Compliance
+    // Mode, or still Polling after the wait above.
+    let usb3 = usb3_port_mask(info);
+    for port in 1..=info.max_ports {
+        if port > 63 || usb3 & (1u64 << port) == 0 {
+            continue;
+        }
+        let p = portsc_at(port);
+        let v = unsafe { read_volatile(p) };
+        let pls = (v >> 5) & 0xF;
+        if v & PORTSC_CCS != 0 || !(pls == 10 || pls == 7) {
+            continue;
+        }
+        crate::boot_status(&alloc::format!(
+            "xHCI: port {} stuck (pls={}) -> warm reset",
+            port, pls
+        ));
+        unsafe { write_volatile(p, (v & PORTSC_PRESERVE) | PORTSC_WPR) };
+        let _ = poll_until(p, PORTSC_WRC, PORTSC_WRC, 1_000_000);
+        let v2 = unsafe { read_volatile(p) };
+        unsafe {
+            write_volatile(
+                p,
+                (v2 & PORTSC_PRESERVE) | (v2 & (PORTSC_WRC | PORTSC_PRC | PORTSC_CSC)),
+            );
+        }
+        let _ = poll_until(p, PORTSC_CCS, PORTSC_CCS, 500_000);
+    }
 
     let mut ports = Vec::new();
     let mut slots = Vec::new();
@@ -1199,8 +1355,9 @@ pub fn address_enabled_slots(
     info: &XhciInfo,
 ) -> Result<Vec<AddressedDevice>, &'static str> {
     let _ = dev;
-    let mut guard = STATE.lock();
-    let st = guard.as_mut().ok_or("bring up the controller first ([b])")?;
+    let mut guard = STATES.lock();
+    let st =
+        state_for(&mut guard, info.mmio_base).ok_or("bring up the controller first ([b])")?;
     if !info.mmio_accessible {
         return Err("MMIO not accessible");
     }
@@ -1738,8 +1895,9 @@ pub fn fetch_configurations(
     info: &XhciInfo,
 ) -> Result<Vec<AddressedDevice>, &'static str> {
     let _ = dev;
-    let mut guard = STATE.lock();
-    let st = guard.as_mut().ok_or("bring up the controller first ([b])")?;
+    let mut guard = STATES.lock();
+    let st =
+        state_for(&mut guard, info.mmio_base).ok_or("bring up the controller first ([b])")?;
     if !info.mmio_accessible {
         return Err("MMIO not accessible");
     }
@@ -2018,8 +2176,9 @@ pub fn configure_endpoints(
     info: &XhciInfo,
 ) -> Result<Vec<AddressedDevice>, &'static str> {
     let _ = dev;
-    let mut guard = STATE.lock();
-    let st = guard.as_mut().ok_or("bring up the controller first ([b])")?;
+    let mut guard = STATES.lock();
+    let st =
+        state_for(&mut guard, info.mmio_base).ok_or("bring up the controller first ([b])")?;
     if !info.mmio_accessible {
         return Err("MMIO not accessible");
     }
@@ -2297,11 +2456,11 @@ pub struct MscProbe {
 
 /// Per-call accessor for the most recent MSC probe. Lives in `XhciState`.
 pub fn current_msc() -> Vec<MscProbe> {
-    STATE
+    STATES
         .lock()
-        .as_ref()
-        .map(|s| s.msc.clone())
-        .unwrap_or_default()
+        .iter()
+        .flat_map(|s| s.msc.iter().cloned())
+        .collect()
 }
 
 /// For every addressed + configured Mass-Storage device, send INQUIRY,
@@ -2312,8 +2471,9 @@ pub fn probe_mass_storage(
     info: &XhciInfo,
 ) -> Result<Vec<MscProbe>, &'static str> {
     let _ = dev;
-    let mut guard = STATE.lock();
-    let st = guard.as_mut().ok_or("bring up the controller first ([b])")?;
+    let mut guard = STATES.lock();
+    let st =
+        state_for(&mut guard, info.mmio_base).ok_or("bring up the controller first ([b])")?;
     if !info.mmio_accessible {
         return Err("MMIO not accessible");
     }
@@ -2787,34 +2947,62 @@ fn scsi_write10(
     if data.len() < total as usize {
         return Err("WRITE(10): payload smaller than declared transfer length");
     }
-    let cb: [u8; 10] = [
-        0x2A,
-        0,
-        (lba >> 24) as u8,
-        (lba >> 16) as u8,
-        (lba >> 8) as u8,
-        lba as u8,
-        0,
-        (blocks >> 8) as u8,
-        blocks as u8,
-        0,
-    ];
     // Copy the payload into a DMA-aligned buffer.
     let buf = DmaBuffer::new(total as usize, 4096);
     buf.write_slice(0, &data[..total as usize]);
-    let outcome = msc_command(
-        info,
-        st,
-        slot_idx,
-        bulk_in_idx,
-        bulk_out_idx,
-        lun,
-        &cb,
-        Some((buf.ptr(), total, false)),
-        tag,
-    )?;
-    Ok(outcome.scsi_status)
+
+    // Durability: ask for Force Unit Access (CDB byte 1 bit 3) so the write
+    // reaches the medium before the CSW — the journal's commit guarantee must
+    // not depend on SYNCHRONIZE CACHE, which `flush` treats as best-effort
+    // because cheap sticks routinely stall it. Devices that reject FUA
+    // (CHECK CONDITION / stall) get one plain retry and a sticky opt-out.
+    let mut use_fua = !FUA_UNSUPPORTED.load(Ordering::Relaxed);
+    loop {
+        let cb: [u8; 10] = [
+            0x2A,
+            if use_fua { 0x08 } else { 0x00 },
+            (lba >> 24) as u8,
+            (lba >> 16) as u8,
+            (lba >> 8) as u8,
+            lba as u8,
+            0,
+            (blocks >> 8) as u8,
+            blocks as u8,
+            0,
+        ];
+        let result = msc_command(
+            info,
+            st,
+            slot_idx,
+            bulk_in_idx,
+            bulk_out_idx,
+            lun,
+            &cb,
+            Some((buf.ptr(), total, false)),
+            tag,
+        );
+        match result {
+            Ok(outcome) if outcome.scsi_status == 0 => return Ok(0),
+            other if use_fua => {
+                // Could be a device that doesn't know FUA — never retry with
+                // it again, and re-issue this write plain.
+                FUA_UNSUPPORTED.store(true, Ordering::Relaxed);
+                serial_println!(
+                    "xhci: WRITE(10)+FUA refused ({:?}); falling back to plain writes",
+                    other.as_ref().map(|o| o.scsi_status)
+                );
+                use_fua = false;
+            }
+            Ok(outcome) => return Ok(outcome.scsi_status),
+            Err(e) => return Err(e),
+        }
+    }
 }
+
+/// Latched once a device rejects WRITE(10)+FUA; all later writes go plain.
+/// (Per-machine, not per-device — TablesOS only ever writes its boot disk,
+/// plus the explicit install target.)
+static FUA_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 
 fn parse_inquiry(b: &[u8]) -> InquiryData {
     let trim = |s: &str| -> alloc::string::String {
@@ -2947,13 +3135,14 @@ pub struct MouseDelta {
 /// Idempotent: a second call with a mouse already bound is a no-op success.
 pub fn probe_hid_mouse(dev: &PciDevice, info: &XhciInfo) -> Result<bool, &'static str> {
     let _ = dev;
-    let mut guard = STATE.lock();
-    let st = guard.as_mut().ok_or("bring up the controller first")?;
+    let mut guard = STATES.lock();
+    // One mouse globally, regardless of which controller carries it.
+    if guard.iter().any(|s| s.mouse.is_some()) {
+        return Ok(true);
+    }
+    let st = state_for(&mut guard, info.mmio_base).ok_or("bring up the controller first")?;
     if !info.mmio_accessible {
         return Err("MMIO not accessible");
-    }
-    if st.mouse.is_some() {
-        return Ok(true);
     }
 
     // A configured device whose interface is a boot mouse.
@@ -3051,7 +3240,15 @@ pub fn setup_mouse() -> bool {
             Some(i) => i,
             None => continue,
         };
-        if current_addressed().is_empty() {
+        // Per controller: if boot-disk discovery already enumerated THIS
+        // controller, only probe (re-running port resets could disturb the
+        // open boot disk). A controller nothing has touched yet gets the
+        // full, idempotent pipeline — the mouse may live there.
+        let untouched = {
+            let mut guard = STATES.lock();
+            state_for(&mut guard, info.mmio_base).map_or(true, |s| s.addressed.is_empty())
+        };
+        if untouched {
             let _ = bring_up(dev, &info);
             let _ = reset_and_enable_slots(dev, &info);
             let _ = address_enabled_slots(dev, &info);
@@ -3068,7 +3265,7 @@ pub fn setup_mouse() -> bool {
 /// Is a USB-HID mouse bound? The UI uses this to choose its idle wait strategy
 /// (a USB mouse has no IRQ, so the loop must poll rather than `hlt` indefinitely).
 pub fn mouse_present() -> bool {
-    STATE.lock().as_ref().map_or(false, |s| s.mouse.is_some())
+    STATES.lock().iter().any(|s| s.mouse.is_some())
 }
 
 /// Cooperatively poll the HID mouse: consume every interrupt-IN completion the
@@ -3077,9 +3274,8 @@ pub fn mouse_present() -> bool {
 /// is bound or nothing changed. Cheap when idle (one event-ring peek). Called
 /// from the UI loop — never an IRQ (it takes the heap-backed xHCI lock).
 pub fn poll_mouse_delta() -> Option<MouseDelta> {
-    let mut guard = STATE.lock();
-    let st = guard.as_mut()?;
-    st.mouse.as_ref()?;
+    let mut guard = STATES.lock();
+    let st = guard.iter_mut().find(|s| s.mouse.is_some())?;
     let info = st.info.clone();
 
     // Recover an endpoint that halted during a prior event drain (deferred to
@@ -3196,7 +3392,7 @@ pub fn completion_code_name(cc: u8) -> &'static str {
 //
 // `UsbMscDevice` is a tiny handle: it remembers the slot ID, sector
 // count, and optionally the system GUID we expect to see in MBR LBA 0.
-// Each `read_sector` / `write_sector` / `flush` locks `STATE`, looks up
+// Each `read_sector` / `write_sector` / `flush` locks `STATES`, looks up
 // the slot's bulk endpoints, and dispatches to the SCSI helpers.
 //
 // Identity-gate (opt-in via `with_identity_gate`): before every write,
@@ -3235,7 +3431,7 @@ pub struct UsbMscDevice {
     next_tag: u32,
     /// `Some(expected_sys_guid)` activates the identity gate. The
     /// wrapper re-reads MBR LBA 0 before every write and compares the
-    /// 16-byte GUID at offset 0x1DC.
+    /// 16-byte GUID at offset 0x1AC.
     identity_gate: Option<[u8; 16]>,
     /// Latched on any identity-gate failure. All subsequent calls fail.
     poisoned: bool,
@@ -3271,7 +3467,7 @@ impl UsbMscDevice {
 
     /// Strict open: in addition to `open`, every subsequent write
     /// is preceded by a READ(10) of LBA 0 and a comparison of the
-    /// 16-byte GUID at MBR offset 0x1DC against `expected_sys_guid`.
+    /// 16-byte GUID at MBR offset 0x1AC against `expected_sys_guid`.
     /// A mismatch poisons the wrapper.
     pub fn open_with_identity_gate(
         slot_id: u8,
@@ -3314,7 +3510,7 @@ impl UsbMscDevice {
             self.poisoned = true;
             StoreError::Io
         })?;
-        let on_disk: &[u8; 16] = mbr[0x1DC..0x1DC + 16].try_into().unwrap();
+        let on_disk: &[u8; 16] = mbr[0x1AC..0x1AC + 16].try_into().unwrap();
         if on_disk != &expected {
             serial_println!(
                 "UsbMscDevice: identity gate FAILED on slot {} — poisoning",
@@ -3414,8 +3610,8 @@ fn msc_read_sector(
     buf: &mut [u8],
     tag: u32,
 ) -> Result<(), &'static str> {
-    let mut guard = STATE.lock();
-    let st = guard.as_mut().ok_or("xhci not brought up")?;
+    let mut guard = STATES.lock();
+    let st = state_for_slot(&mut guard, slot_id).ok_or("no controller owns this USB slot")?;
     let info = st.info.clone();
     let (slot_idx, bulk_in_idx, bulk_out_idx) = msc_resolve_bulk(st, slot_id)?;
     let (status, bytes) = scsi_read10(
@@ -3446,8 +3642,8 @@ fn msc_write_sector(
     data: &[u8],
     tag: u32,
 ) -> Result<(), &'static str> {
-    let mut guard = STATE.lock();
-    let st = guard.as_mut().ok_or("xhci not brought up")?;
+    let mut guard = STATES.lock();
+    let st = state_for_slot(&mut guard, slot_id).ok_or("no controller owns this USB slot")?;
     let info = st.info.clone();
     let (slot_idx, bulk_in_idx, bulk_out_idx) = msc_resolve_bulk(st, slot_id)?;
     // Retry once: a transient bulk stall on the first attempt halts the endpoint,
@@ -3467,8 +3663,8 @@ fn msc_write_sector(
 }
 
 fn msc_sync_cache(slot_id: u8, tag: u32) -> Result<(), &'static str> {
-    let mut guard = STATE.lock();
-    let st = guard.as_mut().ok_or("xhci not brought up")?;
+    let mut guard = STATES.lock();
+    let st = state_for_slot(&mut guard, slot_id).ok_or("no controller owns this USB slot")?;
     let info = st.info.clone();
     let (slot_idx, bulk_in_idx, bulk_out_idx) = msc_resolve_bulk(st, slot_id)?;
     // SCSI SYNCHRONIZE CACHE(10), opcode 0x35. No data stage.
@@ -3509,8 +3705,8 @@ pub fn msc_write_blocks(
     data: &[u8],
 ) -> Result<(), &'static str> {
     let tag = next_msc_tag();
-    let mut guard = STATE.lock();
-    let st = guard.as_mut().ok_or("xhci not brought up")?;
+    let mut guard = STATES.lock();
+    let st = state_for_slot(&mut guard, slot_id).ok_or("no controller owns this USB slot")?;
     let info = st.info.clone();
     let (slot_idx, bulk_in_idx, bulk_out_idx) = msc_resolve_bulk(st, slot_id)?;
     let status = scsi_write10(

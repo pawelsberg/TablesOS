@@ -1,10 +1,15 @@
 //! TablesOS kernel entry point.
 //!
-//! Boot path: our own custom BIOS bootloader (no partitions, no FAT — see
-//! SPECIFICATION.md item 8 and boot/layout.md) loads this flat kernel at
-//! 0x200000, sets a VESA mode, enters long mode and jumps to `_start` with a
-//! pointer to [`BootInfo`] in RDI. `_start` sets up the stack, zeroes BSS,
-//! and calls [`kmain`], which brings up the system and runs the GUI.
+//! Boot paths (both our own — see boot/layout.md):
+//! - **BIOS**: stage 1 (custom MBR) + stage 2 load this flat kernel at
+//!   0x1000000, set a VESA mode, enter long mode and jump to `_start` with a
+//!   pointer to [`BootInfo`] in RDI.
+//! - **UEFI**: `uefi-loader` (BOOTX64.EFI on the image's FAT16 ESP) does the
+//!   equivalent — GOP mode, identity paging, ExitBootServices — and jumps to
+//!   the same `_start` with the same `BootInfo` contract.
+//!
+//! `_start` sets up the stack, zeroes BSS, and calls [`kmain`], which brings
+//! up the system and runs the GUI.
 
 #![no_std]
 #![no_main]
@@ -49,20 +54,25 @@ pub struct BootInfo {
     pub data_lba: u64,    // 0x20  LBA where the TablesOS volume starts
     pub boot_drive: u8,   // 0x28
     _r2: [u8; 7],         // 0x29
-    /// The unique system GUID copied out of the MBR (offset 0x1DC) at boot.
+    /// The unique system GUID copied out of the MBR (offset 0x1AC) at boot.
     /// The kernel re-reads sector 0 and refuses to run unless this still
     /// matches — so it can never read, write or format any disk other than
     /// the exact one it was booted from.
     pub sys_guid: [u8; 16], // 0x30
+    /// Physical address of the ACPI RSDP, or 0 when the bootloader doesn't
+    /// know it. The UEFI loader fills this from the EFI configuration table
+    /// (UEFI firmware need not place the RSDP in the legacy BIOS scan areas);
+    /// the BIOS stage 2 leaves it 0 and the kernel scans EBDA/0xE0000.
+    pub rsdp_addr: u64, // 0x40
 }
 
 /// Offset of the 16-byte system GUID inside the custom MBR.
-const SYS_GUID_OFF: usize = 0x1DC;
+const SYS_GUID_OFF: usize = 0x1AC;
 
 const BOOT_MAGIC: u32 = 0x5342_544F;
 
 // The very first bytes of the image (`.text._start`, forced first by the
-// linker script) so the entry point == load address 0x200000.
+// linker script) so the entry point == load address 0x1000000.
 core::arch::global_asm!(
     r#"
 .section .text._start,"ax"
@@ -104,6 +114,12 @@ extern "C" fn kmain(info: *const BootInfo) -> ! {
     if info.magic != BOOT_MAGIC {
         serial_println!("FATAL: bad BootInfo magic {:#x}", info.magic);
         halt();
+    }
+    // Under UEFI the RSDP rarely sits in the legacy BIOS areas; the loader
+    // hands us its address so ACPI shutdown works there too.
+    if info.rsdp_addr != 0 {
+        acpi::set_rsdp_hint(info.rsdp_addr);
+        serial_println!("ACPI RSDP hint from bootloader: {:#x}", info.rsdp_addr);
     }
     serial_println!(
         "framebuffer {}x{} pitch={} {}bpp {}",
@@ -219,6 +235,12 @@ enum BootDisk {
         base: u64,
         sectors: u64,
     },
+    /// Pre-xHCI machines: the pendrive sits on the chipset EHCI controller.
+    Ehci {
+        dev: usb::ehci::EhciMscDevice,
+        base: u64,
+        sectors: u64,
+    },
 }
 
 impl BootDisk {
@@ -227,6 +249,7 @@ impl BootDisk {
         match self {
             BootDisk::Ata(a) => a.read_boot_sector(buf),
             BootDisk::Usb { dev, .. } => dev.read_sector(0, buf),
+            BootDisk::Ehci { dev, .. } => dev.read_sector(0, buf),
         }
     }
 }
@@ -236,12 +259,19 @@ impl BlockDevice for BootDisk {
         match self {
             BootDisk::Ata(a) => a.sector_count(),
             BootDisk::Usb { sectors, .. } => *sectors,
+            BootDisk::Ehci { sectors, .. } => *sectors,
         }
     }
     fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> TsResult<()> {
         match self {
             BootDisk::Ata(a) => a.read_sector(lba, buf),
             BootDisk::Usb { dev, base, sectors } => {
+                if lba >= *sectors {
+                    return Err(StoreError::Io);
+                }
+                dev.read_sector(*base + lba, buf)
+            }
+            BootDisk::Ehci { dev, base, sectors } => {
                 if lba >= *sectors {
                     return Err(StoreError::Io);
                 }
@@ -258,12 +288,19 @@ impl BlockDevice for BootDisk {
                 }
                 dev.write_sector(*base + lba, buf)
             }
+            BootDisk::Ehci { dev, base, sectors } => {
+                if lba >= *sectors {
+                    return Err(StoreError::Io);
+                }
+                dev.write_sector(*base + lba, buf)
+            }
         }
     }
     fn flush(&mut self) -> TsResult<()> {
         match self {
             BootDisk::Ata(a) => a.flush(),
             BootDisk::Usb { dev, .. } => dev.flush(),
+            BootDisk::Ehci { dev, .. } => dev.flush(),
         }
     }
 }
@@ -296,28 +333,84 @@ fn discover_boot_disk(data_lba: u64, sys_guid: &[u8; 16]) -> Option<BootDisk> {
     // drive whose MBR GUID matches the booted system GUID is ever selected.
     boot_status("xHCI: enumerating PCI");
     let devices = pci::enumerate();
-    let mut saw_xhci = false;
-    for dev in devices
+    // Real machines have several xHCI controllers (PCH + Thunderbolt …).
+    // Inspect them all, then visit the ones that already show a connected
+    // device first — that's where the boot stick is, and a deviceless
+    // controller costs a full connect-wait timeout.
+    let mut xhci_devs: alloc::vec::Vec<(pci::PciDevice, usb::xhci::XhciInfo)> = devices
         .iter()
         .filter(|d| d.class == 0x0C && d.subclass == 0x03 && d.prog_if == 0x30)
+        .filter_map(|d| usb::xhci::inspect(d).map(|i| (*d, i)))
+        .collect();
+    xhci_devs.sort_by_key(|(_, i)| !i.ports.iter().any(|p| p.ccs));
+    let saw_xhci = !xhci_devs.is_empty();
+    // Surface USB host controllers we have no driver for. On pre-xHCI-PCH
+    // machines the USB2 ports are wired to EHCI permanently — a stick in one
+    // of those is invisible to the xHCI no matter what; this line plus an
+    // all-empty SC dump is the signature of that situation (try a USB3 port).
+    for d in devices
+        .iter()
+        .filter(|d| d.class == 0x0C && d.subclass == 0x03 && d.prog_if != 0x30)
     {
-        saw_xhci = true;
-        let info = match usb::xhci::inspect(dev) {
-            Some(i) => i,
-            None => continue,
-        };
+        boot_status(&alloc::format!(
+            "USB: {} {:04x}:{:04x} present (no driver)",
+            pci::class_name(d.class, d.subclass, d.prog_if),
+            d.vendor,
+            d.device
+        ));
+    }
+    for (dev, info) in &xhci_devs {
+        let info = info.clone();
+        if !info.mmio_accessible {
+            boot_status(&alloc::format!(
+                "xHCI: MMIO unreachable at {:#x} (BAR relocation failed?)",
+                info.mmio_base
+            ));
+            continue;
+        }
+        // Each step swallows its own error internally; print it here so a
+        // real-hardware failure names the exact step instead of surfacing
+        // later as a bare "addressed=0".
         boot_status("xHCI: bring-up");
-        let _ = usb::xhci::bring_up(dev, &info);
+        if let Err(e) = usb::xhci::bring_up(dev, &info) {
+            boot_status(&alloc::format!("xHCI: bring-up FAILED: {}", e));
+            continue;
+        }
         boot_status("xHCI: reset + enable slots");
-        let _ = usb::xhci::reset_and_enable_slots(dev, &info);
+        match usb::xhci::reset_and_enable_slots(dev, &info) {
+            Ok(en) => {
+                // Raw PORTSC per port — the forensic line for "no device on
+                // any port" on real hardware (PP, PLS and CCS are visible).
+                let mut line = alloc::string::String::from("SC:");
+                for pr in &en.ports {
+                    line = alloc::format!("{} {}={:08x}", line, pr.port, pr.portsc_after);
+                    if line.len() > 96 {
+                        boot_status(&line);
+                        line = alloc::string::String::from("SC:");
+                    }
+                }
+                if line.len() > 3 {
+                    boot_status(&line);
+                }
+            }
+            Err(e) => boot_status(&alloc::format!("xHCI: enable slots FAILED: {}", e)),
+        }
         boot_status("xHCI: address devices");
-        let _ = usb::xhci::address_enabled_slots(dev, &info);
+        if let Err(e) = usb::xhci::address_enabled_slots(dev, &info) {
+            boot_status(&alloc::format!("xHCI: address FAILED: {}", e));
+        }
         boot_status("xHCI: fetch configurations");
-        let _ = usb::xhci::fetch_configurations(dev, &info);
+        if let Err(e) = usb::xhci::fetch_configurations(dev, &info) {
+            boot_status(&alloc::format!("xHCI: configs FAILED: {}", e));
+        }
         boot_status("xHCI: configure endpoints");
-        let _ = usb::xhci::configure_endpoints(dev, &info);
+        if let Err(e) = usb::xhci::configure_endpoints(dev, &info) {
+            boot_status(&alloc::format!("xHCI: endpoints FAILED: {}", e));
+        }
         boot_status("xHCI: probe mass storage");
-        let _ = usb::xhci::probe_mass_storage(dev, &info);
+        if let Err(e) = usb::xhci::probe_mass_storage(dev, &info) {
+            boot_status(&alloc::format!("xHCI: MSC probe FAILED: {}", e));
+        }
     }
     if !saw_xhci {
         boot_status("xHCI: no controller found in PCI");
@@ -382,6 +475,21 @@ fn discover_boot_disk(data_lba: u64, sys_guid: &[u8; 16]) -> Option<BootDisk> {
         }
     }
     boot_status("USB: no matching boot drive");
+
+    // Pre-xHCI machines (or sticks in EHCI-wired ports): try the USB 2.0
+    // controllers. Purely additive — machines that booted above never reach
+    // this point.
+    boot_status("EHCI: trying USB 2.0 controllers");
+    if let Some((dev, total)) = usb::ehci::find_boot_drive(sys_guid) {
+        if total > data_lba {
+            boot_status("EHCI: boot drive opened");
+            return Some(BootDisk::Ehci {
+                dev,
+                base: data_lba,
+                sectors: total - data_lba,
+            });
+        }
+    }
     None
 }
 

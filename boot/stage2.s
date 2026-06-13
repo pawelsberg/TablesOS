@@ -1,5 +1,5 @@
 # TablesOS stage 2 — loaded at 0x8000 by stage 1 (real mode, DL = drive).
-# Sets a VESA LFB mode, loads the kernel to 0x200000 via unreal-mode INT13,
+# Sets a VESA LFB mode, loads the kernel to 0x1000000 via unreal-mode INT13,
 # builds BootInfo + identity page tables, enters long mode, jumps to kernel.
 #
 # Relocation-free (see stage1.s): in-image symbol X has run-time address
@@ -15,13 +15,13 @@
 .equ BOOTINFO,    0x7000
 .equ BOUNCE,      0x10000          # seg 0x1000
 .equ PML4,        0x70000
-.equ KERNEL_DST,  0x200000
+.equ KERNEL_DST,  0x1000000
 .equ CHUNK_SECS,  64         # sectors per INT 13h read. Large transfers are
                              # reliable on real USB BIOSes; rapid back-to-back
                              # small reads are the thing that hangs them.
-.equ H_DATA_LBA,  MBR + 0x1BC
-.equ H_KERN_LBA,  MBR + 0x1CC
-.equ H_KERN_SECS, MBR + 0x1D0
+.equ H_DATA_LBA,  MBR + 0x18C
+.equ H_KERN_LBA,  MBR + 0x19C
+.equ H_KERN_SECS, MBR + 0x1A0
 
 _start:
     # DIAG-D execution trace: raw INT 10h teletype markers (need no DS/stack) to
@@ -619,8 +619,8 @@ build_bootinfo:
     mov     ds:[di+0x24], eax
     mov     al, byte ptr [S2 + (drive - _start)]
     mov     ds:[di+0x28], al
-    # copy the 16-byte system GUID from the in-memory MBR (0x7C00+0x1DC)
-    mov     esi, MBR + 0x1DC
+    # copy the 16-byte system GUID from the in-memory MBR (0x7C00+0x1AC)
+    mov     esi, MBR + 0x1AC
     mov     edi, BOOTINFO + 0x30
     mov     ecx, 16
 .cpguid:
@@ -630,6 +630,10 @@ build_bootinfo:
     inc     edi
     dec     ecx
     jnz     .cpguid
+    # rsdp_addr (0x40): BIOS path passes 0 — the kernel falls back to the
+    # legacy EBDA/E0000 RSDP scan. Only the UEFI loader fills this in.
+    mov     dword ptr ds:[BOOTINFO + 0x40], 0
+    mov     dword ptr ds:[BOOTINFO + 0x44], 0
     ret
 
 # Identity-map 0..4 GiB with 2 MiB pages.

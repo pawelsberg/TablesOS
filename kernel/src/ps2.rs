@@ -341,3 +341,12 @@ fn apply_motion(dx: i32, dy_down: i32, left: bool, right: bool) {
 pub fn feed_mouse_delta(dx: i32, dy: i32, left: bool, right: bool) {
     no_irq(|| apply_motion(dx, dy, left, right));
 }
+
+/// Inject an already-decoded key from an external source — the USB-HID boot
+/// keyboard, which (like the boot mouse) is polled cooperatively from the UI
+/// loop rather than via an IRQ. The HID driver does its own usage→[`Key`]
+/// translation and edge detection; this just enqueues the event onto the same
+/// queue the PS/2 path uses, masking interrupts because it touches `QUEUE`.
+pub fn feed_key(key: Key) {
+    no_irq(|| push(Event::Key(key)));
+}

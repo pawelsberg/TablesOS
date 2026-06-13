@@ -13,7 +13,7 @@ license = "MIT"
 publish = false
 
 [workspace]
-members = ["kernel", "tablestore", "pngdec"]
+members = ["kernel", "tablestore", "pngdec", "uefi-loader"]
 resolver = "2"
 
 # The kernel as an artifact dependency, compiled for bare metal. Because it is
@@ -22,6 +22,9 @@ resolver = "2"
 # (Cargo does not forward that variable to build scripts).
 [dependencies]
 kernel = { path = "kernel", artifact = "bin", target = "x86_64-unknown-none" }
+# The UEFI boot loader (BOOTX64.EFI), compiled as a PE binary for the UEFI
+# environment and placed on the image's FAT16 EFI System Partition.
+uefi-loader = { path = "uefi-loader", artifact = "bin", target = "x86_64-unknown-uefi" }
 # Used at build time to lay down an already-formatted volume in the image
 # (the OS never formats at runtime).
 tablestore = { path = "tablestore" }
@@ -54,6 +57,10 @@ debug = false
 opt-level = 2
 debug = false
 
+[profile.dev.package.uefi-loader]
+opt-level = 2
+debug = false
+
 [profile.release.package.kernel]
 opt-level = 2
 debug = false
@@ -63,5 +70,9 @@ opt-level = 2
 debug = false
 
 [profile.release.package.pngdec]
+opt-level = 2
+debug = false
+
+[profile.release.package.uefi-loader]
 opt-level = 2
 debug = false

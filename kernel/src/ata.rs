@@ -259,9 +259,9 @@ pub struct DriveInfo {
 
 #[derive(Clone)]
 pub enum MbrInfo {
-    /// `TBLSBOOT` magic at MBR offset 0x1B0 → our own custom MBR.
+    /// `TBLSBOOT` magic at MBR offset 0x180 → our own custom MBR.
     TablesOs {
-        /// OS/BIOS-loader version from MBR header offset 0x1B8 — the boot
+        /// OS/BIOS-loader version from MBR header offset 0x188 — the boot
         /// format version, distinct from the relational volume's superblock
         /// format version (`tablestore` `SB_VERSION`) and the journal version.
         version: u16,
@@ -494,7 +494,7 @@ fn read_id_string(id: &[u16; 256], start: usize, n_words: usize) -> String {
     s
 }
 
-/// Classify the first 512 bytes of a disk: TablesOS magic at 0x1B0,
+/// Classify the first 512 bytes of a disk: TablesOS magic at 0x180,
 /// classic 4-entry MBR partition table at 0x1BE, blank, or unknown.
 /// Accepts any slice ≥ 512 bytes so the USB-MSC path can reuse it on
 /// whatever READ(10) returned for LBA 0.
@@ -503,17 +503,17 @@ pub fn parse_mbr(s: &[u8]) -> MbrInfo {
         return MbrInfo::Unreadable;
     }
     let boot_sig = s[510] == 0x55 && s[511] == 0xAA;
-    if &s[0x1B0..0x1B8] == b"TBLSBOOT" && boot_sig {
-        let version = u16::from_le_bytes([s[0x1B8], s[0x1B9]]);
-        let data_loc_lba = u64::from_le_bytes(s[0x1BC..0x1C4].try_into().unwrap());
-        let stage2_lba = u32::from_le_bytes(s[0x1C4..0x1C8].try_into().unwrap());
-        let stage2_sectors = u16::from_le_bytes([s[0x1C8], s[0x1C9]]);
-        let kernel_lba = u32::from_le_bytes(s[0x1CC..0x1D0].try_into().unwrap());
-        let kernel_sectors = u32::from_le_bytes(s[0x1D0..0x1D4].try_into().unwrap());
-        let kernel_load = u32::from_le_bytes(s[0x1D4..0x1D8].try_into().unwrap());
-        let kernel_entry = u32::from_le_bytes(s[0x1D8..0x1DC].try_into().unwrap());
+    if &s[0x180..0x188] == b"TBLSBOOT" && boot_sig {
+        let version = u16::from_le_bytes([s[0x188], s[0x189]]);
+        let data_loc_lba = u64::from_le_bytes(s[0x18C..0x194].try_into().unwrap());
+        let stage2_lba = u32::from_le_bytes(s[0x194..0x198].try_into().unwrap());
+        let stage2_sectors = u16::from_le_bytes([s[0x198], s[0x199]]);
+        let kernel_lba = u32::from_le_bytes(s[0x19C..0x1A0].try_into().unwrap());
+        let kernel_sectors = u32::from_le_bytes(s[0x1A0..0x1A4].try_into().unwrap());
+        let kernel_load = u32::from_le_bytes(s[0x1A4..0x1A8].try_into().unwrap());
+        let kernel_entry = u32::from_le_bytes(s[0x1A8..0x1AC].try_into().unwrap());
         let mut sys_guid = [0u8; 16];
-        sys_guid.copy_from_slice(&s[0x1DC..0x1EC]);
+        sys_guid.copy_from_slice(&s[0x1AC..0x1BC]);
         return MbrInfo::TablesOs {
             version,
             data_loc_lba,
