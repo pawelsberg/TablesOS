@@ -605,12 +605,12 @@ pub fn run<D: BlockDevice>(
     // is bound at boot, before the UI starts). EHCI HID is the keyboard+mouse
     // path on pre-xHCI machines, where claiming the controller for the boot
     // disk killed the BIOS's SMM legacy emulation.
-    let usb_poll = xhci::mouse_present() || ehci::hid_present();
+    let usb_poll = xhci::hid_present() || ehci::hid_present();
     app.render();
     loop {
         // Pull any USB-HID input into the shared input queue first, so the
         // drain below treats it exactly like a PS/2 event.
-        xhci::pump_mouse();
+        xhci::pump_hid();
         ehci::pump_hid();
         // A full repaint blits the whole framebuffer, so doing one per input
         // event makes fast key-repeat (held arrows) enqueue faster than we can
@@ -873,7 +873,8 @@ impl<D: BlockDevice> App<D> {
                         let candidates: Vec<(u8, DriveInfo)> =
                             xhci::usb_drives_with_slots(&self.booted_sys_guid)
                                 .into_iter()
-                                .filter(|(_, d)| !d.booted)
+                                .filter(|(_, _, d)| !d.booted)
+                                .map(|(_, slot, d)| (slot, d))
                                 .collect();
                         if candidates.is_empty() {
                             self.status =

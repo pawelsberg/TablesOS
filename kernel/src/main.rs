@@ -35,8 +35,10 @@ mod time;
 mod ui;
 mod usb;
 
+use alloc::string::String;
+use alloc::vec::Vec;
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use spin::Mutex;
 use tablestore::{BlockDevice, Result as TsResult, Store, StoreError};
 
 /// Handed over by the bootloader at a fixed address; layout mirrors
@@ -167,6 +169,14 @@ extern "C" fn kmain(info: *const BootInfo) -> ! {
     // no volume read, no write, and there is no formatting path at all.
     let mut mbr = [0u8; 512];
     if disk.read_boot_sector(&mut mbr).is_err() {
+        // Surface the driver's own reason (no serial console on real HW), e.g.
+        // the EHCI/xHCI low-level error that made the read fail.
+        if let Some(detail) = usb::xhci::take_last_msc_err() {
+            fatal(&alloc::format!("cannot read MBR: {}", detail));
+        }
+        if let Some(detail) = usb::ehci::take_last_err() {
+            fatal(&alloc::format!("cannot read MBR: {}", detail));
+        }
         fatal("cannot read MBR");
     }
     if mbr[SYS_GUID_OFF..SYS_GUID_OFF + 16] != info.sys_guid[..] {
@@ -191,35 +201,261 @@ extern "C" fn kmain(info: *const BootInfo) -> ! {
         }
     };
 
-    // Bind a USB-HID boot mouse if one is present. On real hardware the pointer
-    // is USB and the BIOS's PS/2 emulation for it was switched off by our xHCI
+    // Bind USB-HID boot mouse + keyboard if present. On real hardware input is
+    // USB and the BIOS's PS/2 emulation for it was switched off by our xHCI
     // ownership handoff (taken to reach the USB boot disk), so without this the
-    // mouse is dead. The PS/2 path still serves QEMU and any genuine PS/2 mouse.
-    // See solved-issues/USB mouse on real hardware.md.
+    // mouse and keyboard are dead. The PS/2 path still serves QEMU and any
+    // genuine PS/2 device. See solved-issues/USB mouse on real hardware.md.
     // (DIAG: the on-screen line is a temporary boot marker.)
-    if usb::xhci::setup_mouse() {
-        serial_println!("USB-HID boot mouse ready");
-        boot_status("input: USB mouse ready");
+    if usb::xhci::setup_hid() {
+        serial_println!("USB-HID input ready");
+        boot_status("input: USB HID ready");
     } else {
-        serial_println!("no USB-HID mouse found (PS/2 only)");
+        serial_println!("no USB-HID input found (PS/2 only)");
     }
+
+    // Hold briefly on the boot log so it can be reviewed (press any key to page
+    // through it, Enter to continue); auto-continues if left untouched.
+    boot_pager_finish();
 
     serial_println!("starting UI");
     ui::run(store, info.sys_guid, info.data_lba)
 }
 
-/// DIAG: on-screen boot trace. The laptop has no serial console, so this draws
-/// each milestone as a new line on the framebuffer (and mirrors to serial for
-/// QEMU). The last line left visible when boot stalls pinpoints the hang.
+/// DIAG: on-screen boot trace, as a pager. The laptop has no serial console, so
+/// every milestone is also drawn on the framebuffer. Lines fill the screen
+/// top-to-bottom; once a page is full the screen clears and the next lines start
+/// again from the top. Every line is kept, so the whole trace can be reviewed.
+///
+/// When boot finishes, [`boot_pager_finish`] holds the last page for a few
+/// seconds ("press any key to review"); pressing any key there engages
+/// navigation — PageUp/PageDown/Home/End step through the captured pages and
+/// Enter continues into the UI. If no key is pressed the boot continues on its
+/// own. On real hardware the keyboard is USB-HID, which isn't live until the end
+/// of boot, so that end-of-boot window (which pumps USB-HID, not just PS/2) is
+/// the portable place to pause. A PS/2 keyboard (QEMU) can additionally lock the
+/// trace early, mid-boot, via [`boot_status`].
 /// Temporary — remove with the rest of the diagnostics once USB boot is solid.
-static BOOT_Y: AtomicUsize = AtomicUsize::new(30);
-pub fn boot_status(msg: &str) {
-    serial_println!("{}", msg);
-    let y = BOOT_Y.fetch_add(18, Ordering::Relaxed);
+struct BootPager {
+    /// Every boot line ever emitted, so navigation can reach any page.
+    lines: Vec<String>,
+    /// A key was pressed: auto-scroll is locked and navigation is active.
+    paused: bool,
+    /// Page currently shown while navigating.
+    view: usize,
+}
+
+static BOOT: Mutex<BootPager> = Mutex::new(BootPager {
+    lines: Vec::new(),
+    paused: false,
+    view: 0,
+});
+
+/// Text rows on a boot page. The bottom row is reserved for the hint line.
+fn boot_rows() -> usize {
+    framebuffer::with(|d| d.rows().saturating_sub(1))
+        .unwrap_or(40)
+        .max(1)
+}
+
+/// Total captured pages for `lines` at `per` rows each (at least one).
+fn boot_pages(lines: &[String], per: usize) -> usize {
+    if lines.is_empty() {
+        1
+    } else {
+        (lines.len() - 1) / per + 1
+    }
+}
+
+/// What to stamp on the reserved bottom row of a boot page.
+#[derive(Clone, Copy)]
+enum Hint {
+    /// No hint (e.g. the fatal screen, which overlays its own banner).
+    None,
+    /// Navigation engaged: `page X/Y · PgUp/PgDn · Enter`.
+    Nav,
+    /// End-of-boot review window counting down `secs` to auto-continue.
+    Countdown(u64),
+}
+
+/// Repaint one whole page of the boot log, clearing the screen first, and stamp
+/// `hint` on the reserved bottom row.
+fn draw_boot_page(lines: &[String], page: usize, per: usize, hint: Hint) {
     framebuffer::with(|d| {
-        d.draw_text(40, y, msg, framebuffer::C_FG, font::Font::Body);
+        let (w, h) = (d.width(), d.height());
+        d.fill_rect(0, 0, w, h, framebuffer::C_BG_TOP);
+        let start = page * per;
+        for i in 0..per {
+            let li = start + i;
+            if li >= lines.len() {
+                break;
+            }
+            d.draw_text(8, i * framebuffer::CELL_H, &lines[li], framebuffer::C_FG, font::Font::Body);
+        }
+        let text = match hint {
+            Hint::None => None,
+            Hint::Nav => Some(alloc::format!(
+                "[boot log] page {}/{}  PgUp/PgDn: navigate  Enter: continue",
+                page + 1,
+                boot_pages(lines, per)
+            )),
+            Hint::Countdown(secs) => Some(alloc::format!(
+                "boot complete — press any key to review the log   (continuing in {secs}s)"
+            )),
+        };
+        if let Some(t) = text {
+            d.draw_text(8, per * framebuffer::CELL_H, &t, framebuffer::C_ACCENT, font::Font::Body);
+        }
         d.blit();
     });
+}
+
+pub fn boot_status(msg: &str) {
+    serial_println!("{}", msg);
+    let per = boot_rows();
+    let mut bp = BOOT.lock();
+    bp.lines.push(String::from(msg));
+    let idx = bp.lines.len() - 1;
+
+    if !bp.paused {
+        // Live rolling fill. Any keypress locks the visible page and switches
+        // into navigation for the rest of boot.
+        let mut pressed = false;
+        while let Some(e) = ps2::poll() {
+            if let ps2::Event::Key(_) = e {
+                pressed = true;
+            }
+        }
+        if pressed {
+            bp.paused = true;
+            bp.view = idx / per;
+            let view = bp.view;
+            draw_boot_page(&bp.lines, view, per, Hint::Nav);
+            return;
+        }
+        let row = idx % per;
+        framebuffer::with(|d| {
+            if row == 0 {
+                // New page: clear and re-stamp the live hint on the bottom row.
+                let (w, h) = (d.width(), d.height());
+                d.fill_rect(0, 0, w, h, framebuffer::C_BG_TOP);
+                d.draw_text(
+                    8,
+                    per * framebuffer::CELL_H,
+                    "[boot] press any key to pause / navigate",
+                    framebuffer::C_DIM,
+                    font::Font::Body,
+                );
+            }
+            d.draw_text(8, row * framebuffer::CELL_H, &bp.lines[idx], framebuffer::C_FG, font::Font::Body);
+            d.blit();
+        });
+    } else {
+        // Locked: keep buffering, but only redraw in response to navigation.
+        let max_page = idx / per;
+        let mut redraw = false;
+        while let Some(e) = ps2::poll() {
+            if let ps2::Event::Key(k) = e {
+                match k {
+                    ps2::Key::PageUp => bp.view = bp.view.saturating_sub(1),
+                    ps2::Key::PageDown => bp.view = (bp.view + 1).min(max_page),
+                    ps2::Key::Home => bp.view = 0,
+                    ps2::Key::End => bp.view = max_page,
+                    _ => continue,
+                }
+                redraw = true;
+            }
+        }
+        if redraw {
+            let view = bp.view;
+            draw_boot_page(&bp.lines, view, per, Hint::Nav);
+        }
+    }
+}
+
+/// End-of-boot review window. Holds the last log page for [`REVIEW_MS`] showing
+/// a countdown; if any key is pressed it engages navigation (PageUp/PageDown,
+/// Home/End) and waits for Enter before continuing into the UI, otherwise it
+/// auto-continues when the countdown elapses. This pumps both PS/2 and USB-HID,
+/// so it works on real hardware (where the keyboard is USB and only becomes live
+/// at the end of boot) as well as in QEMU. A PS/2 key pressed mid-boot already
+/// set `paused`, in which case navigation is engaged immediately with no
+/// countdown.
+fn boot_pager_finish() {
+    /// How long the post-boot review window waits for a keypress before
+    /// continuing into the UI on its own.
+    const REVIEW_MS: u64 = 4000;
+
+    let per = boot_rows();
+    let mut engaged = BOOT.lock().paused;
+    let mut elapsed = 0u64;
+    let mut last_secs = u64::MAX;
+
+    // Draw the initial page (the last one filled, unless an early lock moved the
+    // view): navigation hint if already engaged, otherwise the countdown.
+    {
+        let bp = BOOT.lock();
+        let view = if engaged { bp.view } else { boot_pages(&bp.lines, per) - 1 };
+        let hint = if engaged { Hint::Nav } else { Hint::Countdown(REVIEW_MS / 1000) };
+        draw_boot_page(&bp.lines, view, per, hint);
+    }
+
+    loop {
+        usb::xhci::pump_hid();
+        usb::ehci::pump_hid();
+
+        let mut redraw = false;
+        while let Some(e) = ps2::poll() {
+            let ps2::Event::Key(k) = e else { continue };
+            if !engaged {
+                // First key ends the countdown and engages navigation, locked on
+                // the last page.
+                engaged = true;
+                let mut bp = BOOT.lock();
+                bp.paused = true;
+                bp.view = boot_pages(&bp.lines, per) - 1;
+                redraw = true;
+                continue;
+            }
+            let mut bp = BOOT.lock();
+            let max_page = boot_pages(&bp.lines, per) - 1;
+            match k {
+                ps2::Key::PageUp => bp.view = bp.view.saturating_sub(1),
+                ps2::Key::PageDown => bp.view = (bp.view + 1).min(max_page),
+                ps2::Key::Home => bp.view = 0,
+                ps2::Key::End => bp.view = max_page,
+                ps2::Key::Enter => return,
+                _ => continue,
+            }
+            redraw = true;
+        }
+
+        if engaged {
+            if redraw {
+                let bp = BOOT.lock();
+                let view = bp.view;
+                draw_boot_page(&bp.lines, view, per, Hint::Nav);
+            }
+        } else {
+            // Counting down: repaint once per second, auto-continue at zero.
+            let remaining = REVIEW_MS.saturating_sub(elapsed);
+            let secs = remaining.div_ceil(1000);
+            if secs != last_secs {
+                last_secs = secs;
+                let bp = BOOT.lock();
+                let view = boot_pages(&bp.lines, per) - 1;
+                draw_boot_page(&bp.lines, view, per, Hint::Countdown(secs));
+            }
+            if remaining == 0 {
+                return;
+            }
+        }
+
+        // ~125 Hz poll so a USB key (no IRQ) is caught promptly and the
+        // countdown stays smooth. PS/2 IRQs enqueue in the meantime regardless.
+        time::delay_ms(8);
+        elapsed += 8;
+    }
 }
 
 /// The disk we booted from, reached either over legacy ATA PIO (QEMU's IDE
@@ -453,7 +689,7 @@ fn discover_boot_disk(data_lba: u64, sys_guid: &[u8; 16]) -> Option<BootDisk> {
     }
     let drives = usb::xhci::usb_drives_with_slots(sys_guid);
     boot_status(&alloc::format!("USB: drives={}", drives.len()));
-    for (slot, di) in &drives {
+    for (mmio, slot, di) in &drives {
         boot_status(&alloc::format!(
             "USB: slot {} sig={} booted={}",
             slot, di.boot_sig_ok, di.booted
@@ -461,12 +697,32 @@ fn discover_boot_disk(data_lba: u64, sys_guid: &[u8; 16]) -> Option<BootDisk> {
         if !di.booted {
             continue;
         }
-        if let Ok(dev) = usb::xhci::UsbMscDevice::open_with_identity_gate(*slot, *sys_guid) {
+        // Open by *controller + slot*: slot ids are only unique per xHCI, and
+        // this machine has two controllers that both number a slot 1. Keying on
+        // the slot id alone resolved to whichever controller was brought up
+        // first — which differs between a cold boot and a reset, the cause of
+        // the intermittent `slot has no bulk IN endpoint` on cold start.
+        if let Ok(mut dev) =
+            usb::xhci::UsbMscDevice::open_with_identity_gate(*mmio, *slot, *sys_guid)
+        {
             let total = dev.sector_count();
             if total <= data_lba {
                 continue;
             }
-            boot_status("USB: boot drive opened");
+            // Cold-boot spin-up: the stick answers INQUIRY/READ CAPACITY (all
+            // `open` needs) before its medium is actually readable, so the MBR
+            // identity read below fails on a cold first boot but works after a
+            // reset (the stick stays powered and ready). Wait for TEST UNIT
+            // READY first so a cold boot behaves like a reset.
+            if !dev.wait_until_ready() {
+                boot_status("USB: drive slow to become ready -> proceeding");
+            }
+            // The ctrl/slot tag also doubles as a build marker: an old kernel
+            // (pre controller-keyed I/O) prints a plain "USB: boot drive opened".
+            boot_status(&alloc::format!(
+                "USB: boot drive opened (ctrl {:#x} slot {})",
+                mmio, slot
+            ));
             return Some(BootDisk::Usb {
                 dev,
                 base: data_lba,
@@ -497,13 +753,20 @@ fn discover_boot_disk(data_lba: u64, sys_guid: &[u8; 16]) -> Option<BootDisk> {
 /// crucially, it performs no disk writes.
 fn fatal(msg: &str) -> ! {
     serial_println!("FATAL: {msg}");
-    // DIAG: draw below the boot trace instead of clearing the screen, so the
-    // markers that explain the failure stay visible. (Restore the full-screen
-    // error backdrop during cleanup.)
-    let y = BOOT_Y.fetch_add(52, Ordering::Relaxed);
+    // DIAG: record the failure in the boot log, show its last page so the
+    // markers that explain it stay visible, then stamp the error banner over
+    // the bottom rows. (Restore the full-screen error backdrop during cleanup.)
+    let per = boot_rows();
+    {
+        let mut bp = BOOT.lock();
+        bp.lines.push(alloc::format!("FATAL: {msg}"));
+        let last = boot_pages(&bp.lines, per) - 1;
+        draw_boot_page(&bp.lines, last, per, Hint::None);
+    }
     framebuffer::with(|d| {
-        d.draw_text_glow(40, y + 10, "TABLESOS — CANNOT START", framebuffer::C_ERR, framebuffer::C_GLOW, font::Font::Display);
-        d.draw_text(40, y + 38, msg, framebuffer::C_FG, font::Font::Body);
+        let y = d.height().saturating_sub(framebuffer::CELL_H * 3);
+        d.draw_text_glow(8, y, "TABLESOS — CANNOT START", framebuffer::C_ERR, framebuffer::C_GLOW, font::Font::Display);
+        d.draw_text(8, y + framebuffer::CELL_H + 4, msg, framebuffer::C_FG, font::Font::Body);
         d.blit();
     });
     halt();

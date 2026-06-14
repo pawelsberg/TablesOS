@@ -21,6 +21,7 @@
 //! matching boot drive.
 
 use alloc::format;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::ptr::{read_volatile, write_volatile};
@@ -196,6 +197,11 @@ struct HidDev {
     pipe: Pipe,
     iface: u16,
     kind: HidKind,
+    /// Interrupt IN endpoint (number, max-packet) — captured for a future
+    /// switch from control GET_REPORT to interrupt-endpoint polling, which
+    /// real devices implement more reliably. Logged at registration.
+    #[allow(dead_code)]
+    int_in: (u8, u16),
     /// Last keyboard report (modifiers + 6 usages), for edge detection.
     last: [u8; 8],
     /// Consecutive failures; the device is parked after too many.
@@ -618,9 +624,21 @@ fn clear_stall(st: &EhciState, pipe: Pipe, ep: &mut Endpoint, dir_in: bool) {
 
 // ---- enumeration --------------------------------------------------------------------
 
+/// A parsed interface: its real `bInterfaceNumber` (needed as the `wIndex`
+/// of every interface-targeted control request — using the Vec position
+/// instead silently mis-targets composite devices), class/subclass/protocol,
+/// and endpoints `(addr, type, mps)`.
+struct ParsedIface {
+    number: u8,
+    class: u8,
+    subclass: u8,
+    protocol: u8,
+    endpoints: Vec<(u8, u8, u16)>,
+}
+
 struct ParsedConfig {
     config_value: u8,
-    interfaces: Vec<(u8, u8, u8, Vec<(u8, u8, u16)>)>, // class/sub/proto, eps: (addr, type, mps)
+    interfaces: Vec<ParsedIface>,
 }
 
 fn parse_config(raw: &[u8]) -> ParsedConfig {
@@ -638,14 +656,19 @@ fn parse_config(raw: &[u8]) -> ParsedConfig {
             Some(4) if i + 9 <= raw.len() => {
                 // Interface descriptor (alternate setting 0 only).
                 if raw[i + 3] == 0 {
-                    out.interfaces
-                        .push((raw[i + 5], raw[i + 6], raw[i + 7], Vec::new()));
+                    out.interfaces.push(ParsedIface {
+                        number: raw[i + 2],
+                        class: raw[i + 5],
+                        subclass: raw[i + 6],
+                        protocol: raw[i + 7],
+                        endpoints: Vec::new(),
+                    });
                 }
             }
             Some(5) if i + 7 <= raw.len() => {
                 if let Some(last) = out.interfaces.last_mut() {
                     let mps = u16::from_le_bytes([raw[i + 4], raw[i + 5]]);
-                    last.3.push((raw[i + 2], raw[i + 3] & 0x3, mps));
+                    last.endpoints.push((raw[i + 2], raw[i + 3] & 0x3, mps));
                 }
             }
             _ => {}
@@ -703,7 +726,7 @@ fn enumerate_addr0(
     let cfg = parse_config(&full);
     control(st, pipe, 0x00, 9, cfg.config_value as u16, 0, None)?;
 
-    let is_hub = dev_class == 9 || cfg.interfaces.iter().any(|i| i.0 == 9);
+    let is_hub = dev_class == 9 || cfg.interfaces.iter().any(|i| i.class == 9);
     if is_hub {
         crate::boot_status(&format!("ehci: addr {} = hub {:04x}:{:04x}", addr, vid, pid));
         if depth >= 3 {
@@ -717,15 +740,15 @@ fn enumerate_addr0(
     if let Some(ifd) = cfg
         .interfaces
         .iter()
-        .find(|i| i.0 == 0x08 && i.1 == 0x06 && i.2 == 0x50)
+        .find(|i| i.class == 0x08 && i.subclass == 0x06 && i.protocol == 0x50)
     {
         let bulk_in = ifd
-            .3
+            .endpoints
             .iter()
             .find(|e| e.1 == 2 && e.0 & 0x80 != 0)
             .ok_or("MSC without bulk IN")?;
         let bulk_out = ifd
-            .3
+            .endpoints
             .iter()
             .find(|e| e.1 == 2 && e.0 & 0x80 == 0)
             .ok_or("MSC without bulk OUT")?;
@@ -744,35 +767,60 @@ fn enumerate_addr0(
         return Ok(());
     }
 
-    // HID boot keyboard / mouse (class 3, subclass 1 = boot, protocol 1/2)?
-    if let Some((ifn, kind)) = cfg.interfaces.iter().enumerate().find_map(|(n, i)| {
-        if i.0 == 0x03 && i.1 == 0x01 {
-            match i.2 {
-                1 => Some((n as u16, HidKind::Keyboard)),
-                2 => Some((n as u16, HidKind::Mouse)),
-                _ => None,
-            }
-        } else {
-            None
+    // Register EVERY HID boot interface (class 3, subclass 1 = boot, protocol
+    // 1=keyboard / 2=mouse), not just the first — a combo wireless receiver or
+    // a keyboard with an integrated pointer is one device with both. Each is
+    // targeted by its real `bInterfaceNumber`. Collect first so the borrow of
+    // `cfg` ends before we touch `states[idx]` mutably.
+    let hids: Vec<(u16, HidKind, (u8, u16))> = cfg
+        .interfaces
+        .iter()
+        .filter(|i| i.class == 0x03 && i.subclass == 0x01)
+        .filter_map(|i| {
+            let kind = match i.protocol {
+                1 => HidKind::Keyboard,
+                2 => HidKind::Mouse,
+                _ => return None,
+            };
+            // Interrupt IN endpoint (type 3, address bit 7 set).
+            let int_in = i
+                .endpoints
+                .iter()
+                .find(|e| e.1 == 3 && e.0 & 0x80 != 0)
+                .map(|e| (e.0 & 0xF, e.2))
+                .unwrap_or((0, 8));
+            Some((i.number as u16, kind, int_in))
+        })
+        .collect();
+    if !hids.is_empty() {
+        for (ifn, kind, int_in) in hids {
+            let st = &states[idx];
+            // SET_PROTOCOL(boot) — must reach the right interface or reports
+            // keep their report-mode layout and decode to garbage; SET_IDLE(0)
+            // is best-effort. Non-fatal: a device that NAKs/stalls these
+            // shouldn't abort enumeration of the rest.
+            let sp = control(st, pipe, 0x21, 0x0B, 0, ifn, None);
+            let _ = control(st, pipe, 0x21, 0x0A, 0, ifn, None);
+            crate::boot_status(&format!(
+                "ehci: addr {} if {} = HID {} {:04x}:{:04x} epIN={} mps={} setproto={}",
+                addr,
+                ifn,
+                if kind == HidKind::Keyboard { "keyboard" } else { "mouse" },
+                vid,
+                pid,
+                int_in.0,
+                int_in.1,
+                if sp.is_ok() { "ok" } else { "ERR" },
+            ));
+            states[idx].hid.push(HidDev {
+                pipe,
+                iface: ifn,
+                kind,
+                int_in,
+                last: [0; 8],
+                errors: 0,
+            });
         }
-    }) {
-        // Boot protocol + idle-on-change; SET_IDLE failures are tolerated.
-        control(st, pipe, 0x21, 0x0B, 0, ifn, None)?;
-        let _ = control(st, pipe, 0x21, 0x0A, 0, ifn, None);
-        crate::boot_status(&format!(
-            "ehci: addr {} = HID {} {:04x}:{:04x}",
-            addr,
-            if kind == HidKind::Keyboard { "keyboard" } else { "mouse" },
-            vid,
-            pid
-        ));
-        states[idx].hid.push(HidDev {
-            pipe,
-            iface: ifn,
-            kind,
-            last: [0; 8],
-            errors: 0,
-        });
         return Ok(());
     }
 
@@ -1025,18 +1073,50 @@ fn next_tag() -> u32 {
     TAG.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Last low-level failure detail, surfaced where an `Err` would otherwise be
+/// opaque (the kernel's "cannot read MBR" fatal, write errors). The laptop /
+/// desktop have no serial console, so this is how a real-hardware failure
+/// names itself on screen.
+static LAST_ERR: Mutex<Option<String>> = Mutex::new(None);
+fn record_err(detail: &str) {
+    *LAST_ERR.lock() = Some(String::from(detail));
+}
+pub fn take_last_err() -> Option<String> {
+    LAST_ERR.lock().take()
+}
+
+/// Reset both bulk endpoints of an MSC device — CLEAR_FEATURE(ENDPOINT_HALT)
+/// on each plus a software toggle reset. The command-level recovery a flaky
+/// stick needs when a whole READ/WRITE round-trip fails (toggle desync, a
+/// transient stall the per-stage recovery in `bot_command` didn't clear).
+fn reset_msc_endpoints(st: &mut EhciState, msc_idx: usize) {
+    let pipe = st.msc[msc_idx].pipe;
+    let mut ein = take_in(st, msc_idx);
+    clear_stall(st, pipe, &mut ein, true);
+    put_in(st, msc_idx, ein);
+    let mut eout = take_out(st, msc_idx);
+    clear_stall(st, pipe, &mut eout, false);
+    put_out(st, msc_idx, eout);
+}
+
 /// INQUIRY / TEST UNIT READY / READ CAPACITY / READ(10) of LBA 0 on every
 /// enumerated MSC device — fills in geometry + first block.
 fn probe_msc(st: &mut EhciState) {
     for i in 0..st.msc.len() {
         let _ = bot_command(st, i, 0, &bot::cdb_inquiry(36), Some((36, true, &[])), next_tag());
-        for _ in 0..3 {
+        // Wait for the medium to spin up. A freshly-powered stick (cold boot)
+        // answers INQUIRY while its flash-translation layer is still coming up
+        // and reports "becoming ready" to TEST UNIT READY; a warm reset leaves
+        // it already ready. Give it the USB-MSC-conventional ~5 s so the
+        // READ(10) below (which caches the MBR for boot-disk matching) lands on
+        // a cold boot instead of only after a reset.
+        for _ in 0..50 {
             if let Ok((0, _)) =
                 bot_command(st, i, 0, &bot::cdb_test_unit_ready(), None, next_tag())
             {
                 break;
             }
-            time::delay_ms(50);
+            time::delay_ms(100);
         }
         if let Ok((0, cap)) = bot_command(
             st,
@@ -1186,7 +1266,10 @@ fn decode_mouse(report: &[u8]) {
     let left = report[0] & 0x01 != 0;
     let right = report[0] & 0x02 != 0;
     if dx != 0 || dy != 0 || report[0] & 0x07 != 0 {
-        crate::ps2::feed_mouse_delta(dx, -dy, left, right);
+        // HID boot-mouse `dy` is already screen-oriented (positive = down) —
+        // `feed_mouse_delta` expects that convention, so pass it straight
+        // through, matching the xHCI mouse path. (Negating it inverts Y.)
+        crate::ps2::feed_mouse_delta(dx, dy, left, right);
     }
 }
 
@@ -1213,7 +1296,7 @@ fn decode_keyboard(h: &mut HidDev, report: &[u8]) {
 
 /// HID boot-keyboard usage → the kernel's key events (US layout, mirroring
 /// the PS/2 scancode tables in `ps2.rs`).
-fn hid_usage_to_key(usage: u8, shift: bool) -> Option<crate::ps2::Key> {
+pub(crate) fn hid_usage_to_key(usage: u8, shift: bool) -> Option<crate::ps2::Key> {
     use crate::ps2::Key;
     let ch = |a: char, b: char| Some(Key::Char(if shift { b } else { a }));
     match usage {
@@ -1276,20 +1359,39 @@ impl EhciMscDevice {
     fn read_lba(&self, lba: u32, buf: &mut [u8]) -> TsResult<()> {
         let mut guard = STATES.lock();
         let st = guard.get_mut(self.ctrl).ok_or(StoreError::Io)?;
-        match bot_command(
-            st,
-            self.msc,
-            0,
-            &bot::cdb_read10(lba, 1),
-            Some((SECTOR, true, &[])),
-            next_tag(),
-        ) {
-            Ok((0, data)) if data.len() >= SECTOR => {
-                buf.copy_from_slice(&data[..SECTOR]);
-                Ok(())
+        // Retry the whole READ(10) once after a full bulk-endpoint reset: cheap
+        // USB sticks intermittently stall or desync a toggle on a round-trip,
+        // and the standard BOT recovery is to reset and re-issue.
+        let mut last = "no attempt";
+        for attempt in 0..2 {
+            if attempt == 1 {
+                reset_msc_endpoints(st, self.msc);
             }
-            _ => Err(StoreError::Io),
+            match bot_command(
+                st,
+                self.msc,
+                0,
+                &bot::cdb_read10(lba, 1),
+                Some((SECTOR, true, &[])),
+                next_tag(),
+            ) {
+                Ok((0, data)) if data.len() >= SECTOR => {
+                    buf.copy_from_slice(&data[..SECTOR]);
+                    return Ok(());
+                }
+                Ok((status, data)) => {
+                    last = if status != 0 {
+                        "READ(10) CSW status != 0"
+                    } else {
+                        let _ = data;
+                        "READ(10) short data"
+                    };
+                }
+                Err(e) => last = e,
+            }
         }
+        record_err(&format!("READ(10) lba {} failed: {}", lba, last));
+        Err(StoreError::Io)
     }
 
     fn verify_identity(&mut self) -> TsResult<()> {

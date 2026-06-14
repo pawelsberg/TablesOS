@@ -312,10 +312,16 @@ struct XhciState {
     addressed: Vec<AddressedDevice>,
     /// Most recent USB-MSC probe results.
     msc: Vec<MscProbe>,
-    /// The USB-HID boot mouse, if `probe_hid_mouse` found and armed one. Polled
-    /// cooperatively from the UI loop (never from an IRQ — xHCI transfers
-    /// allocate). `None` until set up; absent on machines with no USB mouse.
-    mouse: Option<MouseDevice>,
+    /// **Every** bound USB-HID boot mouse interface — polled cooperatively
+    /// from the UI loop. Plural because a machine can have several composite
+    /// HID devices (e.g. a keyboard and a separate wireless-mouse receiver
+    /// each exposing both a keyboard and a mouse interface); we can't tell
+    /// from descriptors which mouse interface has a physical mouse, so we
+    /// poll them all — the idle ones simply never report.
+    mice: Vec<MouseDevice>,
+    /// Likewise every bound boot keyboard interface. Transfer events are
+    /// dispatched to the right device by (slot, endpoint DCI).
+    keyboards: Vec<KeyboardDevice>,
 }
 
 /// Per-slot allocations needed for Address Device and subsequent control
@@ -354,6 +360,10 @@ struct EndpointState {
     transfer_type: u8,
     max_packet_size: u16,
     direction_in: bool,
+    /// Owning interface's `bInterfaceNumber` — so a composite device's
+    /// endpoints can be matched to the right interface (e.g. binding the
+    /// *mouse* interface's interrupt-IN endpoint, not the keyboard's).
+    interface_number: u8,
     tr_ring: u64,
     tr_enqueue: usize,
     tr_pcs: u8,
@@ -371,6 +381,9 @@ struct MouseDevice {
     /// Index into `slots[slot_idx].endpoints` of the interrupt-IN endpoint.
     ep_idx: usize,
     slot_id: u8,
+    /// Endpoint DCI — distinguishes this endpoint's transfer events from a
+    /// keyboard sharing the same (composite) slot.
+    dci: u8,
     /// Leaked, identity-mapped DMA buffer the controller writes each report into.
     report_buf: u64,
     /// Bytes requested per transfer (endpoint max packet, clamped to 4..=8).
@@ -385,6 +398,26 @@ struct MouseDevice {
     accum_dy: i32,
     buttons: u8,
     dirty: bool,
+}
+
+/// A bound USB-HID boot-protocol keyboard. Mirrors [`MouseDevice`]: one
+/// interrupt-IN TRB kept armed; each completed 8-byte boot report is decoded
+/// against the previous one (edge detection) and the new keys fed straight
+/// into the shared input queue via `ps2::feed_key`.
+#[derive(Clone)]
+struct KeyboardDevice {
+    slot_idx: usize,
+    ep_idx: usize,
+    slot_id: u8,
+    /// Endpoint DCI — matches the Transfer Event's endpoint id so we can tell
+    /// keyboard events from mouse events on a shared (composite) slot.
+    dci: u8,
+    report_buf: u64,
+    report_len: u32,
+    armed: bool,
+    needs_reset: bool,
+    /// Previous boot report (modifiers + 6 key usages) for edge detection.
+    last: [u8; 8],
 }
 
 #[derive(Clone)]
@@ -780,7 +813,8 @@ pub fn bring_up(dev: &PciDevice, info: &XhciInfo) -> Result<BringUpInfo, &'stati
         slots: Vec::new(),
         addressed: Vec::new(),
         msc: Vec::new(),
-        mouse: None,
+        mice: Vec::new(),
+        keyboards: Vec::new(),
     });
     Ok(bringup)
 }
@@ -1182,6 +1216,10 @@ struct Event {
     trb_type: u8,
     completion_code: u8,
     slot_id: u8,
+    /// Transfer Events: the Endpoint ID (DCI) the event is for — needed to
+    /// tell a composite device's interrupt endpoints apart (keyboard vs mouse
+    /// on the same slot).
+    endpoint_id: u8,
     parameter: u64,
     /// Status field bits 0..23. For Transfer Events this is the
     /// *residue* (bytes not transferred); 0 = full transfer done.
@@ -1215,6 +1253,7 @@ fn try_consume_event(info: &XhciInfo, st: &mut XhciState) -> Option<Event> {
         trb_type,
         completion_code: ((status >> 24) & 0xFF) as u8,
         slot_id: ((control >> 24) & 0xFF) as u8,
+        endpoint_id: ((control >> 16) & 0x1F) as u8,
         parameter,
         transfer_length: status & 0x00FF_FFFF,
     };
@@ -1246,8 +1285,7 @@ fn drain_event(
     loop {
         match try_consume_event(info, st) {
             Some(ev) => {
-                if ev.trb_type == 32 && is_mouse_slot(st, ev.slot_id) {
-                    service_mouse(st, ev.completion_code);
+                if service_hid_transfer(st, &ev) {
                     continue;
                 }
                 if ev.trb_type == want {
@@ -1266,12 +1304,31 @@ fn drain_event(
     }
 }
 
-/// Does this transfer-event slot belong to the armed HID mouse? Its slot only
-/// ever produces events from our interrupt-IN poll once `st.mouse` is set (we
-/// finish all control transfers to it before recording it), so a slot match is
-/// definitive.
-fn is_mouse_slot(st: &XhciState, slot_id: u8) -> bool {
-    st.mouse.as_ref().map_or(false, |m| m.slot_id == slot_id)
+/// Route a Transfer Event (type 32) to the HID mouse or keyboard it belongs
+/// to, by (slot, endpoint DCI) — so a composite device's two interrupt
+/// endpoints on one shared slot are told apart. Returns true if it was a HID
+/// event (serviced), so the caller skips it.
+fn service_hid_transfer(st: &mut XhciState, ev: &Event) -> bool {
+    if ev.trb_type != 32 {
+        return false;
+    }
+    if let Some(i) = st
+        .mice
+        .iter()
+        .position(|m| m.slot_id == ev.slot_id && m.dci == ev.endpoint_id)
+    {
+        service_mouse(st, i, ev.completion_code);
+        return true;
+    }
+    if let Some(i) = st
+        .keyboards
+        .iter()
+        .position(|k| k.slot_id == ev.slot_id && k.dci == ev.endpoint_id)
+    {
+        service_keyboard(st, i, ev.completion_code);
+        return true;
+    }
+    false
 }
 
 /// Handle one completed interrupt-IN transfer for the HID mouse. Parses the
@@ -1279,11 +1336,8 @@ fn is_mouse_slot(st: &XhciState, slot_id: u8) -> bool {
 /// positive = down) and accumulates it; marks the TRB consumed so the next poll
 /// re-arms. A non-Success/Short completion means the endpoint halted — flag it
 /// for reset by the poll (not here, to avoid a re-entrant command drain).
-fn service_mouse(st: &mut XhciState, cc: u8) {
-    let buf = match st.mouse.as_ref() {
-        Some(m) => m.report_buf,
-        None => return,
-    };
+fn service_mouse(st: &mut XhciState, idx: usize, cc: u8) {
+    let buf = st.mice[idx].report_buf;
     let (b0, b1, b2) = unsafe {
         (
             read_volatile(buf as *const u8),
@@ -1291,34 +1345,79 @@ fn service_mouse(st: &mut XhciState, cc: u8) {
             read_volatile((buf as *const u8).add(2)),
         )
     };
-    if let Some(m) = st.mouse.as_mut() {
-        m.armed = false; // its TRB was consumed
-        if cc == 1 || cc == 13 {
-            m.accum_dx += (b1 as i8) as i32;
-            m.accum_dy += (b2 as i8) as i32;
-            m.buttons = b0;
-            m.dirty = true;
-        } else {
-            m.needs_reset = true;
-        }
+    let m = &mut st.mice[idx];
+    m.armed = false; // its TRB was consumed
+    if cc == 1 || cc == 13 {
+        m.accum_dx += (b1 as i8) as i32;
+        m.accum_dy += (b2 as i8) as i32;
+        m.buttons = b0;
+        m.dirty = true;
+    } else {
+        m.needs_reset = true;
     }
 }
 
-/// Queue one interrupt-IN transfer for the HID mouse and ring its doorbell, so
+/// Queue one interrupt-IN transfer for mouse `idx` and ring its doorbell, so
 /// the controller delivers the next report into the report buffer. Guarded by
 /// `armed` so we never queue two at once. Does no draining, so it is safe to
 /// call from inside an event drain.
-fn arm_mouse(info: &XhciInfo, st: &mut XhciState) {
-    let (slot_idx, ep_idx, buf, len) = match st.mouse.as_ref() {
-        Some(m) if !m.armed => (m.slot_idx, m.ep_idx, m.report_buf, m.report_len),
-        _ => return,
-    };
+fn arm_mouse(info: &XhciInfo, st: &mut XhciState, idx: usize) {
+    let m = &st.mice[idx];
+    if m.armed {
+        return;
+    }
+    let (slot_idx, ep_idx, buf, len) = (m.slot_idx, m.ep_idx, m.report_buf, m.report_len);
     let (slot_id, dci) = post_normal_trb(st, slot_idx, ep_idx, buf, len);
     let db = (info.mmio_base + info.dboff as u64 + 4 * slot_id as u64) as *mut u32;
     unsafe { write_volatile(db, dci as u32) };
-    if let Some(m) = st.mouse.as_mut() {
-        m.armed = true;
+    st.mice[idx].armed = true;
+}
+
+/// Handle one completed interrupt-IN transfer for keyboard `idx`. Decodes the
+/// 8-byte boot report (byte0 = modifiers, bytes 2..8 = up to 6 key usages)
+/// against the previous one and feeds newly-pressed keys into the shared input
+/// queue. A non-Success/Short completion flags an endpoint reset for the poll
+/// to perform (not here — avoids a re-entrant command drain).
+fn service_keyboard(st: &mut XhciState, idx: usize, cc: u8) {
+    let (buf, last) = { let k = &st.keyboards[idx]; (k.report_buf, k.last) };
+    let mut report = [0u8; 8];
+    for (i, b) in report.iter_mut().enumerate() {
+        *b = unsafe { read_volatile((buf as *const u8).add(i)) };
     }
+    let armed_ok = cc == 1 || cc == 13;
+    if armed_ok {
+        let shift = report[0] & 0x22 != 0;
+        for i in 2..8 {
+            let usage = report[i];
+            if usage < 4 || last[2..8].contains(&usage) {
+                continue; // empty/rollover, or held since the last report
+            }
+            if let Some(key) = super::ehci::hid_usage_to_key(usage, shift) {
+                crate::ps2::feed_key(key);
+            }
+        }
+    }
+    let k = &mut st.keyboards[idx];
+    k.armed = false;
+    if armed_ok {
+        k.last = report;
+    } else {
+        k.needs_reset = true;
+    }
+}
+
+/// Queue one interrupt-IN transfer for keyboard `idx` and ring its doorbell.
+/// Guarded by `armed`; does no draining (safe from inside an event drain).
+fn arm_keyboard(info: &XhciInfo, st: &mut XhciState, idx: usize) {
+    let k = &st.keyboards[idx];
+    if k.armed {
+        return;
+    }
+    let (slot_idx, ep_idx, buf, len) = (k.slot_idx, k.ep_idx, k.report_buf, k.report_len);
+    let (slot_id, dci) = post_normal_trb(st, slot_idx, ep_idx, buf, len);
+    let db = (info.mmio_base + info.dboff as u64 + 4 * slot_id as u64) as *mut u32;
+    unsafe { write_volatile(db, dci as u32) };
+    st.keyboards[idx].armed = true;
 }
 
 fn drain_for_command_completion(
@@ -2206,15 +2305,25 @@ pub fn configure_endpoints(
         };
         let mut res = st.slots[slot_idx].clone();
 
-        // Use the first interface's first alt setting (alt 0).
-        let interface = &cfg.interfaces[0];
+        // Configure the endpoints of EVERY interface (alt 0), not just the
+        // first — a composite device (e.g. a combo keyboard+mouse: keyboard on
+        // interface 0, mouse on interface 1) needs both interfaces' endpoints
+        // wired, or the second function (the mouse) has no transfer ring and
+        // `probe_hid_*` would otherwise fall back to the wrong interface's
+        // endpoint. Endpoint numbers are device-unique, so DCIs never collide.
         let mut new_endpoints: Vec<EndpointState> = Vec::new();
         let mut summary: Vec<ConfiguredEndpoint> = Vec::new();
         let mut max_dci: u8 = 1;
         let mut add_flags: u32 = 1; // A0 = 1 (slot context always re-evaluated)
         let input_ctx_ptr = res.input_ctx as *mut u8;
 
-        for ep in &interface.endpoints {
+        for ep in cfg
+            .interfaces
+            .iter()
+            .filter(|i| i.alt_setting == 0)
+            .flat_map(|i| i.endpoints.iter().map(move |e| (i.number, e)))
+        {
+            let (iface_num, ep) = ep;
             let dci = 2 * ep.number + (if ep.direction_in { 1 } else { 0 });
             let ep_type = xhci_ep_type(ep.transfer_type, ep.direction_in);
             if ep_type == 0 {
@@ -2272,6 +2381,7 @@ pub fn configure_endpoints(
                 transfer_type: ep.transfer_type,
                 max_packet_size: ep.max_packet_size,
                 direction_in: ep.direction_in,
+                interface_number: iface_num,
                 tr_ring: tr as u64,
                 tr_enqueue: 0,
                 tr_pcs: 1,
@@ -2439,6 +2549,11 @@ impl CapacityData {
 
 #[derive(Clone)]
 pub struct MscProbe {
+    /// MMIO base of the xHCI controller this device lives on. Slot ids are
+    /// only unique *per controller*, so on a machine with several xHCIs (PCH +
+    /// add-in card) two drives can share slot id 1; this disambiguates them so
+    /// I/O is routed to the right controller. See [`state_for`].
+    pub mmio_base: u64,
     pub slot_id: u8,
     pub interface_number: u8,
     pub get_max_lun_cc: u8,
@@ -2529,6 +2644,7 @@ pub fn probe_mass_storage(
         };
 
         let mut probe = MscProbe {
+            mmio_base: info.mmio_base,
             slot_id,
             interface_number,
             get_max_lun_cc: 0,
@@ -3043,14 +3159,15 @@ fn parse_inquiry(b: &[u8]) -> InquiryData {
 pub fn usb_drives(booted_sys_guid: &[u8; 16]) -> Vec<DriveInfo> {
     usb_drives_with_slots(booted_sys_guid)
         .into_iter()
-        .map(|(_, d)| d)
+        .map(|(_, _, d)| d)
         .collect()
 }
 
-/// Same as `usb_drives`, but each row carries the xHCI slot ID. Used by
-/// the install-to-USB picker (the `BlockDevice` wrapper is opened by
-/// slot ID, not by drive label).
-pub fn usb_drives_with_slots(booted_sys_guid: &[u8; 16]) -> Vec<(u8, DriveInfo)> {
+/// Same as `usb_drives`, but each row carries the owning controller's MMIO
+/// base and the xHCI slot ID. Used by the boot-disk selection (which must
+/// reach the exact controller — two xHCIs can share a slot id) and the
+/// install-to-USB picker.
+pub fn usb_drives_with_slots(booted_sys_guid: &[u8; 16]) -> Vec<(u64, u8, DriveInfo)> {
     let probes = current_msc();
     let addressed = current_addressed();
     let mut out = Vec::new();
@@ -3086,6 +3203,7 @@ pub fn usb_drives_with_slots(booted_sys_guid: &[u8; 16]) -> Vec<(u8, DriveInfo)>
             alloc::format!("{} {}", inquiry.vendor, inquiry.product)
         };
         out.push((
+            p.mmio_base,
             p.slot_id,
             DriveInfo {
                 slot: alloc::format!("USB slot {} (xHCI port {})", p.slot_id, port),
@@ -3118,7 +3236,8 @@ pub fn usb_drives_with_slots(booted_sys_guid: &[u8; 16]) -> Vec<(u8, DriveInfo)>
 // See solved-issues/USB mouse on real hardware.md.
 // =====================================================================
 
-/// Relative movement + current button state, returned by `poll_mouse_delta`.
+/// Relative movement + current button state, accumulated by `service_mouse`
+/// and forwarded by `pump_hid`.
 #[derive(Clone, Copy)]
 pub struct MouseDelta {
     pub dx: i32,
@@ -3136,102 +3255,180 @@ pub struct MouseDelta {
 pub fn probe_hid_mouse(dev: &PciDevice, info: &XhciInfo) -> Result<bool, &'static str> {
     let _ = dev;
     let mut guard = STATES.lock();
-    // One mouse globally, regardless of which controller carries it.
-    if guard.iter().any(|s| s.mouse.is_some()) {
-        return Ok(true);
-    }
     let st = state_for(&mut guard, info.mmio_base).ok_or("bring up the controller first")?;
     if !info.mmio_accessible {
         return Err("MMIO not accessible");
     }
 
-    // A configured device whose interface is a boot mouse.
-    let candidate = st
+    // EVERY configured device's boot-mouse interface(s) — there can be more
+    // than one (a keyboard and a wireless-mouse receiver each expose a mouse
+    // interface; only one has a physical mouse, but we can't tell which, so
+    // bind and poll them all — the idle one never reports).
+    let candidates: Vec<(u8, u8)> = st
         .addressed
         .iter()
         .filter(|d| d.set_config_cc == 1)
-        .find_map(|d| {
-            d.config.as_ref().and_then(|c| {
-                c.interfaces.iter().find_map(|ifd| {
-                    (ifd.class == 0x03 && ifd.subclass == 0x01 && ifd.protocol == 0x02)
-                        .then_some((d.slot_id, ifd.number))
+        .flat_map(|d| {
+            d.config
+                .as_ref()
+                .map(|c| {
+                    c.interfaces
+                        .iter()
+                        .filter(|i| i.class == 0x03 && i.subclass == 0x01 && i.protocol == 0x02)
+                        .map(|i| (d.slot_id, i.number))
+                        .collect::<Vec<_>>()
                 })
-            })
-        });
-    let (slot_id, interface_number) = match candidate {
-        Some(c) => c,
-        None => return Ok(false),
-    };
-    let slot_idx = match st.slots.iter().position(|s| s.slot_id == slot_id) {
-        Some(i) => i,
-        None => return Ok(false),
-    };
-    // The interrupt-IN endpoint (configure_endpoints wired interface 0's EPs).
-    let ep_idx = match st.slots[slot_idx]
-        .endpoints
-        .iter()
-        .position(|e| e.direction_in && e.transfer_type == 3)
-    {
-        Some(i) => i,
-        None => {
-            serial_println!("xhci: slot {} HID mouse but no interrupt-IN ep", slot_id);
-            return Ok(false);
-        }
-    };
+                .unwrap_or_default()
+        })
+        .collect();
 
-    // SET_PROTOCOL(Boot): class request (bmRequestType 0x21) to the interface.
-    let mut res = st.slots[slot_idx].clone();
-    match control_transfer(info, st, &mut res, 0x21, 0x0B, 0, interface_number as u16, 0) {
-        Ok((cc, _)) => {
-            serial_println!("xhci: slot {} SET_PROTOCOL(boot) cc={}", slot_id, cc)
+    let mut bound = false;
+    for (slot_id, interface_number) in candidates {
+        let Some(slot_idx) = st.slots.iter().position(|s| s.slot_id == slot_id) else {
+            continue;
+        };
+        let Some(ep_idx) = st.slots[slot_idx].endpoints.iter().position(|e| {
+            e.direction_in && e.transfer_type == 3 && e.interface_number == interface_number
+        }) else {
+            continue;
+        };
+        let dci = st.slots[slot_idx].endpoints[ep_idx].dci;
+        // Skip if already bound (idempotent across repeated setup calls).
+        if st.mice.iter().any(|m| m.slot_id == slot_id && m.dci == dci) {
+            bound = true;
+            continue;
         }
-        Err(e) => {
-            serial_println!("xhci: slot {} SET_PROTOCOL failed: {}", slot_id, e);
+
+        let mut res = st.slots[slot_idx].clone();
+        if let Err(e) = control_transfer(info, st, &mut res, 0x21, 0x0B, 0, interface_number as u16, 0) {
+            serial_println!("xhci: slot {} mouse SET_PROTOCOL failed: {}", slot_id, e);
             st.slots[slot_idx] = res;
-            return Ok(false);
+            continue;
         }
-    }
-    // SET_IDLE(0): report only on change. Best-effort — many devices stall it.
-    match control_transfer(info, st, &mut res, 0x21, 0x0A, 0, interface_number as u16, 0) {
-        Ok((cc, _)) => serial_println!("xhci: slot {} SET_IDLE cc={}", slot_id, cc),
-        Err(e) => serial_println!("xhci: slot {} SET_IDLE: {}", slot_id, e),
-    }
-    st.slots[slot_idx] = res;
+        let _ = control_transfer(info, st, &mut res, 0x21, 0x0A, 0, interface_number as u16, 0);
+        st.slots[slot_idx] = res;
 
-    // Persistent report buffer; record + arm.
-    let report_len =
-        (st.slots[slot_idx].endpoints[ep_idx].max_packet_size as u32).clamp(4, 8);
-    let report_buf = alloc_dma(report_len as usize, 64) as u64;
-    let dci = st.slots[slot_idx].endpoints[ep_idx].dci;
-    st.mouse = Some(MouseDevice {
-        slot_idx,
-        ep_idx,
-        slot_id,
-        report_buf,
-        report_len,
-        armed: false,
-        needs_reset: false,
-        accum_dx: 0,
-        accum_dy: 0,
-        buttons: 0,
-        dirty: false,
-    });
-    arm_mouse(info, st);
-    serial_println!(
-        "xhci: HID boot mouse armed (slot {}, if {}, ep dci {}, {} B reports)",
-        slot_id, interface_number, dci, report_len
-    );
-    Ok(true)
+        let report_len =
+            (st.slots[slot_idx].endpoints[ep_idx].max_packet_size as u32).clamp(4, 8);
+        let report_buf = alloc_dma(report_len as usize, 64) as u64;
+        st.mice.push(MouseDevice {
+            slot_idx,
+            ep_idx,
+            slot_id,
+            dci,
+            report_buf,
+            report_len,
+            armed: false,
+            needs_reset: false,
+            accum_dx: 0,
+            accum_dy: 0,
+            buttons: 0,
+            dirty: false,
+        });
+        let idx = st.mice.len() - 1;
+        arm_mouse(info, st, idx);
+        serial_println!(
+            "xhci: HID boot mouse armed (slot {}, if {}, ep dci {}, {} B reports)",
+            slot_id, interface_number, dci, report_len
+        );
+        bound = true;
+    }
+    Ok(bound)
 }
 
-/// Bring up xHCI if needed, ensure devices are enumerated, then find + arm a HID
-/// boot mouse. Called once at boot before the UI. On a USB-booted machine the
-/// enumeration pipeline already ran during boot-disk discovery, so it is skipped
-/// here (re-running port reset could disturb the open boot disk) and we only
-/// probe. On an ATA-booted machine (QEMU) nothing has touched USB yet, so the
-/// full, idempotent pipeline runs first. Returns whether a mouse was armed.
-pub fn setup_mouse() -> bool {
+/// Find a configured device exposing a HID **boot keyboard** interface
+/// (class 3 / subclass 1 / protocol 1) with a configured interrupt-IN
+/// endpoint *on that interface*, put it in Boot Protocol, SET_IDLE(0), and
+/// arm the first transfer. Mirrors [`probe_hid_mouse`]; on a combo device the
+/// keyboard shares the mouse's slot but uses its own interface + endpoint.
+/// Idempotent: a no-op success once a keyboard is bound.
+pub fn probe_hid_keyboard(dev: &PciDevice, info: &XhciInfo) -> Result<bool, &'static str> {
+    let _ = dev;
+    let mut guard = STATES.lock();
+    let st = state_for(&mut guard, info.mmio_base).ok_or("bring up the controller first")?;
+    if !info.mmio_accessible {
+        return Err("MMIO not accessible");
+    }
+
+    // EVERY configured device's boot-keyboard interface(s) — bind and poll all
+    // (a wireless-mouse receiver may also expose a vestigial keyboard
+    // interface; polling it is harmless, it just never reports).
+    let candidates: Vec<(u8, u8)> = st
+        .addressed
+        .iter()
+        .filter(|d| d.set_config_cc == 1)
+        .flat_map(|d| {
+            d.config
+                .as_ref()
+                .map(|c| {
+                    c.interfaces
+                        .iter()
+                        .filter(|i| i.class == 0x03 && i.subclass == 0x01 && i.protocol == 0x01)
+                        .map(|i| (d.slot_id, i.number))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .collect();
+
+    let mut bound = false;
+    for (slot_id, interface_number) in candidates {
+        let Some(slot_idx) = st.slots.iter().position(|s| s.slot_id == slot_id) else {
+            continue;
+        };
+        let Some(ep_idx) = st.slots[slot_idx].endpoints.iter().position(|e| {
+            e.direction_in && e.transfer_type == 3 && e.interface_number == interface_number
+        }) else {
+            continue;
+        };
+        let dci = st.slots[slot_idx].endpoints[ep_idx].dci;
+        if st.keyboards.iter().any(|k| k.slot_id == slot_id && k.dci == dci) {
+            bound = true;
+            continue;
+        }
+
+        let mut res = st.slots[slot_idx].clone();
+        if let Err(e) = control_transfer(info, st, &mut res, 0x21, 0x0B, 0, interface_number as u16, 0) {
+            serial_println!("xhci: slot {} kbd SET_PROTOCOL failed: {}", slot_id, e);
+            st.slots[slot_idx] = res;
+            continue;
+        }
+        let _ = control_transfer(info, st, &mut res, 0x21, 0x0A, 0, interface_number as u16, 0);
+        st.slots[slot_idx] = res;
+
+        let report_buf = alloc_dma(8, 64) as u64;
+        st.keyboards.push(KeyboardDevice {
+            slot_idx,
+            ep_idx,
+            slot_id,
+            dci,
+            report_buf,
+            report_len: 8,
+            armed: false,
+            needs_reset: false,
+            last: [0; 8],
+        });
+        let idx = st.keyboards.len() - 1;
+        arm_keyboard(info, st, idx);
+        serial_println!(
+            "xhci: HID boot keyboard armed (slot {}, if {}, ep dci {})",
+            slot_id, interface_number, dci
+        );
+        bound = true;
+    }
+    Ok(bound)
+}
+
+/// Bring up xHCI if needed, ensure devices are enumerated, then find + arm a
+/// HID boot **mouse and keyboard**. Called once at boot before the UI. On a
+/// USB-booted machine the enumeration pipeline already ran during boot-disk
+/// discovery, so it is skipped here (re-running port reset could disturb the
+/// open boot disk) and we only probe. On an ATA-booted machine (QEMU) nothing
+/// has touched USB yet, so the full, idempotent pipeline runs first. Returns
+/// whether any HID device was armed.
+pub fn setup_hid() -> bool {
     let devices = pci::enumerate();
+    let mut any = false;
     for dev in devices
         .iter()
         .filter(|d| d.class == 0x0C && d.subclass == 0x03 && d.prog_if == 0x30)
@@ -3243,7 +3440,7 @@ pub fn setup_mouse() -> bool {
         // Per controller: if boot-disk discovery already enumerated THIS
         // controller, only probe (re-running port resets could disturb the
         // open boot disk). A controller nothing has touched yet gets the
-        // full, idempotent pipeline — the mouse may live there.
+        // full, idempotent pipeline — HID may live there.
         let untouched = {
             let mut guard = STATES.lock();
             state_for(&mut guard, info.mmio_base).map_or(true, |s| s.addressed.is_empty())
@@ -3255,74 +3452,106 @@ pub fn setup_mouse() -> bool {
             let _ = fetch_configurations(dev, &info);
             let _ = configure_endpoints(dev, &info);
         }
+        // Probe both — a combo device exposes both on one slot, and we want
+        // each bound to its own interface/endpoint.
         if let Ok(true) = probe_hid_mouse(dev, &info) {
-            return true;
+            any = true;
         }
-    }
-    false
-}
-
-/// Is a USB-HID mouse bound? The UI uses this to choose its idle wait strategy
-/// (a USB mouse has no IRQ, so the loop must poll rather than `hlt` indefinitely).
-pub fn mouse_present() -> bool {
-    STATES.lock().iter().any(|s| s.mouse.is_some())
-}
-
-/// Cooperatively poll the HID mouse: consume every interrupt-IN completion the
-/// controller posted (each accumulates a report; we keep exactly one TRB armed),
-/// then return the net movement + buttons since the last poll. `None` if no mouse
-/// is bound or nothing changed. Cheap when idle (one event-ring peek). Called
-/// from the UI loop — never an IRQ (it takes the heap-backed xHCI lock).
-pub fn poll_mouse_delta() -> Option<MouseDelta> {
-    let mut guard = STATES.lock();
-    let st = guard.iter_mut().find(|s| s.mouse.is_some())?;
-    let info = st.info.clone();
-
-    // Recover an endpoint that halted during a prior event drain (deferred to
-    // here so we never issue a command wait from inside another drain).
-    if st.mouse.as_ref().map_or(false, |m| m.needs_reset) {
-        let (slot_idx, ep_idx) = {
-            let m = st.mouse.as_ref().unwrap();
-            (m.slot_idx, m.ep_idx)
-        };
-        reset_bulk_endpoint(&info, st, slot_idx, ep_idx);
-        if let Some(m) = st.mouse.as_mut() {
-            m.needs_reset = false;
-            m.armed = false;
+        if let Ok(true) = probe_hid_keyboard(dev, &info) {
+            any = true;
         }
     }
 
-    // Consume everything ready; mouse completions are serviced inline.
-    while let Some(ev) = try_consume_event(&info, st) {
-        if ev.trb_type == 32 && is_mouse_slot(st, ev.slot_id) {
-            service_mouse(st, ev.completion_code);
-        }
-        // Stray non-mouse events shouldn't occur at idle (MSC drains its own
-        // transfers synchronously under the same lock); dropping them is harmless.
+    // DIAG (temporary): one line per bound HID input, so the boot trace shows
+    // exactly what attached (the boot pager lets it be reviewed). Remove once
+    // HID is solid on the targets.
+    {
+        let guard = STATES.lock();
+        let mice: Vec<u8> = guard.iter().flat_map(|s| s.mice.iter().map(|m| m.slot_id)).collect();
+        let kbds: Vec<u8> = guard.iter().flat_map(|s| s.keyboards.iter().map(|k| k.slot_id)).collect();
+        crate::boot_status(&alloc::format!(
+            "hid: bound {} mouse {:?}, {} keyboard {:?}",
+            mice.len(), mice, kbds.len(), kbds
+        ));
     }
-    // Guarantee a TRB is always pending for the next report.
-    arm_mouse(&info, st);
-
-    let m = st.mouse.as_mut()?;
-    if !m.dirty {
-        return None;
-    }
-    let d = MouseDelta {
-        dx: m.accum_dx,
-        dy: m.accum_dy,
-        left: m.buttons & 0x01 != 0,
-        right: m.buttons & 0x02 != 0,
-    };
-    m.accum_dx = 0;
-    m.accum_dy = 0;
-    m.dirty = false;
-    Some(d)
+    any
 }
 
-/// Poll the HID mouse and forward any movement/buttons into the shared input
-/// queue, so the existing PS/2-shaped UI event loop drains it with no changes.
-pub fn pump_mouse() {
-    if let Some(d) = poll_mouse_delta() {
+/// Is a USB-HID device (mouse or keyboard) bound? The UI uses this to choose
+/// its idle wait strategy — HID has no IRQ, so the loop polls rather than
+/// `hlt`-waiting for one that will never come.
+pub fn hid_present() -> bool {
+    STATES
+        .lock()
+        .iter()
+        .any(|s| !s.mice.is_empty() || !s.keyboards.is_empty())
+}
+
+/// Cooperatively poll **every** bound xHCI HID device across **all**
+/// controllers: recover any halted endpoint, drain every pending interrupt-IN
+/// completion (dispatched to the right mouse/keyboard by slot+DCI), re-arm,
+/// and forward accumulated mouse movement into the shared input queue
+/// (keyboard keys are fed straight in by `service_keyboard`). Called from the
+/// UI loop — never an IRQ (it takes the heap-backed xHCI lock). Cheap when
+/// idle (one event-ring peek per controller).
+pub fn pump_hid() {
+    let mut deltas: Vec<MouseDelta> = Vec::new();
+    {
+        let mut guard = STATES.lock();
+        for st in guard.iter_mut() {
+            if st.mice.is_empty() && st.keyboards.is_empty() {
+                continue;
+            }
+            let info = st.info.clone();
+
+            // Recover halted endpoints (deferred here so we never issue a
+            // command wait from inside an event drain).
+            for i in 0..st.mice.len() {
+                if st.mice[i].needs_reset {
+                    let (si, ei) = (st.mice[i].slot_idx, st.mice[i].ep_idx);
+                    reset_bulk_endpoint(&info, st, si, ei);
+                    st.mice[i].needs_reset = false;
+                    st.mice[i].armed = false;
+                }
+            }
+            for i in 0..st.keyboards.len() {
+                if st.keyboards[i].needs_reset {
+                    let (si, ei) = (st.keyboards[i].slot_idx, st.keyboards[i].ep_idx);
+                    reset_bulk_endpoint(&info, st, si, ei);
+                    st.keyboards[i].needs_reset = false;
+                    st.keyboards[i].armed = false;
+                }
+            }
+
+            // Consume everything ready; completions serviced inline.
+            while let Some(ev) = try_consume_event(&info, st) {
+                service_hid_transfer(st, &ev);
+            }
+            // Keep one TRB pending on each so the next report is delivered.
+            for i in 0..st.mice.len() {
+                arm_mouse(&info, st, i);
+            }
+            for i in 0..st.keyboards.len() {
+                arm_keyboard(&info, st, i);
+            }
+
+            // Collect accumulated motion (fed after the lock drops).
+            for m in st.mice.iter_mut() {
+                if m.dirty {
+                    deltas.push(MouseDelta {
+                        dx: m.accum_dx,
+                        dy: m.accum_dy,
+                        left: m.buttons & 0x01 != 0,
+                        right: m.buttons & 0x02 != 0,
+                    });
+                    m.accum_dx = 0;
+                    m.accum_dy = 0;
+                    m.dirty = false;
+                }
+            }
+        }
+    }
+    for d in deltas {
         crate::ps2::feed_mouse_delta(d.dx, d.dy, d.left, d.right);
     }
 }
@@ -3426,6 +3655,10 @@ pub fn take_last_msc_err() -> Option<alloc::string::String> {
 #[allow(dead_code)]
 pub struct UsbMscDevice {
     slot_id: u8,
+    /// MMIO base of the owning xHCI controller. Together with `slot_id` this
+    /// uniquely identifies the device: slot ids are only unique per
+    /// controller, and this machine has two xHCIs that both number a slot 1.
+    mmio_base: u64,
     sectors: u64,
     block_size: u32,
     next_tag: u32,
@@ -3439,16 +3672,9 @@ pub struct UsbMscDevice {
 
 #[allow(dead_code)]
 impl UsbMscDevice {
-    /// Open the USB-MSC device on the given slot. Requires a prior
-    /// successful MSC probe (which populated `block_size`, `sectors`,
-    /// and at least one INQUIRY). Refuses any block size other than
+    /// Build a wrapper from a cached probe. Refuses any block size other than
     /// 512 — the engine assumes that.
-    pub fn open(slot_id: u8) -> TsResult<Self> {
-        let probes = current_msc();
-        let probe = probes
-            .iter()
-            .find(|p| p.slot_id == slot_id)
-            .ok_or(StoreError::Io)?;
+    fn from_probe(probe: &MscProbe) -> TsResult<Self> {
         let cap = probe.capacity.ok_or(StoreError::Io)?;
         if (cap.block_size as usize) != SECTOR {
             // The engine assumes 512-B sectors throughout. Refuse rather
@@ -3456,7 +3682,8 @@ impl UsbMscDevice {
             return Err(StoreError::Corrupt("USB device block size != 512"));
         }
         Ok(UsbMscDevice {
-            slot_id,
+            slot_id: probe.slot_id,
+            mmio_base: probe.mmio_base,
             sectors: cap.total_blocks(),
             block_size: cap.block_size,
             next_tag: 0xCAFE_0000,
@@ -3465,15 +3692,37 @@ impl UsbMscDevice {
         })
     }
 
-    /// Strict open: in addition to `open`, every subsequent write
-    /// is preceded by a READ(10) of LBA 0 and a comparison of the
-    /// 16-byte GUID at MBR offset 0x1AC against `expected_sys_guid`.
-    /// A mismatch poisons the wrapper.
+    /// Open the USB-MSC device on the given slot. Requires a prior
+    /// successful MSC probe (which populated `block_size`, `sectors`,
+    /// and at least one INQUIRY). When two controllers both have this
+    /// slot id, the first probe wins — callers that must reach an exact
+    /// device (the boot disk) use [`open_with_identity_gate`], which keys
+    /// on the controller too.
+    pub fn open(slot_id: u8) -> TsResult<Self> {
+        let probes = current_msc();
+        let probe = probes
+            .iter()
+            .find(|p| p.slot_id == slot_id)
+            .ok_or(StoreError::Io)?;
+        Self::from_probe(probe)
+    }
+
+    /// Strict open: identifies the device by **controller + slot** (slot ids
+    /// are only unique per controller), and every subsequent write is preceded
+    /// by a READ(10) of LBA 0 and a comparison of the 16-byte GUID at MBR
+    /// offset 0x1AC against `expected_sys_guid`. A mismatch poisons the
+    /// wrapper.
     pub fn open_with_identity_gate(
+        mmio_base: u64,
         slot_id: u8,
         expected_sys_guid: [u8; 16],
     ) -> TsResult<Self> {
-        let mut dev = Self::open(slot_id)?;
+        let probes = current_msc();
+        let probe = probes
+            .iter()
+            .find(|p| p.mmio_base == mmio_base && p.slot_id == slot_id)
+            .ok_or(StoreError::Io)?;
+        let mut dev = Self::from_probe(probe)?;
         dev.identity_gate = Some(expected_sys_guid);
         Ok(dev)
     }
@@ -3504,7 +3753,7 @@ impl UsbMscDevice {
         }
         let mut mbr = [0u8; SECTOR];
         let tag = self.next_tag();
-        msc_read_sector(self.slot_id, 0, &mut mbr, tag).map_err(|e| {
+        msc_read_sector(self.mmio_base, self.slot_id, 0, &mut mbr, tag).map_err(|e| {
             serial_println!("UsbMscDevice: identity check READ(10) failed: {}", e);
             record_msc_err(e);
             self.poisoned = true;
@@ -3520,6 +3769,35 @@ impl UsbMscDevice {
             return Err(StoreError::Corrupt("USB system GUID changed at runtime"));
         }
         Ok(())
+    }
+
+    /// Poll TEST UNIT READY until the medium is ready (CSW status 0) or a ~5 s
+    /// budget elapses; returns whether it became ready.
+    ///
+    /// A USB flash stick that has just been powered (cold boot) answers
+    /// INQUIRY / READ CAPACITY — which is all `open` consumes — while its
+    /// flash-translation layer is still coming up, then fails the first
+    /// READ(10) with "Not Ready, becoming ready". A warm *reset* leaves the
+    /// stick powered and already spun up, which is the whole reason a reboot
+    /// "fixes" a cold-boot `cannot read MBR`. Calling this before the first
+    /// real read makes a cold boot behave like a reset. Best-effort: the read
+    /// path keeps its own retry, so the caller may proceed even on `false`.
+    pub fn wait_until_ready(&mut self) -> bool {
+        if self.poisoned {
+            return false;
+        }
+        // Up to ~5 s (the USB-MSC convention), 50 × 100 ms. The first probe has
+        // no pre-delay, so an already-ready stick (warm reset) returns at once.
+        for _ in 0..50 {
+            let tag = self.next_tag();
+            match msc_test_unit_ready(self.mmio_base, self.slot_id, tag) {
+                Ok(0) => return true,
+                // CHECK CONDITION (becoming ready) or a transient transport
+                // stall while the stick wakes up — wait and try again.
+                Ok(_) | Err(_) => time::delay_ms(100),
+            }
+        }
+        false
     }
 }
 
@@ -3538,7 +3816,7 @@ impl TsBlockDevice for UsbMscDevice {
             return Err(StoreError::Io);
         }
         let tag = self.next_tag();
-        msc_read_sector(self.slot_id, lba as u32, buf, tag)
+        msc_read_sector(self.mmio_base, self.slot_id, lba as u32, buf, tag)
             .map_err(|e| {
                 record_msc_err(e);
                 StoreError::Io
@@ -3556,7 +3834,7 @@ impl TsBlockDevice for UsbMscDevice {
         // we're still talking to the originally-booted disk.
         self.verify_identity()?;
         let tag = self.next_tag();
-        msc_write_sector(self.slot_id, lba as u32, buf, tag)
+        msc_write_sector(self.mmio_base, self.slot_id, lba as u32, buf, tag)
             .map_err(|e| {
                 record_msc_err(e);
                 StoreError::Io
@@ -3572,7 +3850,7 @@ impl TsBlockDevice for UsbMscDevice {
         // stall or Fail it. The endpoint is recovered by msc_command, and writes
         // on these devices are write-through, so treat a failure as a no-op
         // rather than failing the whole operation.
-        if let Err(e) = msc_sync_cache(self.slot_id, tag) {
+        if let Err(e) = msc_sync_cache(self.mmio_base, self.slot_id, tag) {
             record_msc_err(e);
             serial_println!("UsbMscDevice: SYNC CACHE best-effort failed: {}", e);
         }
@@ -3605,45 +3883,53 @@ fn msc_resolve_bulk(
 }
 
 fn msc_read_sector(
+    mmio_base: u64,
     slot_id: u8,
     lba: u32,
     buf: &mut [u8],
     tag: u32,
 ) -> Result<(), &'static str> {
     let mut guard = STATES.lock();
-    let st = state_for_slot(&mut guard, slot_id).ok_or("no controller owns this USB slot")?;
+    let st = state_for(&mut guard, mmio_base).ok_or("no such USB controller")?;
     let info = st.info.clone();
     let (slot_idx, bulk_in_idx, bulk_out_idx) = msc_resolve_bulk(st, slot_id)?;
-    let (status, bytes) = scsi_read10(
-        &info,
-        st,
-        slot_idx,
-        bulk_in_idx,
-        bulk_out_idx,
-        0,
-        lba,
-        1,
-        SECTOR as u32,
-        tag,
-    )?;
-    if status != 0 {
-        return Err("READ(10) CSW status != 0");
+
+    // Retry the whole READ(10) a few times, resetting both bulk endpoints
+    // between attempts. Real sticks (and freshly-enumerated devices that are
+    // not yet fully ready — seen on cold boot with two xHCI controllers)
+    // intermittently stall or short a round-trip; the standard BOT recovery
+    // is reset + re-issue. A short settle delay gives a not-ready device time.
+    let mut last = "READ(10) not attempted";
+    for attempt in 0..3 {
+        if attempt > 0 {
+            reset_bulk_endpoint(&info, st, slot_idx, bulk_in_idx);
+            reset_bulk_endpoint(&info, st, slot_idx, bulk_out_idx);
+            time::delay_ms(20);
+        }
+        match scsi_read10(
+            &info, st, slot_idx, bulk_in_idx, bulk_out_idx, 0, lba, 1, SECTOR as u32, tag,
+        ) {
+            Ok((0, bytes)) if bytes.len() >= buf.len() => {
+                buf.copy_from_slice(&bytes[..buf.len()]);
+                return Ok(());
+            }
+            Ok((status, _)) if status != 0 => last = "READ(10) CSW status != 0",
+            Ok(_) => last = "READ(10) returned short data",
+            Err(e) => last = e,
+        }
     }
-    if bytes.len() < buf.len() {
-        return Err("READ(10) returned short data");
-    }
-    buf.copy_from_slice(&bytes[..buf.len()]);
-    Ok(())
+    Err(last)
 }
 
 fn msc_write_sector(
+    mmio_base: u64,
     slot_id: u8,
     lba: u32,
     data: &[u8],
     tag: u32,
 ) -> Result<(), &'static str> {
     let mut guard = STATES.lock();
-    let st = state_for_slot(&mut guard, slot_id).ok_or("no controller owns this USB slot")?;
+    let st = state_for(&mut guard, mmio_base).ok_or("no such USB controller")?;
     let info = st.info.clone();
     let (slot_idx, bulk_in_idx, bulk_out_idx) = msc_resolve_bulk(st, slot_id)?;
     // Retry once: a transient bulk stall on the first attempt halts the endpoint,
@@ -3662,9 +3948,9 @@ fn msc_write_sector(
     last
 }
 
-fn msc_sync_cache(slot_id: u8, tag: u32) -> Result<(), &'static str> {
+fn msc_sync_cache(mmio_base: u64, slot_id: u8, tag: u32) -> Result<(), &'static str> {
     let mut guard = STATES.lock();
-    let st = state_for_slot(&mut guard, slot_id).ok_or("no controller owns this USB slot")?;
+    let st = state_for(&mut guard, mmio_base).ok_or("no such USB controller")?;
     let info = st.info.clone();
     let (slot_idx, bulk_in_idx, bulk_out_idx) = msc_resolve_bulk(st, slot_id)?;
     // SCSI SYNCHRONIZE CACHE(10), opcode 0x35. No data stage.
@@ -3684,6 +3970,17 @@ fn msc_sync_cache(slot_id: u8, tag: u32) -> Result<(), &'static str> {
         return Err("SYNCHRONIZE CACHE CSW status != 0");
     }
     Ok(())
+}
+
+/// Issue a single TEST UNIT READY and return its CSW status (0 = ready).
+/// `msc_command` already recovers a stalled endpoint internally, so the
+/// caller polls this directly while a freshly-powered stick spins up.
+fn msc_test_unit_ready(mmio_base: u64, slot_id: u8, tag: u32) -> Result<u8, &'static str> {
+    let mut guard = STATES.lock();
+    let st = state_for(&mut guard, mmio_base).ok_or("no such USB controller")?;
+    let info = st.info.clone();
+    let (slot_idx, bulk_in_idx, bulk_out_idx) = msc_resolve_bulk(st, slot_id)?;
+    scsi_test_unit_ready(&info, st, slot_idx, bulk_in_idx, bulk_out_idx, 0, tag)
 }
 
 /// Monotonic tag source for callers that don't carry their own (the
