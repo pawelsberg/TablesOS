@@ -256,23 +256,33 @@ fn bios_handoff(dev: &PciDevice, hccparams: u32) {
         }
         let cap = pci::config_read32(dev, off);
         if cap & 0xFF == 0x01 {
-            // USBLEGSUP: bit16 = BIOS owned, bit24 = OS owned.
-            pci::config_write32(dev, off, cap | (1 << 24));
+            // USBLEGSUP: bit16 = BIOS owned, bit24 = OS owned; USBLEGCTLSTS at
+            // off+4 holds the BIOS SMI enables. On some machines (the Sony VAIO
+            // PCG-31311M) a single USBLEGSUP ownership write blocks for *minutes*
+            // — it traps into a slow synchronous BIOS SMM handler. So disable the
+            // SMI sources FIRST (that stops the handler firing), THEN seize
+            // ownership directly, confirming with a short wall-clock-bounded
+            // poll. We halt+reset the controller next, so the BIOS must stop
+            // servicing it from SMM regardless.
+            pci::config_write32(dev, off + 4, 0); // disable BIOS SMI sources
+            pci::config_write32(dev, off, (cap | (1 << 24)) & !(1 << 16)); // OS owned, BIOS not
+            let per = time::tsc_per_us().max(1);
+            let start = unsafe { core::arch::x86_64::_rdtsc() };
             let mut released = false;
-            for _ in 0..200 {
+            loop {
                 if pci::config_read32(dev, off) & (1 << 16) == 0 {
                     released = true;
                     break;
                 }
+                if (unsafe { core::arch::x86_64::_rdtsc() } - start) / per > 200_000 {
+                    break;
+                }
                 time::delay_ms(5);
             }
-            // USBLEGCTLSTS: clear the SMI enables, ack pending statuses.
-            let ctl = pci::config_read32(dev, off + 4);
-            pci::config_write32(dev, off + 4, ctl & 0xFFFF_0000);
             crate::boot_status(if released {
                 "ehci: handoff OK"
             } else {
-                "ehci: handoff TIMEOUT (BIOS kept it)"
+                "ehci: handoff forced (BIOS kept it)"
             });
             return;
         }
@@ -1107,13 +1117,23 @@ fn probe_msc(st: &mut EhciState) {
         // Wait for the medium to spin up. A freshly-powered stick (cold boot)
         // answers INQUIRY while its flash-translation layer is still coming up
         // and reports "becoming ready" to TEST UNIT READY; a warm reset leaves
-        // it already ready. Give it the USB-MSC-conventional ~5 s so the
-        // READ(10) below (which caches the MBR for boot-disk matching) lands on
-        // a cold boot instead of only after a reset.
-        for _ in 0..50 {
+        // it already ready. Give it the USB-MSC-conventional ~5 s.
+        //
+        // Bound by WALL-CLOCK, not an iteration count: a cold stick NAKs every
+        // probe until it is ready, and each NAK burns the full ~1 s bulk
+        // transfer timeout — counting 50 iterations turned a cold boot into ~1
+        // minute on real hardware (an Alcor 058f:6387 that never reports ready
+        // via TUR yet is perfectly readable). Give up at the deadline and let
+        // READ CAPACITY / READ(10) below proceed regardless.
+        let per = time::tsc_per_us().max(1);
+        let ready_start = unsafe { core::arch::x86_64::_rdtsc() };
+        loop {
             if let Ok((0, _)) =
                 bot_command(st, i, 0, &bot::cdb_test_unit_ready(), None, next_tag())
             {
+                break;
+            }
+            if (unsafe { core::arch::x86_64::_rdtsc() } - ready_start) / per > 5_000_000 {
                 break;
             }
             time::delay_ms(100);

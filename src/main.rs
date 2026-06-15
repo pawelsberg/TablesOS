@@ -30,9 +30,11 @@ const SECTOR: usize = 512;
 const STAGE2_LBA: u32 = 1;
 const STAGE2_MAX_SECTORS: u32 = 63; // stage1 reads a fixed 63 sectors
 const KERNEL_LBA: u32 = 64;
-// 16 MiB, not 2 MiB: the kernel footprint (image + 256 MiB .bss heap) must
-// clear the low-RAM islands UEFI firmware needs alive after boot (OVMF keeps
-// ACPI NVS at 8 MiB). Must match kernel/linker.ld.
+// 16 MiB, not 2 MiB: the kernel footprint (image + .bss: a small fallback heap
+// + stack) must clear the low-RAM islands UEFI firmware needs alive after boot
+// (OVMF keeps ACPI NVS at 8 MiB). The kernel's real heap is no longer in .bss —
+// each bootloader reserves a free block and reports it in BootInfo (see
+// boot/layout.md), so the footprint here is small. Must match kernel/linker.ld.
 const KERNEL_LOAD: u32 = 0x0100_0000;
 const IMG_SECTORS: u64 = 64 * 1024 * 1024 / SECTOR as u64; // 64 MiB device
 
@@ -230,10 +232,10 @@ fn main() {
 
     let status = cmd
         .args(["-machine", "pc"])
-        // TablesOS owns the whole machine and now keeps a 256 MiB heap (five
-        // cached full-screen background composites + the engine working set),
-        // so give the VM generous RAM. On real hardware the kernel uses only
-        // its fixed .bss heap regardless of installed RAM.
+        // TablesOS owns the whole machine and wants a large heap (five cached
+        // full-screen background composites + the engine working set), which
+        // the bootloader now carves out of free RAM (BIOS: largest E820 region;
+        // UEFI: an AllocatePages block) — so give the VM generous RAM.
         .args(["-m", "1024M"])
         .args([
             "-drive",
@@ -309,9 +311,9 @@ fn sectors(len: usize) -> u32 {
 /// The kernel's total RAM footprint in MiB (rounded up): the highest
 /// `p_vaddr + p_memsz` over the ELF's PT_LOAD segments, minus the 0x1000000
 /// load address. Unlike the flat binary this includes NOLOAD `.bss` — the
-/// 256 MiB heap and the boot stack — which the UEFI loader must reserve at
-/// the load address before handing over (the BIOS path just assumes the RAM
-/// is there).
+/// small fallback heap and the boot stack — which the UEFI loader must reserve
+/// at the load address before handing over (the BIOS path just assumes the RAM
+/// is there). The kernel's main heap is reserved separately by the bootloader.
 fn kernel_mem_mib(elf: &[u8]) -> u16 {
     assert!(
         elf.len() >= 64 && elf[..4] == [0x7F, b'E', b'L', b'F'] && elf[4] == 2 && elf[5] == 1,

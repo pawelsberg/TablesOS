@@ -66,6 +66,13 @@ pub struct BootInfo {
     /// (UEFI firmware need not place the RSDP in the legacy BIOS scan areas);
     /// the BIOS stage 2 leaves it 0 and the kernel scans EBDA/0xE0000.
     pub rsdp_addr: u64, // 0x40
+    /// Physical base of the heap region the bootloader reserved for the kernel:
+    /// a free, identity-mapped, below-4-GiB block clear of the kernel footprint.
+    /// 0 when the bootloader didn't provide one (the kernel then uses a small
+    /// built-in fallback heap). See `allocator::init`.
+    pub heap_base: u64, // 0x48
+    /// Bytes available at `heap_base`, or 0.
+    pub heap_size: u64, // 0x50
 }
 
 /// Offset of the 16-byte system GUID inside the custom MBR.
@@ -103,7 +110,21 @@ extern "C" fn kmain(info: *const BootInfo) -> ! {
     serial::init();
     serial_println!("\nTablesOS booting (custom MBR, single device)");
 
-    allocator::init();
+    let (heap_base, heap_size) = allocator::init(info.heap_base, info.heap_size);
+    if heap_base == info.heap_base && info.heap_size != 0 {
+        serial_println!(
+            "heap: {} MiB at {:#x} (bootloader-placed)",
+            heap_size >> 20,
+            heap_base
+        );
+    } else {
+        serial_println!(
+            "heap: {} MiB fallback (bootloader heap {:#x}/{} unusable)",
+            heap_size >> 20,
+            info.heap_base,
+            info.heap_size
+        );
+    }
     gdt::init();
     interrupts::init();
     time::init();
@@ -488,6 +509,26 @@ impl BootDisk {
             BootDisk::Ehci { dev, .. } => dev.read_sector(0, buf),
         }
     }
+
+    /// One unverified sector write (the actual device write). `write_sector`
+    /// wraps this with read-after-write verification.
+    fn write_sector_raw(&mut self, lba: u64, buf: &[u8]) -> TsResult<()> {
+        match self {
+            BootDisk::Ata(a) => a.write_sector(lba, buf),
+            BootDisk::Usb { dev, base, sectors } => {
+                if lba >= *sectors {
+                    return Err(StoreError::Io);
+                }
+                dev.write_sector(*base + lba, buf)
+            }
+            BootDisk::Ehci { dev, base, sectors } => {
+                if lba >= *sectors {
+                    return Err(StoreError::Io);
+                }
+                dev.write_sector(*base + lba, buf)
+            }
+        }
+    }
 }
 
 impl BlockDevice for BootDisk {
@@ -516,21 +557,25 @@ impl BlockDevice for BootDisk {
         }
     }
     fn write_sector(&mut self, lba: u64, buf: &[u8]) -> TsResult<()> {
-        match self {
-            BootDisk::Ata(a) => a.write_sector(lba, buf),
-            BootDisk::Usb { dev, base, sectors } => {
-                if lba >= *sectors {
-                    return Err(StoreError::Io);
-                }
-                dev.write_sector(*base + lba, buf)
-            }
-            BootDisk::Ehci { dev, base, sectors } => {
-                if lba >= *sectors {
-                    return Err(StoreError::Io);
-                }
-                dev.write_sector(*base + lba, buf)
+        // Read-after-write verify. Cheap USB sticks (and controllers brought up
+        // through a forced BIOS handoff) can ACK a write yet leave wrong bytes on
+        // the medium — silent corruption that later surfaces as "corrupt store:
+        // chain length / varint eof". Read the sector back and compare; retry on
+        // mismatch, and fail loudly (I/O error) rather than corrupt if it never
+        // matches. Reads are trustworthy (the volume mounts), so a mismatch means
+        // the *write* didn't take. ATA (QEMU) is reliable and passes first try.
+        if buf.len() != 512 {
+            return Err(StoreError::Io);
+        }
+        let mut check = [0u8; 512];
+        for _ in 0..4 {
+            self.write_sector_raw(lba, buf)?;
+            self.read_sector(lba, &mut check)?;
+            if check[..] == buf[..] {
+                return Ok(());
             }
         }
+        Err(StoreError::Io)
     }
     fn flush(&mut self) -> TsResult<()> {
         match self {

@@ -10,8 +10,10 @@
 //! 2. Read the flat kernel image from its raw LBAs into a staging buffer and
 //!    reserve the kernel's whole RAM footprint (image + .bss + stack, the
 //!    header's `kernel_mem_mib`) at the fixed load address 0x1000000.
-//! 3. Pick the highest ≥1024×720 32-bpp GOP mode (the BIOS path does the same
-//!    via VBE) and find the ACPI RSDP in the EFI configuration table.
+//! 3. Pick the lowest ≥1024×720 32-bpp GOP mode (the BIOS path does the same
+//!    via VBE), find the ACPI RSDP in the EFI configuration table, and reserve
+//!    a free below-4-GiB block as the kernel heap (the kernel no longer carries
+//!    its heap in .bss at the fixed load address — see boot/layout.md).
 //! 4. Build `BootInfo` and identity page tables (0–4 GiB in 2 MiB pages, plus
 //!    the framebuffer, this image and the current stack if they sit higher).
 //! 5. `ExitBootServices`, switch to our page tables, copy the kernel to
@@ -148,8 +150,14 @@ fn boot(image: Handle, st: &mut SystemTable, bs: &mut BootServices) -> Result<Ne
     let staging = alloc_pages_avoiding(bs, pages(kernel_bytes), footprint)?;
     read_blocks_chunked(&disk, disk.kernel_lba, kernel_bytes, staging)?;
 
-    let fb = pick_video_mode(bs)?;
+    let fb = choose_video_mode(st, bs)?;
     let rsdp = find_rsdp(st);
+
+    // Reserve the kernel heap now, before BootInfo and the page-table pool, so
+    // those later allocations can't land inside it. The kernel no longer keeps
+    // its heap in .bss at the fixed load address (that collided with
+    // firmware-reserved RAM on some laptops); we hand it a free block instead.
+    let (heap_base, heap_size) = reserve_kernel_heap(bs, footprint);
 
     // BootInfo — same layout the BIOS stage 2 builds at 0x7000 (boot/layout.md).
     let bootinfo = alloc_pages_avoiding(bs, 1, footprint)? as *mut u8;
@@ -166,6 +174,8 @@ fn boot(image: Handle, st: &mut SystemTable, bs: &mut BootServices) -> Result<Ne
         *bootinfo.add(0x28) = 0x80; // boot_drive: BIOS notion, fixed under UEFI
         ptr::copy_nonoverlapping(disk.sys_guid.as_ptr(), bootinfo.add(0x30), 16);
         wr64(bootinfo, 0x40, rsdp);
+        wr64(bootinfo, 0x48, heap_base);
+        wr64(bootinfo, 0x50, heap_size);
     }
 
     // Identity page tables: 0–4 GiB plus anything we still need that may sit
@@ -310,18 +320,93 @@ fn read_blocks_chunked(disk: &BootDisk, lba: u64, bytes: u64, dst: u64) -> Resul
     Ok(())
 }
 
-// ---- video -------------------------------------------------------------------
+// ---- video + resolution chooser ----------------------------------------------
 
-/// Highest ≥1024×720 32-bpp RGB/BGR GOP mode, like stage 2's VBE pick.
-fn pick_video_mode(bs: &mut BootServices) -> Result<Framebuffer, &'static str> {
-    let mut gop: *mut c_void = ptr::null_mut();
-    if unsafe { (bs.locate_protocol)(&GOP_GUID, ptr::null_mut(), &mut gop) } != SUCCESS {
+/// Offered modes: every qualifying GOP mode, selectable 1..9 then A..Z.
+const MENU_MAX: usize = 35;
+/// Menu grid columns.
+const NCOLS: usize = 3;
+/// ~5 s auto-boot countdown on the menu; ~10 s revert window after a pick.
+const OFFER_MS: u32 = 5_000;
+const REVERT_MS: u32 = 10_000;
+
+#[derive(Clone, Copy)]
+struct ModeEntry {
+    mode: u32,
+    w: u32,
+    h: u32,
+}
+
+impl ModeEntry {
+    const ZERO: ModeEntry = ModeEntry { mode: 0, w: 0, h: 0 };
+    fn area(&self) -> u64 {
+        self.w as u64 * self.h as u64
+    }
+}
+
+/// Build `BootInfo`'s framebuffer by choosing a mode: the default is the
+/// smallest ≥1024×720 32-bpp mode (the one a fixed laptop panel is most likely
+/// to display), but a short menu lets the user try another — picking one shows
+/// a colour gradient and Enter keeps it while ESC / 10 s reverts to the menu.
+fn choose_video_mode(st: &SystemTable, bs: &BootServices) -> Result<Framebuffer, &'static str> {
+    let mut gop_p: *mut c_void = ptr::null_mut();
+    if unsafe { (bs.locate_protocol)(&GOP_GUID, ptr::null_mut(), &mut gop_p) } != SUCCESS {
         return Err("no Graphics Output Protocol");
     }
-    let gop = gop as *mut Gop;
-    let mode = unsafe { &*(*gop).mode };
+    let gop = gop_p as *mut Gop;
+    let (modes, n) = collect_modes(gop);
+    if n == 0 {
+        return Err("no >=1024x720 32bpp GOP mode");
+    }
 
-    let mut best: Option<(u32, u64)> = None; // (mode number, area)
+    loop {
+        draw_menu(&modes, n);
+        drain_keys(st);
+        match read_key_timeout(st, bs, OFFER_MS) {
+            // Countdown elapsed, or Enter/ESC at the menu: boot the default.
+            None => return Ok(commit_default(gop, &modes, n)),
+            Some(k) if k.unicode_char == CHAR_CR || k.scan_code == SCAN_ESC => {
+                return Ok(commit_default(gop, &modes, n));
+            }
+            Some(k) => {
+                // Decode 1..9 then A..Z (case-insensitive) to a 0-based index.
+                let ch = k.unicode_char;
+                let idx = if (b'1' as u16..=b'9' as u16).contains(&ch) {
+                    (ch - b'1' as u16) as usize
+                } else {
+                    let up = if (b'a' as u16..=b'z' as u16).contains(&ch) { ch - 0x20 } else { ch };
+                    if (b'A' as u16..=b'Z' as u16).contains(&up) {
+                        9 + (up - b'A' as u16) as usize
+                    } else {
+                        continue; // stray key: redraw
+                    }
+                };
+                if idx >= n {
+                    continue;
+                }
+                if unsafe { ((*gop).set_mode)(gop, modes[idx].mode) } != SUCCESS {
+                    out("\r\n** that mode could not be set - pick another **\r\n");
+                    continue;
+                }
+                fill_test_pattern(gop);
+                match read_key_timeout(st, bs, REVERT_MS) {
+                    Some(k2) if k2.unicode_char == CHAR_CR => return Ok(framebuffer_now(gop)),
+                    // ESC or timeout: restore the default mode (clears the
+                    // gradient so the console is sane) and re-offer the menu.
+                    _ => {
+                        let _ = unsafe { ((*gop).set_mode)(gop, modes[0].mode) };
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Every qualifying mode (up to `MENU_MAX`), sorted ascending by area.
+fn collect_modes(gop: *mut Gop) -> ([ModeEntry; MENU_MAX], usize) {
+    let mode = unsafe { &*(*gop).mode };
+    let mut all = [ModeEntry::ZERO; 64];
+    let mut cnt = 0usize;
     for m in 0..mode.max_mode {
         let mut info: *mut GopModeInfo = ptr::null_mut();
         let mut size = 0usize;
@@ -334,30 +419,151 @@ fn pick_video_mode(bs: &mut BootServices) -> Result<Framebuffer, &'static str> {
         if !ok_format || i.horizontal_resolution < 1024 || i.vertical_resolution < 720 {
             continue;
         }
-        let area = i.horizontal_resolution as u64 * i.vertical_resolution as u64;
-        let better = match best {
-            Some((bm, ba)) => area > ba || (area == ba && bm != mode.mode && m == mode.mode),
-            None => true,
-        };
-        if better {
-            best = Some((m, area));
+        if cnt < all.len() {
+            all[cnt] = ModeEntry { mode: m, w: i.horizontal_resolution, h: i.vertical_resolution };
+            cnt += 1;
         }
     }
-    let (m, _) = best.ok_or("no >=1024x720 32bpp GOP mode")?;
-    if m != mode.mode && unsafe { ((*gop).set_mode)(gop, m) } != SUCCESS {
-        return Err("GOP SetMode failed");
+    let n = if cnt < MENU_MAX { cnt } else { MENU_MAX };
+    // selection-sort the smallest n into place
+    for a in 0..n {
+        let mut min = a;
+        for b in (a + 1)..cnt {
+            if all[b].area() < all[min].area() {
+                min = b;
+            }
+        }
+        all.swap(a, min);
     }
+    let mut out = [ModeEntry::ZERO; MENU_MAX];
+    out[..n].copy_from_slice(&all[..n]);
+    (out, n)
+}
 
-    // Re-read after SetMode — the mode struct now describes the active mode.
+/// Set the default (smallest) mode; if the firmware refuses it, try the rest in
+/// ascending order. Returns the resulting framebuffer.
+fn commit_default(gop: *mut Gop, modes: &[ModeEntry; MENU_MAX], n: usize) -> Framebuffer {
+    for m in &modes[..n] {
+        let cur = unsafe { (*(*gop).mode).mode };
+        if m.mode == cur || unsafe { ((*gop).set_mode)(gop, m.mode) } == SUCCESS {
+            break;
+        }
+    }
+    framebuffer_now(gop)
+}
+
+/// Snapshot the active GOP mode as a `Framebuffer`.
+fn framebuffer_now(gop: *mut Gop) -> Framebuffer {
     let mode = unsafe { &*(*gop).mode };
     let info = unsafe { &*mode.info };
-    Ok(Framebuffer {
+    Framebuffer {
         addr: mode.frame_buffer_base,
         width: info.horizontal_resolution,
         height: info.vertical_resolution,
         pitch: info.pixels_per_scan_line * 4,
         bgr: info.pixel_format == PIXEL_BGR_RESERVED_8BPC,
-    })
+    }
+}
+
+/// Paint a green/blue gradient over the whole framebuffer so a working panel
+/// shows something unmistakable (firmware identity-maps the GOP buffer, so a
+/// direct write is safe pre-ExitBootServices).
+fn fill_test_pattern(gop: *mut Gop) {
+    let mode = unsafe { &*(*gop).mode };
+    let info = unsafe { &*mode.info };
+    let base = mode.frame_buffer_base as *mut u8;
+    let pitch = info.pixels_per_scan_line as usize * 4;
+    let w = info.horizontal_resolution as usize;
+    let h = info.vertical_resolution as usize;
+    for y in 0..h {
+        let row = unsafe { base.add(y * pitch) } as *mut u32;
+        let g = (y as u32 & 0xFF) << 8;
+        for x in 0..w {
+            unsafe { row.add(x).write_volatile(g | (x as u32 & 0xFF)) };
+        }
+    }
+}
+
+/// Draw the resolution menu as an NCOLS grid (every mode, smallest-first,
+/// column-major), labelled 1..9 then A..Z with '*' on the default.
+fn draw_menu(modes: &[ModeEntry; MENU_MAX], n: usize) {
+    out("\r\nTablesOS - choose display resolution\r\n\r\n");
+    let rows = (n + NCOLS - 1) / NCOLS;
+    for r in 0..rows {
+        for c in 0..NCOLS {
+            let idx = c * rows + r;
+            if idx < n {
+                draw_cell(modes[idx], idx);
+            }
+        }
+        out("\r\n");
+    }
+    out("\r\nPress 1-9 or A-Z to try a mode (* = default).  Enter/ESC: boot default.\r\n");
+    out("After a mode is shown: Enter keeps it, ESC or 10s reverts.\r\n");
+}
+
+/// One fixed-width (16-column) grid cell: "<*|space><label>) WxH" padded.
+fn draw_cell(m: ModeEntry, idx: usize) {
+    out(if idx == 0 { "*" } else { " " });
+    let label = [if idx < 9 { b'1' + idx as u8 } else { b'A' + (idx - 9) as u8 }];
+    out(core::str::from_utf8(&label).unwrap_or("?"));
+    out(") ");
+    out_dec(m.w);
+    out("x");
+    out_dec(m.h);
+    let used = 4 + ndigits(m.w) + 1 + ndigits(m.h); // marker+label+") " = 4
+    for _ in 0..(16usize.saturating_sub(used).max(1)) {
+        out(" ");
+    }
+}
+
+fn ndigits(mut v: u32) -> usize {
+    let mut n = 1;
+    while v >= 10 {
+        v /= 10;
+        n += 1;
+    }
+    n
+}
+
+/// Print a `u32` as decimal to the firmware console.
+fn out_dec(mut v: u32) {
+    if v == 0 {
+        out("0");
+        return;
+    }
+    let mut buf = [0u8; 10];
+    let mut i = buf.len();
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    out(core::str::from_utf8(&buf[i..]).unwrap_or("?"));
+}
+
+/// Discard any buffered keystrokes so a stale key can't instantly dismiss the
+/// menu or the revert window.
+fn drain_keys(st: &SystemTable) {
+    let con_in = st.con_in;
+    let mut key = InputKey { scan_code: 0, unicode_char: 0 };
+    while unsafe { ((*con_in).read_key_stroke)(con_in, &mut key) } == SUCCESS {}
+}
+
+/// Poll for a keystroke for up to `ms` milliseconds (10 ms granularity).
+fn read_key_timeout(st: &SystemTable, bs: &BootServices, mut ms: u32) -> Option<InputKey> {
+    let con_in = st.con_in;
+    loop {
+        let mut key = InputKey { scan_code: 0, unicode_char: 0 };
+        if unsafe { ((*con_in).read_key_stroke)(con_in, &mut key) } == SUCCESS {
+            return Some(key);
+        }
+        if ms == 0 {
+            return None;
+        }
+        unsafe { (bs.stall)(10_000) };
+        ms = ms.saturating_sub(10);
+    }
 }
 
 // ---- ACPI ---------------------------------------------------------------------
@@ -422,6 +628,25 @@ fn alloc_pages_avoiding(
         unsafe { (bs.free_pages)(r, count) };
     }
     result
+}
+
+/// Reserve the kernel's heap as a single contiguous block below 4 GiB (so the
+/// 0–4 GiB identity map covers it) and outside the kernel footprint. Reserved
+/// as `LoaderData`, so it survives ExitBootServices and the kernel owns it.
+/// Tries decreasing target sizes so a RAM-constrained box still boots, and
+/// returns `(base, bytes)` — or `(0, 0)` if even the smallest can't be had, in
+/// which case the kernel falls back to its small built-in heap. Because the
+/// firmware *places* this wherever there is free RAM, it dodges reserved
+/// regions that a fixed-address heap would collide with.
+fn reserve_kernel_heap(bs: &mut BootServices, footprint: (u64, u64)) -> (u64, u64) {
+    const TARGETS_MIB: [u64; 4] = [256, 192, 128, 64];
+    for &mib in &TARGETS_MIB {
+        let bytes = mib << 20;
+        if let Ok(base) = alloc_pages_avoiding(bs, pages(bytes), footprint) {
+            return (base, bytes);
+        }
+    }
+    (0, 0)
 }
 
 const PTE_P: u64 = 1;

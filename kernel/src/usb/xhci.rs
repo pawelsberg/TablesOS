@@ -2830,7 +2830,8 @@ fn bulk_transfer(
 struct MscOutcome {
     /// CSW `bCSWStatus`: 0 = Passed, 1 = Failed, 2 = Phase Error.
     scsi_status: u8,
-    #[allow(dead_code)]
+    /// CSW `dCSWDataResidue`: bytes of the declared transfer NOT moved. Nonzero
+    /// means a short data stage — the buffer tail is not real device data.
     residue: u32,
 }
 
@@ -3038,7 +3039,15 @@ fn scsi_read10(
         tag,
     )?;
     let data = if outcome.scsi_status == 0 {
-        buf.read_to_vec(total as usize)
+        // Honour the CSW residue. A short data stage transferred fewer than
+        // `total` bytes, and the unfilled tail of the zeroed DMA buffer is NOT
+        // sector data — returning it would feed zero-padded garbage to the
+        // store (and a later read-modify-write would persist that garbage,
+        // corrupting the volume: "corrupt store: varint eof"). Hand back only
+        // the bytes actually transferred so `msc_read_sector` sees a short read,
+        // resets the endpoints, and retries instead of trusting the padding.
+        let got = (total as usize).saturating_sub(outcome.residue as usize);
+        buf.read_to_vec(got)
     } else {
         Vec::new()
     };
@@ -3098,7 +3107,13 @@ fn scsi_write10(
             tag,
         );
         match result {
-            Ok(outcome) if outcome.scsi_status == 0 => return Ok(0),
+            Ok(outcome) if outcome.scsi_status == 0 && outcome.residue == 0 => return Ok(0),
+            // Passed but short: the medium did not receive the whole sector.
+            // Surface it as an error (msc_write_sector retries) rather than
+            // reporting success for a partial write that corrupts the volume.
+            Ok(outcome) if outcome.scsi_status == 0 => {
+                return Err("WRITE(10) short transfer (CSW residue != 0)")
+            }
             other if use_fua => {
                 // Could be a device that doesn't know FUA — never retry with
                 // it again, and re-issue this write plain.

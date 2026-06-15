@@ -2,8 +2,9 @@
    `_start` is forced first so the entry point == load address (0x1000000),
    which is all the custom bootloaders need to know. 16 MiB rather than 2 MiB
    because UEFI firmware keeps things in low RAM that must survive boot —
-   OVMF parks ACPI NVS at 8 MiB — and the kernel footprint (image + 256 MiB
-   .bss heap) must not cover them. */
+   OVMF parks ACPI NVS at 8 MiB — and the kernel footprint (image + .bss: a
+   small fallback heap + stack) must not cover them. The main heap is no longer
+   in .bss; the bootloader reserves it from free RAM (see boot/layout.md). */
 OUTPUT_FORMAT(elf64-x86-64)
 ENTRY(_start)
 

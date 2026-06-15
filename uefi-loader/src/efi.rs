@@ -16,6 +16,12 @@ pub const SUCCESS: Status = 0;
 pub const ERR_BIT: Status = 1 << (usize::BITS - 1);
 pub const INVALID_PARAMETER: Status = ERR_BIT | 2;
 pub const BUFFER_TOO_SMALL: Status = ERR_BIT | 5;
+/// `EFI_NOT_READY` — ReadKeyStroke returns this when no key is buffered.
+pub const NOT_READY: Status = ERR_BIT | 6;
+/// `EFI_SCAN_CODE` for the Escape key (UEFI 2.x simple text input).
+pub const SCAN_ESC: u16 = 0x17;
+/// Carriage return in `unicode_char` (the Enter key).
+pub const CHAR_CR: u16 = 0x0D;
 
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -80,7 +86,7 @@ pub struct SystemTable {
     pub firmware_vendor: *const u16,
     pub firmware_revision: u32,
     pub console_in_handle: Handle,
-    pub con_in: *mut c_void,
+    pub con_in: *mut SimpleTextInput,
     pub console_out_handle: Handle,
     pub con_out: *mut SimpleTextOutput,
     pub standard_error_handle: Handle,
@@ -98,6 +104,22 @@ pub struct SimpleTextOutput {
         unsafe extern "efiapi" fn(this: *mut SimpleTextOutput, string: *const u16) -> Status,
     // (test_string, query_mode, set_mode, set_attribute, clear_screen,
     //  set_cursor_position, enable_cursor, mode — unused)
+}
+
+/// `EFI_INPUT_KEY` — one keystroke from the simple text input protocol.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct InputKey {
+    pub scan_code: u16,
+    pub unicode_char: u16,
+}
+
+#[repr(C)]
+pub struct SimpleTextInput {
+    pub reset: unsafe extern "efiapi" fn(this: *mut SimpleTextInput, extended: bool) -> Status,
+    pub read_key_stroke:
+        unsafe extern "efiapi" fn(this: *mut SimpleTextInput, key: *mut InputKey) -> Status,
+    pub wait_for_key: *mut c_void,
 }
 
 /// `EFI_ALLOCATE_TYPE`

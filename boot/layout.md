@@ -32,9 +32,11 @@ LBA <data_loc>   TablesOS relational volume (superblock "TBLS" at this LBA),
 
 Either way the kernel starts at 0x1000000 (16 MiB) with a `BootInfo` pointer
 in RDI and cannot tell (nor needs to know) which firmware booted it. The load
-address is 16 MiB rather than 2 MiB so the kernel footprint (image + 256 MiB
-`.bss` heap) stays clear of the low-RAM islands UEFI firmware needs to keep
-alive after boot (OVMF parks ACPI NVS at 8 MiB).
+address is 16 MiB rather than 2 MiB so the kernel footprint (image + a small
+`.bss` fallback heap + stack) stays clear of the low-RAM islands UEFI firmware
+needs to keep alive after boot (OVMF parks ACPI NVS at 8 MiB). The kernel's
+main heap is reserved separately by the bootloader from free RAM and reported
+via `BootInfo` (heap_base/heap_size below) — it is not in `.bss`.
 
 ## Custom MBR header (sector 0, offset 0x180). All little-endian.
 
@@ -113,3 +115,14 @@ At 0x7000 on the BIOS path; anywhere below 4 GiB on the UEFI path.
 |0x29 | 7    | reserved       |
 |0x30 |16    | sys_guid (copied from MBR 0x1AC at boot) |
 |0x40 | 8    | rsdp_addr — ACPI RSDP physical address, or 0 (BIOS path: kernel scans EBDA/0xE0000 itself; UEFI path: from the EFI configuration table) |
+|0x48 | 8    | heap_base — physical base of the kernel heap region the bootloader reserved (free, identity-mapped, below 4 GiB, clear of the kernel footprint), or 0 |
+|0x50 | 8    | heap_size — bytes at heap_base, or 0. When 0/invalid the kernel uses a small built-in fallback heap. |
+
+The kernel no longer carries its multi-hundred-MiB heap in `.bss` at the fixed
+load address (which collided with firmware-reserved RAM on some laptops —
+e.g. an SGIN M15 Pro reserves everything from 256 MiB up). Instead each
+bootloader picks a large free block at runtime and reports it here: the UEFI
+loader reserves it with `AllocatePages` (so its *placement* dodges any reserved
+region), and the BIOS stage 2 finds the largest usable E820 region above the
+kernel footprint. The kernel footprint is now just image + stack + a small
+fallback heap, so `kernel mem MiB` (0x19A) is tiny.
