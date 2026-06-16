@@ -34,6 +34,7 @@ mod serial;
 mod time;
 mod ui;
 mod usb;
+mod vmem;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -164,8 +165,15 @@ extern "C" fn kmain(info: *const BootInfo) -> ! {
         serial_println!("FATAL: no acceptable graphics mode");
         halt();
     }
-    // The framebuffer is identity-mapped by the bootloader's page tables.
+    // The framebuffer is identity-mapped by the bootloader's page tables but
+    // left UC (uncacheable) under UEFI, so a full-screen present crawls (~80 ms
+    // at high res). Retag it write-combining — minimal version: just PAT slot 1
+    // + page retag + TLB flush, no CR0.CD/wbinvd/CR3-helper (the dance that hung
+    // the DELL before). UC has no cached lines to flush, so this is safe; if it
+    // ever hangs on other firmware, the coloured stripe left on screen localises
+    // it. See `vmem`.
     let len = fb.pitch * fb.height;
+    vmem::enable_framebuffer_wc(info.fb_addr, len, fb.pitch, fb.height);
     let buffer =
         unsafe { core::slice::from_raw_parts_mut(info.fb_addr as *mut u8, len) };
     framebuffer::init(buffer, fb);
@@ -291,12 +299,12 @@ fn boot_pages(lines: &[String], per: usize) -> usize {
 /// What to stamp on the reserved bottom row of a boot page.
 #[derive(Clone, Copy)]
 enum Hint {
-    /// No hint (e.g. the fatal screen, which overlays its own banner).
-    None,
     /// Navigation engaged: `page X/Y · PgUp/PgDn · Enter`.
     Nav,
     /// End-of-boot review window counting down `secs` to auto-continue.
     Countdown(u64),
+    /// Fatal browse: the boot failed; page through the log to review it.
+    Fatal,
 }
 
 /// Repaint one whole page of the boot log, clearing the screen first, and stamp
@@ -314,7 +322,6 @@ fn draw_boot_page(lines: &[String], page: usize, per: usize, hint: Hint) {
             d.draw_text(8, i * framebuffer::CELL_H, &lines[li], framebuffer::C_FG, font::Font::Body);
         }
         let text = match hint {
-            Hint::None => None,
             Hint::Nav => Some(alloc::format!(
                 "[boot log] page {}/{}  PgUp/PgDn: navigate  Enter: continue",
                 page + 1,
@@ -323,9 +330,20 @@ fn draw_boot_page(lines: &[String], page: usize, per: usize, hint: Hint) {
             Hint::Countdown(secs) => Some(alloc::format!(
                 "boot complete — press any key to review the log   (continuing in {secs}s)"
             )),
+            Hint::Fatal => Some(alloc::format!(
+                "CANNOT START — page {}/{}  PgUp/PgDn/Home/End: review boot log",
+                page + 1,
+                boot_pages(lines, per)
+            )),
         };
         if let Some(t) = text {
-            d.draw_text(8, per * framebuffer::CELL_H, &t, framebuffer::C_ACCENT, font::Font::Body);
+            // The fatal hint reads in the error colour so it's unmistakable.
+            let c = if matches!(hint, Hint::Fatal) {
+                framebuffer::C_ERR
+            } else {
+                framebuffer::C_ACCENT
+            };
+            d.draw_text(8, per * framebuffer::CELL_H, &t, c, font::Font::Body);
         }
         d.blit();
     });
@@ -794,27 +812,59 @@ fn discover_boot_disk(data_lba: u64, sys_guid: &[u8; 16]) -> Option<BootDisk> {
     None
 }
 
-/// Report a fatal boot condition on screen + serial and stop. Never returns;
-/// crucially, it performs no disk writes.
+/// Report a fatal boot condition on screen + serial, then let the boot log be
+/// **browsed** (PgUp/PgDn/Home/End) instead of just halting, so the trace that
+/// explains the failure can be reviewed — e.g. the USB enumeration dump behind a
+/// "no boot disk". Never returns; crucially, it performs **no disk writes** (it
+/// only reads input and repaints).
 fn fatal(msg: &str) -> ! {
     serial_println!("FATAL: {msg}");
-    // DIAG: record the failure in the boot log, show its last page so the
-    // markers that explain it stay visible, then stamp the error banner over
-    // the bottom rows. (Restore the full-screen error backdrop during cleanup.)
     let per = boot_rows();
     {
         let mut bp = BOOT.lock();
         bp.lines.push(alloc::format!("FATAL: {msg}"));
-        let last = boot_pages(&bp.lines, per) - 1;
-        draw_boot_page(&bp.lines, last, per, Hint::None);
     }
-    framebuffer::with(|d| {
-        let y = d.height().saturating_sub(framebuffer::CELL_H * 3);
-        d.draw_text_glow(8, y, "TABLESOS — CANNOT START", framebuffer::C_ERR, framebuffer::C_GLOW, font::Font::Display);
-        d.draw_text(8, y + framebuffer::CELL_H + 4, msg, framebuffer::C_FG, font::Font::Body);
-        d.blit();
-    });
-    halt();
+    // A "no boot disk" (and the other disk failures) happen *before* kmain's
+    // normal `setup_hid`, so on real hardware the USB keyboard isn't bound yet —
+    // bring it up now (best effort) so the log is actually navigable. PS/2 works
+    // regardless; if no keyboard binds, the last page just stays put (no worse
+    // than the old halt, and the FATAL line is right there).
+    usb::xhci::setup_hid();
+
+    let mut view = {
+        let bp = BOOT.lock();
+        boot_pages(&bp.lines, per) - 1 // start on the last page (the FATAL line)
+    };
+    {
+        let bp = BOOT.lock();
+        draw_boot_page(&bp.lines, view, per, Hint::Fatal);
+    }
+    loop {
+        usb::xhci::pump_hid();
+        usb::ehci::pump_hid();
+        let mut redraw = false;
+        while let Some(e) = ps2::poll() {
+            let ps2::Event::Key(k) = e else { continue };
+            let max_page = {
+                let bp = BOOT.lock();
+                boot_pages(&bp.lines, per) - 1
+            };
+            match k {
+                ps2::Key::PageUp => view = view.saturating_sub(1),
+                ps2::Key::PageDown => view = (view + 1).min(max_page),
+                ps2::Key::Home => view = 0,
+                ps2::Key::End => view = max_page,
+                _ => continue,
+            }
+            redraw = true;
+        }
+        if redraw {
+            let bp = BOOT.lock();
+            draw_boot_page(&bp.lines, view, per, Hint::Fatal);
+        }
+        // ~125 Hz poll so a USB key (no IRQ) is caught promptly.
+        time::delay_ms(8);
+    }
 }
 
 fn halt() -> ! {

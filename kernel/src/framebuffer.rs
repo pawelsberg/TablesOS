@@ -322,6 +322,38 @@ fn paint_atlas_glyph(
     }
 }
 
+/// Copy `src` over `dst` (copies the shorter length) a **qword at a time**
+/// (`rep movsq`) with a byte remainder. Two reasons not to use the generic
+/// `copy_from_slice`:
+///   * On real hardware `rep movs` produces the write-combining bursts a WC
+///     framebuffer wants (and uses the CPU's fast-string path).
+///   * Under QEMU's TCG emulation each `rep movs` *iteration* is interpreted, so
+///     the element width matters a lot — `rep movsb` is emulated byte-by-byte
+///     (8× the iterations) and was measurably slower; `rep movsq` moves 8 bytes
+///     per iteration, matching the old word-wide `memcpy`.
+/// DF is 0 per the ABI (and our `_start` `cld`).
+#[inline]
+fn fast_copy(dst: &mut [u8], src: &[u8]) {
+    let n = dst.len().min(src.len());
+    if n == 0 {
+        return;
+    }
+    let words = n / 8;
+    let rem = n % 8;
+    unsafe {
+        core::arch::asm!(
+            "rep movsq",        // bulk: 8 bytes per iteration (rcx = qwords)
+            "mov rcx, {rem}",
+            "rep movsb",        // tail: remaining 0..7 bytes
+            rem = in(reg) rem,
+            inout("rcx") words => _,
+            inout("rsi") src.as_ptr() => _,
+            inout("rdi") dst.as_mut_ptr() => _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// Write one pixel into an arbitrary buffer (scene or hardware). Bounds are
 /// the caller's responsibility except the final slice check.
 #[inline]
@@ -358,6 +390,16 @@ fn lerp(a: Rgb, b: Rgb, num: usize, den: usize) -> Rgb {
 pub struct Display {
     fb: &'static mut [u8],
     scene: Vec<u8>,
+    /// Shadow copy (in RAM) of what was last pushed to the hardware buffer,
+    /// *without* the cursor. [`Display::present`] diffs `scene` against this
+    /// per scanline and copies only the rows that changed, so a partial update
+    /// (a keystroke, a moved selection, a drawn line) writes a few KiB to VRAM
+    /// instead of the whole framebuffer. Empty until the first present (and
+    /// after a full [`Display::blit`]), which forces one full copy.
+    shadow: Vec<u8>,
+    /// TSC ticks the last [`Display::present`] took (for the on-screen FB
+    /// readout — VRAM writes are the dominant cost on real hardware).
+    last_present_ticks: u64,
     info: FbInfo,
     cursor_at: Option<(usize, usize)>,
     /// Per-view background bitmaps (index = `slot_for`); `None` => procedural.
@@ -509,7 +551,7 @@ impl Display {
             // take/put-back so the immutable cache borrow doesn't clash with
             // the mutable `scene` borrow.
             let cached = self.bg_cache[slot].take().unwrap();
-            self.scene.copy_from_slice(&cached);
+            fast_copy(&mut self.scene, &cached);
             self.bg_cache[slot] = Some(cached);
             return;
         }
@@ -771,17 +813,49 @@ impl Display {
     /// Blit the whole scene to the screen (no cursor). For fatal screens.
     pub fn blit(&mut self) {
         let n = self.fb.len().min(self.scene.len());
-        self.fb[..n].copy_from_slice(&self.scene[..n]);
+        fast_copy(&mut self.fb[..n], &self.scene[..n]);
         self.cursor_at = None;
+        self.shadow.clear(); // force the next present() to do a full copy
     }
 
     /// Present a freshly drawn scene and stamp the pointer at `cursor`.
-    /// One contiguous copy → no flicker.
+    ///
+    /// Only the scanlines that changed since the last present are copied to the
+    /// hardware buffer. The compare runs against the in-RAM `shadow` (cheap);
+    /// VRAM — the expensive side on real hardware — sees only the changed rows.
+    /// A full-screen change (e.g. switching views) still copies everything;
+    /// the common case of a small edit copies a handful of rows.
     pub fn present(&mut self, cursor: (usize, usize)) {
+        let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+        // Erase the previous pointer using the clean scene first, so a scanline
+        // the diff leaves untouched can't keep a stale cursor ghost.
+        if let Some((ox, oy)) = self.cursor_at.take() {
+            self.restore_cursor_bg(ox, oy);
+        }
         let n = self.fb.len().min(self.scene.len());
-        self.fb[..n].copy_from_slice(&self.scene[..n]);
+        if self.shadow.len() != self.scene.len() {
+            // First present, or after a full blit: copy everything, seed shadow.
+            fast_copy(&mut self.fb[..n], &self.scene[..n]);
+            self.shadow.clear();
+            self.shadow.extend_from_slice(&self.scene);
+        } else {
+            let pitch = self.info.pitch;
+            for y in 0..self.info.height {
+                let s = y * pitch;
+                let e = (s + pitch).min(n);
+                if s >= e {
+                    break;
+                }
+                if self.scene[s..e] != self.shadow[s..e] {
+                    fast_copy(&mut self.fb[s..e], &self.scene[s..e]);
+                    fast_copy(&mut self.shadow[s..e], &self.scene[s..e]);
+                }
+            }
+        }
         self.cursor_at = Some(cursor);
         self.paint_cursor();
+        let t1 = unsafe { core::arch::x86_64::_rdtsc() };
+        self.last_present_ticks = t1.wrapping_sub(t0);
     }
 
     /// Move just the pointer (no scene repaint): erase the old position from
@@ -808,6 +882,8 @@ pub fn init(buffer: &'static mut [u8], info: FbInfo) {
     *d = Some(Display {
         fb: buffer,
         scene,
+        shadow: Vec::new(),
+        last_present_ticks: 0,
         info,
         cursor_at: None,
         backgrounds: [None, None, None, None, None],
@@ -815,6 +891,13 @@ pub fn init(buffer: &'static mut [u8], info: FbInfo) {
         atlas: None,
         bg_cache: [None, None, None, None, None],
     });
+}
+
+/// TSC ticks the most recent `present()` took (0 if no display). Divide by
+/// `time::tsc_per_us()` for microseconds — surfaced in the HUD readout so the
+/// real cost of a frame is visible on hardware that has no serial console.
+pub fn last_present_ticks() -> u64 {
+    with(|d| d.last_present_ticks).unwrap_or(0)
 }
 
 /// Run `f` against the display with interrupts masked (input IRQs also move

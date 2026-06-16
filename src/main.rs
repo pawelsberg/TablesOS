@@ -230,8 +230,21 @@ fn main() {
         .args(["-drive", &format!("if=pflash,format=raw,file={}", vars.display())]);
     }
 
+    // Prefer a hardware accelerator, falling back to TCG software emulation if
+    // it isn't available (`accel=A:tcg` picks the first usable one, so this
+    // never fails to launch). Under pure TCG every guest instruction is
+    // interpreted, which makes the kernel's full-screen framebuffer copies
+    // crawl (~80 ms a present at high resolution); with the accelerator they run
+    // near-native. WHPX needs the in-kernel irqchip disabled.
+    let accel = if cfg!(target_os = "windows") {
+        "whpx:tcg,kernel-irqchip=off"
+    } else if cfg!(target_os = "macos") {
+        "hvf:tcg"
+    } else {
+        "kvm:tcg"
+    };
     let status = cmd
-        .args(["-machine", "pc"])
+        .args(["-machine", &format!("pc,accel={accel}")])
         // TablesOS owns the whole machine and wants a large heap (five cached
         // full-screen background composites + the engine working set), which
         // the bootloader now carves out of free RAM (BIOS: largest E820 region;

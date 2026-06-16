@@ -2518,7 +2518,10 @@ impl<D: BlockDevice> App<D> {
             return format!("TABLESOS v{ver} // SYS ONLINE");
         }
         let secs = unsafe { core::arch::x86_64::_rdtsc() } / (per.saturating_mul(1_000_000)).max(1);
-        format!("TABLESOS v{ver} // T+{}s // ONLINE", secs)
+        // Last frame's present cost (VRAM copy) — diagnostic for graphics speed
+        // on real hardware, where there is no serial console.
+        let fbus = fbm::last_present_ticks() / per.max(1);
+        format!("TABLESOS v{ver} // T+{}s // FB {}us // ONLINE", secs, fbus)
     }
 
     fn render(&mut self) {

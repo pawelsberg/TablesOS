@@ -1304,6 +1304,52 @@ fn drain_event(
     }
 }
 
+/// Like [`drain_event`] but for the Transfer Event of a **specific endpoint**:
+/// only a Transfer Event whose `(slot_id, endpoint_id/DCI)` matches the transfer
+/// we issued is accepted. HID interrupt completions are serviced inline and
+/// skipped, and any *other* transfer event is skipped too — so a mouse/keyboard
+/// report landing on the shared event ring mid-command can never be returned as
+/// this transfer's completion (which would hand back a wrong `transfer_length`
+/// and a garbage buffer: "corrupt store: chain length" on real hardware).
+///
+/// We match on slot+endpoint rather than the exact TRB Pointer because an
+/// **errored** transfer raises its event pointing at the *failing* TRB (e.g. the
+/// data-stage TRB of a control TD) and halts the TD — the TRB we'd compute (the
+/// status/normal TRB) then never completes. Matching the endpoint still surfaces
+/// that error event so the caller can reset the endpoint and retry, instead of
+/// spinning to the deadline (the symptom that wedged config-descriptor reads on a
+/// flaky Alcor 058f:6387). HID lives on a different slot, so it's still excluded.
+fn drain_transfer_event(
+    info: &XhciInfo,
+    st: &mut XhciState,
+    slot_id: u8,
+    endpoint_id: u8,
+    max_us: u64,
+) -> Result<Event, &'static str> {
+    let per = time::tsc_per_us().max(1);
+    let start = unsafe { core::arch::x86_64::_rdtsc() };
+    loop {
+        match try_consume_event(info, st) {
+            Some(ev) => {
+                if service_hid_transfer(st, &ev) {
+                    continue;
+                }
+                if ev.trb_type == 32 && ev.slot_id == slot_id && ev.endpoint_id == endpoint_id {
+                    return Ok(ev);
+                }
+                // Not our transfer (HID/stale/unrelated) — skip and keep draining.
+            }
+            None => {
+                let now = unsafe { core::arch::x86_64::_rdtsc() };
+                if (now - start) / per > max_us {
+                    return Err("event-ring deadline elapsed");
+                }
+                core::hint::spin_loop();
+            }
+        }
+    }
+}
+
 /// Route a Transfer Event (type 32) to the HID mouse or keyboard it belongs
 /// to, by (slot, endpoint DCI) — so a composite device's two interrupt
 /// endpoints on one shared slot are told apart. Returns true if it was a HID
@@ -1898,7 +1944,11 @@ fn control_transfer_once(
     let db = (info.mmio_base + info.dboff as u64 + 4 * res.slot_id as u64) as *mut u32;
     unsafe { write_volatile(db, 1) };
 
-    let ev = drain_event(info, st, 32, 2_000_000)?;
+    // EP0 control transfer: match the Transfer Event by slot + EP0 (DCI 1). On
+    // success that's the Status Stage event; on a data-stage error it's the
+    // error event for EP0 — either way it's ours, and surfacing the error lets
+    // the caller reset EP0 and retry instead of hanging to the deadline.
+    let ev = drain_transfer_event(info, st, res.slot_id, 1, 2_000_000)?;
     let bytes = match (length > 0, &buf) {
         (true, Some(b)) if ev.completion_code == 1 || ev.completion_code == 13 => {
             b.read_to_vec(length as usize)
@@ -2045,46 +2095,63 @@ pub fn fetch_configurations(
             }
         }
 
-        // Settle between control transfers; real HS devices can transaction-
-        // error on a back-to-back request that QEMU accepts instantly.
-        time::delay_ms(5);
-        // ---- Get Configuration Descriptor (9-byte header) ---------
-        let (cc1, hdr) =
-            match control_transfer(info, st, &mut res, 0x80, 6, 0x0200, 0, 9) {
-                Ok(v) => v,
-                Err(e) => {
-                    serial_println!(
-                        "xhci: slot {} GET_DESCRIPTOR(CONFIG,short) failed: {}",
-                        slot_id, e
-                    );
-                    st.slots[slot_idx] = res;
-                    st.addressed[i].eval_context_cc = eval_cc;
-                    continue;
-                }
-            };
-
-        let mut config_cc = cc1;
-        let mut bytes = hdr.clone();
-        if (cc1 == 1 || cc1 == 13) && hdr.len() >= 4 {
-            let total = u16::from_le_bytes([hdr[2], hdr[3]]);
-            if total > 9 {
-                match control_transfer(info, st, &mut res, 0x80, 6, 0x0200, 0, total) {
-                    Ok((cc2, full)) => {
-                        config_cc = cc2;
-                        if !full.is_empty() {
-                            bytes = full;
-                        }
-                    }
+        // ---- Get Configuration Descriptor, with retry ----------------
+        // Some sticks/controllers return a Success CSW for the config-descriptor
+        // control transfer but hand back empty/zero data (seen on a Cheshunt
+        // root port: cc=1 yet no interfaces parsed → device never configured →
+        // not recognised as mass storage → "no boot drive"). The device
+        // descriptor read fine, so addressing is OK; only this fetch is flaky.
+        // Re-fetch (with a growing settle) until it parses to a usable config.
+        // Devices that answer correctly the first time break immediately, so
+        // working machines are unaffected.
+        let mut config_cc = 0u8;
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut parsed: Option<Configuration> = None;
+        for attempt in 0..4 {
+            // Settle between control transfers; real HS devices can transaction-
+            // error on a back-to-back request that QEMU accepts instantly. Later
+            // attempts wait longer for a slow/settling port.
+            time::delay_ms(if attempt == 0 { 5 } else { 20 * attempt as u64 });
+            // 9-byte header first, to learn wTotalLength.
+            let (cc1, hdr) =
+                match control_transfer(info, st, &mut res, 0x80, 6, 0x0200, 0, 9) {
+                    Ok(v) => v,
                     Err(e) => {
                         serial_println!(
-                            "xhci: slot {} GET_DESCRIPTOR(CONFIG,full) failed: {}",
+                            "xhci: slot {} GET_DESCRIPTOR(CONFIG,short) failed: {}",
                             slot_id, e
                         );
+                        continue;
+                    }
+                };
+            config_cc = cc1;
+            bytes = hdr.clone();
+            if (cc1 == 1 || cc1 == 13) && hdr.len() >= 4 {
+                let total = u16::from_le_bytes([hdr[2], hdr[3]]);
+                if total > 9 {
+                    match control_transfer(info, st, &mut res, 0x80, 6, 0x0200, 0, total) {
+                        Ok((cc2, full)) => {
+                            config_cc = cc2;
+                            if !full.is_empty() {
+                                bytes = full;
+                            }
+                        }
+                        Err(e) => {
+                            serial_println!(
+                                "xhci: slot {} GET_DESCRIPTOR(CONFIG,full) failed: {}",
+                                slot_id, e
+                            );
+                        }
                     }
                 }
             }
+            parsed = parse_configuration(&bytes);
+            // Accept only a config that actually yielded interfaces; a bogus
+            // (empty/zero) read parses to None or zero interfaces → retry.
+            if parsed.as_ref().map_or(false, |c| !c.interfaces.is_empty()) {
+                break;
+            }
         }
-        let parsed = parse_configuration(&bytes);
 
         st.slots[slot_idx] = res;
         st.addressed[i].eval_context_cc = eval_cc;
@@ -2820,7 +2887,7 @@ fn bulk_transfer(
     // Ring the doorbell after the &mut borrow inside `post_normal_trb` is dropped.
     let db = (info.mmio_base + info.dboff as u64 + 4 * slot_id as u64) as *mut u32;
     unsafe { write_volatile(db, dci as u32) };
-    let ev = drain_event(info, st, 32, 2_000_000)?;
+    let ev = drain_transfer_event(info, st, slot_id, dci, 2_000_000)?;
     Ok((ev.completion_code, ev.transfer_length))
 }
 
