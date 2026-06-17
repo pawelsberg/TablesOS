@@ -33,6 +33,7 @@ mod rtc;
 mod serial;
 mod time;
 mod ui;
+mod upgrade;
 mod usb;
 mod vmem;
 

@@ -175,6 +175,25 @@ fn main() {
         image.display()
     );
 
+    // `--archive`: keep a copy of this build under `images/` named by version,
+    // so a previous release stays around to test the "top up version" upgrade
+    // path against (see Cargo.toml / kernel/src/upgrade.rs). The policy is:
+    // whenever the version is bumped, archive the OUTGOING release first, then
+    // bump — `images/` therefore accumulates one image per shipped version.
+    if std::env::args().any(|a| a == "--archive") {
+        let seeded = std::env::args().any(|a| a == "--seed");
+        let images = manifest.join("images");
+        std::fs::create_dir_all(&images).expect("create images/ dir");
+        let name = format!(
+            "tablesos-{}{}.img",
+            tablestore::VERSION_STR,
+            if seeded { "-seed" } else { "" }
+        );
+        let dst = images.join(&name);
+        std::fs::copy(&image, &dst).expect("archive image");
+        println!("archived {} → {}", tablestore::VERSION_STR, dst.display());
+    }
+
     if std::env::args().any(|a| a == "--no-run") {
         return;
     }
@@ -191,18 +210,30 @@ fn main() {
     // for its journal region). A previously-created 4 MiB stub is grown.
     let usb_img = out.join("usbstick.img");
     const USB_IMG_BYTES: u64 = 64 * 1024 * 1024;
-    let need_create = match std::fs::metadata(&usb_img) {
-        Ok(m) => m.len() < USB_IMG_BYTES,
-        Err(_) => true,
-    };
-    if need_create {
-        let blank = vec![0u8; USB_IMG_BYTES as usize];
-        std::fs::write(&usb_img, &blank).expect("create usbstick.img");
-        eprintln!(
-            "created {} MiB USB backing image at {}",
-            USB_IMG_BYTES >> 20,
-            usb_img.display()
-        );
+    // `--usb-image <path>`: stage a specific image onto the emulated USB stick
+    // before launching (always overwriting). This is what makes the "top up
+    // version" upgrade testable from `cargo run`: point it at an older release
+    // image (e.g. `images/tablesos-v0.1.0-seed.img`) and the booted OS will see
+    // that volume on USB, ready to upgrade via Table List `[u]`. Re-run before
+    // each attempt — a successful upgrade rewrites the stick to this version.
+    if let Some(src) = arg_value("--usb-image") {
+        std::fs::copy(&src, &usb_img)
+            .unwrap_or_else(|e| panic!("stage --usb-image {src}: {e}"));
+        println!("staged USB stick from {src}");
+    } else {
+        let need_create = match std::fs::metadata(&usb_img) {
+            Ok(m) => m.len() < USB_IMG_BYTES,
+            Err(_) => true,
+        };
+        if need_create {
+            let blank = vec![0u8; USB_IMG_BYTES as usize];
+            std::fs::write(&usb_img, &blank).expect("create usbstick.img");
+            eprintln!(
+                "created {} MiB USB backing image at {}",
+                USB_IMG_BYTES >> 20,
+                usb_img.display()
+            );
+        }
     }
 
     let qemu = find_qemu();
@@ -324,6 +355,17 @@ fn random_guid() -> [u8; 16] {
 
 fn sectors(len: usize) -> u32 {
     ((len + SECTOR - 1) / SECTOR) as u32
+}
+
+/// Value of a `--flag value` command-line argument, if present.
+fn arg_value(flag: &str) -> Option<String> {
+    let mut args = std::env::args();
+    while let Some(a) = args.next() {
+        if a == flag {
+            return args.next();
+        }
+    }
+    None
 }
 
 /// The kernel's total RAM footprint in MiB (rounded up): the highest

@@ -22,7 +22,7 @@ checksum = "413d67b29ef1021b4d60f4aa1e925ca031751e213832b4b1d588fae623c05c60"
 
 [[package]]
 name = "kernel"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "linked_list_allocator",
  "pic8259",
@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "pngdec"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "rustversion"
@@ -95,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "tablesos-builder"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "kernel",
  "tablestore",
@@ -104,11 +104,11 @@ dependencies = [
 
 [[package]]
 name = "tablestore"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "uefi-loader"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "volatile"

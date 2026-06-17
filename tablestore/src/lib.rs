@@ -28,6 +28,7 @@ pub mod bignum;
 pub mod block;
 pub mod codec;
 pub mod journal;
+pub mod migrate;
 pub mod pager;
 pub mod schema;
 pub mod store;

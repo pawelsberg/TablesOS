@@ -21,9 +21,15 @@ resolver = "2"
 # `tablestore::VERSION` — into every on-disk version field (MBR boot header,
 # volume superblock, journal control header). There are deliberately no
 # independent format numbers: a change here is assumed to change every on-disk
-# format at once. The displayed form is `tablestore::VERSION_STR` (= "v0.1.0").
+# format at once. The displayed form is `tablestore::VERSION_STR` (= "v0.2.0").
+#
+# Upgrade path: an existing volume of an OLDER version can be brought up to this
+# one in place (keeping its data) via the Table List `[u]` "top up version on
+# USB" action — see `kernel/src/upgrade.rs` and `tablestore/src/migrate.rs`.
+# When bumping this, archive the previous release's seeded image first
+# (`cargo run -- --seed --no-run --archive`), so upgrades from it stay testable.
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 
 # The kernel as an artifact dependency, compiled for bare metal. Because it is
 # a *normal* dependency, Cargo exposes `CARGO_BIN_FILE_KERNEL_kernel` to this

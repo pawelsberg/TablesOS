@@ -131,6 +131,34 @@ impl<D: BlockDevice> Pager<D> {
         &mut self.dev
     }
 
+    /// The current superblock (copy). Lets the migration/upgrade path read the
+    /// allocator high-water mark and volume size without poking page 0.
+    pub fn superblock(&self) -> Superblock {
+        self.sb
+    }
+
+    /// Change the recorded volume size. Used by the upgrade path when the
+    /// volume is relocated into a region of a different size; the new value is
+    /// only persisted on the next [`rewrite_superblock`]/commit. Caller must
+    /// ensure `total_pages >= hwm` or later allocations/reads go out of range.
+    pub fn set_total_pages(&mut self, total_pages: u64) {
+        self.sb.total_pages = total_pages;
+    }
+
+    /// Force a one-page commit of the superblock alone, even when no data pages
+    /// changed. This (re)stamps the on-disk `SB_VERSION` (= current product
+    /// version, see [`crate::VERSION`]) and the journal control header, which is
+    /// how a data-less version "top up" still bumps every on-disk version field.
+    pub fn rewrite_superblock(&mut self) -> Result<()> {
+        let txid = self.sb.generation + 1;
+        let mut sb = self.sb;
+        sb.generation = txid;
+        let batch: Vec<(u64, Vec<u8>)> = alloc::vec![(0u64, sb.encode())];
+        journal::commit(&mut self.dev, txid, &batch)?;
+        self.sb = sb;
+        Ok(())
+    }
+
     /// Read a page, honouring uncommitted writes from the active transaction,
     /// then the clean-page cache, then the disk (populating the cache).
     pub fn read_page(&mut self, page: u64) -> Result<Page> {

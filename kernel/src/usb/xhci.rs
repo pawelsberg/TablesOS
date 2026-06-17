@@ -4194,6 +4194,32 @@ pub fn msc_write_blocks(
     Ok(())
 }
 
+/// Slot-addressed batched read — the read counterpart of [`msc_write_blocks`],
+/// used by the upgrade flow to relocate a volume quickly. Thin wrapper over the
+/// retrying [`msc_read_blocks`]: it resolves the owning controller's MMIO base
+/// from `slot_id` and supplies a fresh tag. `buf.len()` must be at least
+/// `blocks * 512`; exactly that many bytes are filled.
+pub fn msc_read_blocks_slot(
+    slot_id: u8,
+    lba: u32,
+    blocks: u16,
+    buf: &mut [u8],
+) -> Result<(), &'static str> {
+    let want = blocks as usize * SECTOR;
+    if buf.len() < want {
+        return Err("msc_read_blocks_slot: buffer too small");
+    }
+    let mmio_base = {
+        let mut guard = STATES.lock();
+        state_for_slot(&mut guard, slot_id)
+            .ok_or("no controller owns this USB slot")?
+            .info
+            .mmio_base
+    };
+    let tag = next_msc_tag();
+    msc_read_blocks(mmio_base, slot_id, lba, blocks, &mut buf[..want], tag)
+}
+
 // ---- Self-test: write a pattern, read it back, verify ---------------
 
 #[derive(Clone)]

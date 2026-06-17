@@ -29,6 +29,7 @@ use crate::ps2::{self, Event, Key};
 use crate::rtc;
 use crate::serial_println;
 use crate::time;
+use crate::upgrade::{self, UpgradeReport};
 use crate::usb::ehci;
 use crate::usb::xhci::{self, XhciInfo};
 
@@ -82,6 +83,9 @@ enum Action {
     /// Install a fresh TablesOS image onto the given USB slot. The label
     /// is shown in the confirmation modal.
     CreateOs(u8, String),
+    /// Top up (upgrade) the existing TablesOS volume on the given USB slot to
+    /// the running version, keeping its data. Label shown in the confirmation.
+    UpgradeOs(u8, String),
 }
 
 enum Screen {
@@ -176,6 +180,17 @@ enum Screen {
     /// Detailed result panel shown after an install attempt.
     InstallResult {
         report: InstallReport,
+    },
+    /// Pick an existing (older-or-equal-version) TablesOS USB drive to top up to
+    /// the running version, keeping its data. Reached from the Table List via
+    /// `u`.
+    UpgradePick {
+        candidates: Vec<(u8, DriveInfo)>,
+        sel: usize,
+    },
+    /// Detailed result panel shown after an upgrade ("top up version") attempt.
+    UpgradeResult {
+        report: UpgradeReport,
     },
     /// Scrollable "About / Licenses" panel. Carries the bundled-font
     /// attribution and the full SIL OFL 1.1 text (OFL clause 2: the notice and
@@ -781,6 +796,8 @@ impl<D: BlockDevice> App<D> {
             | Screen::Xhci { .. }
             | Screen::CreateOsPick { .. }
             | Screen::InstallResult { .. }
+            | Screen::UpgradePick { .. }
+            | Screen::UpgradeResult { .. }
             | Screen::About { .. }
             | Screen::FkPick { .. } => {}
         }
@@ -893,6 +910,42 @@ impl<D: BlockDevice> App<D> {
                                 candidates.len()
                             );
                             nav = Nav::Push(Screen::CreateOsPick {
+                                candidates,
+                                sel: 0,
+                            });
+                        }
+                    }
+                    Key::Char('u') | Key::Char('U') => {
+                        // Top up version: offer existing TablesOS USB volumes of
+                        // an older-or-equal, known version (never the booted disk,
+                        // never a newer one) as upgrade targets.
+                        let _ = xhci::autopilot_usb_drives(&self.booted_sys_guid);
+                        let candidates: Vec<(u8, DriveInfo)> =
+                            xhci::usb_drives_with_slots(&self.booted_sys_guid)
+                                .into_iter()
+                                .filter(|(_, _, d)| {
+                                    if d.booted {
+                                        return false;
+                                    }
+                                    if let ata::MbrInfo::TablesOs { version, .. } = d.mbr {
+                                        version <= tablestore::VERSION
+                                            && tablestore::migrate::is_known(version)
+                                    } else {
+                                        false
+                                    }
+                                })
+                                .map(|(_, slot, d)| (slot, d))
+                                .collect();
+                        if candidates.is_empty() {
+                            self.status =
+                                "no upgradable TablesOS USB volumes — plug one in and press [d] to refresh"
+                                    .into();
+                        } else {
+                            self.status = format!(
+                                "select a volume to top up ({} candidate(s))",
+                                candidates.len()
+                            );
+                            nav = Nav::Push(Screen::UpgradePick {
                                 candidates,
                                 sel: 0,
                             });
@@ -1348,6 +1401,38 @@ impl<D: BlockDevice> App<D> {
                 }
                 Screen::CreateOsPick { candidates, sel }
             }
+            Screen::UpgradePick { candidates, mut sel } => {
+                let n = candidates.len();
+                if sel >= n {
+                    sel = n.saturating_sub(1);
+                }
+                match k {
+                    Key::Esc => nav = Nav::Pop,
+                    Key::Up if sel > 0 => sel -= 1,
+                    Key::Down if sel + 1 < n => sel += 1,
+                    Key::Enter if !candidates.is_empty() => {
+                        let (slot_id, drive) = candidates[sel].clone();
+                        let label = drive.slot.clone();
+                        let from = match &drive.mbr {
+                            crate::ata::MbrInfo::TablesOs { version, .. } => {
+                                tablestore::version_string(*version)
+                            }
+                            _ => "?".into(),
+                        };
+                        nav = Nav::Push(Screen::Confirm {
+                            msg: format!(
+                                "Top up {} from {} to {}? Existing data is kept and migrated.",
+                                label,
+                                from,
+                                tablestore::VERSION_STR,
+                            ),
+                            action: Action::UpgradeOs(slot_id, label),
+                        });
+                    }
+                    _ => {}
+                }
+                Screen::UpgradePick { candidates, sel }
+            }
             Screen::FkPick { field_idx, from_col, to_table, to_col, rows, mut sel, mut top } => {
                 let n = rows.len();
                 if sel >= n {
@@ -1403,6 +1488,12 @@ impl<D: BlockDevice> App<D> {
                     nav = Nav::PopToList;
                 }
                 Screen::InstallResult { report }
+            }
+            Screen::UpgradeResult { report } => {
+                if matches!(k, Key::Esc | Key::Enter) {
+                    nav = Nav::PopToList;
+                }
+                Screen::UpgradeResult { report }
             }
             Screen::About { mut top } => {
                 let max_top = about_lines().len().saturating_sub(visible_rows().max(1));
@@ -1851,6 +1942,21 @@ impl<D: BlockDevice> App<D> {
                     self.pop();
                 }
                 self.push(Screen::InstallResult { report });
+            }
+            Action::UpgradeOs(slot_id, label) => {
+                self.status = format!("topping up {} to {} …", label, tablestore::VERSION_STR);
+                let report =
+                    upgrade::upgrade_usb(slot_id, self.data_lba, &self.booted_sys_guid);
+                self.status = if report.verify_mount_ok {
+                    format!("upgrade OK — slot {} now {}", slot_id, tablestore::VERSION_STR)
+                } else {
+                    format!("upgrade failed: {}", report.message)
+                };
+                // Replace the picker screen with the result panel.
+                while !matches!(self.top(), Screen::List { .. }) {
+                    self.pop();
+                }
+                self.push(Screen::UpgradeResult { report });
             }
             _ => {}
         }
@@ -2512,6 +2618,7 @@ impl<D: BlockDevice> App<D> {
             Screen::Drives { sel, .. } => *sel = i,
             Screen::Pci { sel, .. } => *sel = i,
             Screen::CreateOsPick { sel, .. } => *sel = i,
+            Screen::UpgradePick { sel, .. } => *sel = i,
             Screen::FkPick { sel, .. } => *sel = i,
             Screen::Editor(ed) => ed.focus = i,
             Screen::Builder(b) => b.focus = i,
@@ -2711,8 +2818,10 @@ impl<D: BlockDevice> App<D> {
             Some(Screen::Pci { .. }) => self.frame_pci(status),
             Some(Screen::Xhci { .. }) => self.frame_xhci(status),
             Some(Screen::CreateOsPick { .. }) => self.frame_create_os_pick(status),
+            Some(Screen::UpgradePick { .. }) => self.frame_upgrade_pick(status),
             Some(Screen::FkPick { .. }) => self.frame_fk_pick(status),
             Some(Screen::InstallResult { .. }) => self.frame_install_result(status),
+            Some(Screen::UpgradeResult { .. }) => self.frame_upgrade_result(status),
             Some(Screen::Builder(_)) => self.frame_builder(status),
             Some(Screen::RefCols { .. }) => self.frame_refcols(status),
             Some(Screen::About { .. }) => self.frame_about(status),
@@ -2775,7 +2884,7 @@ impl<D: BlockDevice> App<D> {
         let tables = self.store.list_tables().unwrap_or_default();
         let mut body = Vec::new();
         body.push(line(
-            "Tables  [↑↓] select  [Enter] open  [c]reate  [d]rives  [p]ci  [n]ew OS on USB  [a]bout  [s]hutdown",
+            "Tables  [↑↓] select  [Enter] open  [c]reate  [d]rives  [p]ci  [n]ew OS on USB  top [u]p USB  [a]bout  [s]hutdown",
             LineKind::Dim,
         ).hit(Hit::Shortcuts));
         body.push(line("", LineKind::Normal));
@@ -4334,6 +4443,137 @@ impl<D: BlockDevice> App<D> {
         ));
         Frame {
             title: "TablesOS install — result".into(),
+            bg: fbm::C_BG_ROW,
+            body,
+            status,
+            cell_hls: Vec::new(),
+            cursor: None,
+        }
+    }
+
+    fn frame_upgrade_pick(&mut self, status: String) -> Frame {
+        let (candidates, sel) = match self.top() {
+            Screen::UpgradePick { candidates, sel } => (candidates.clone(), *sel),
+            _ => unreachable!(),
+        };
+        let mut body = Vec::new();
+        body.push(line(
+            "[↑↓] select  [Enter] top up this drive  [Esc] cancel",
+            LineKind::Dim,
+        ).hit(Hit::Shortcuts));
+        body.push(line(
+            &format!(
+                "Upgrades an existing TablesOS USB volume to {} in place — its data is kept and migrated. Only older-or-equal, known versions are listed; the booted disk is excluded.",
+                tablestore::VERSION_STR,
+            ),
+            LineKind::Dim,
+        ));
+        body.push(line("", LineKind::Normal));
+        if candidates.is_empty() {
+            body.push(line("(no upgradable TablesOS USB volumes)", LineKind::Dim));
+        }
+        for (i, (slot_id, d)) in candidates.iter().enumerate() {
+            let head = if i == sel {
+                LineKind::Selected
+            } else {
+                LineKind::Accent
+            };
+            body.push(line(
+                &format!(
+                    "[{}]  {}    slot {}    {} MiB",
+                    d.slot,
+                    d.model,
+                    slot_id,
+                    d.lba28_sectors / 2048
+                ),
+                head,
+            ).hit(Hit::Activate(i)));
+            let desc = match &d.mbr {
+                MbrInfo::TablesOs { version, sys_guid, .. } => alloc::format!(
+                    "  currently {}  →  {}   GUID {}",
+                    tablestore::version_string(*version),
+                    tablestore::VERSION_STR,
+                    ata::fmt_guid(sys_guid),
+                ),
+                _ => "  (not a TablesOS volume)".into(),
+            };
+            body.push(line(&desc, LineKind::Normal));
+        }
+        Frame {
+            title: "Top up version on USB — pick a volume".into(),
+            bg: fbm::C_BG_EDIT,
+            body,
+            status,
+            cell_hls: Vec::new(),
+            cursor: None,
+        }
+    }
+
+    fn frame_upgrade_result(&mut self, status: String) -> Frame {
+        let report = match self.top() {
+            Screen::UpgradeResult { report } => report.clone(),
+            _ => unreachable!(),
+        };
+        let mut body = Vec::new();
+        body.push(line("[Enter] or [Esc] back to Table List", LineKind::Dim).hit(Hit::Shortcuts));
+        body.push(line("", LineKind::Normal));
+        body.push(line(
+            &format!("Top-up report — target USB slot {}", report.target_slot),
+            LineKind::Accent,
+        ));
+        body.push(line(
+            &format!(
+                "  Version: {}  →  {}",
+                tablestore::version_string(report.from_version),
+                tablestore::version_string(report.to_version),
+            ),
+            LineKind::Normal,
+        ));
+        body.push(line(
+            &format!(
+                "  Data location LBA: {}  →  {}",
+                report.old_data_lba, report.new_data_lba
+            ),
+            LineKind::Normal,
+        ));
+        body.push(line(
+            &format!(
+                "  Migration steps applied: {}    Live pages relocated: {}",
+                report.migration_steps, report.pages_relocated
+            ),
+            LineKind::Normal,
+        ));
+        body.push(line(
+            &format!("  System GUID (preserved): {}", ata::fmt_guid(&report.sys_guid)),
+            LineKind::Normal,
+        ));
+        body.push(line(
+            &format!("  Tables after upgrade: {}", report.tables_after),
+            LineKind::Normal,
+        ));
+        body.push(line(
+            &format!(
+                "  Verify MBR re-read: {}    Verify volume mount: {}",
+                if report.verify_mbr_ok { "OK" } else { "FAIL" },
+                if report.verify_mount_ok { "OK" } else { "FAIL" }
+            ),
+            if report.verify_mount_ok {
+                LineKind::Accent
+            } else {
+                LineKind::Error
+            },
+        ));
+        body.push(line("", LineKind::Normal));
+        body.push(line(
+            &format!("Outcome: {}", report.message),
+            if report.verify_mount_ok {
+                LineKind::Normal
+            } else {
+                LineKind::Error
+            },
+        ));
+        Frame {
+            title: "TablesOS top up — result".into(),
             bg: fbm::C_BG_ROW,
             body,
             status,

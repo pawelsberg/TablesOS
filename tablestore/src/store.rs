@@ -84,6 +84,30 @@ impl<D: BlockDevice> Store<D> {
         })
     }
 
+    /// Allocator high-water mark — the count of pages at or below which all
+    /// live content (superblock, journal region, catalog, schema, rows, free
+    /// list) lives. The upgrade path relocates exactly pages `0..hwm`.
+    pub fn hwm(&self) -> u64 {
+        self.pager.superblock().hwm
+    }
+
+    /// Total pages the volume currently believes it spans.
+    pub fn total_pages(&self) -> u64 {
+        self.pager.superblock().total_pages
+    }
+
+    /// Finish a version "top up" after the volume's bytes are in place: record
+    /// the (possibly new) volume size and force-rewrite the superblock so every
+    /// on-disk version field is stamped with the current product version.
+    /// Fails closed if the new region cannot hold the existing live pages.
+    pub fn finalize_upgrade(&mut self, new_total_pages: u64) -> Result<()> {
+        if new_total_pages < self.pager.superblock().hwm {
+            return Err(StoreError::OutOfSpace);
+        }
+        self.pager.set_total_pages(new_total_pages);
+        self.pager.rewrite_superblock()
+    }
+
     // ---- generic blob chains -------------------------------------------------
 
     fn read_chain(&mut self, head: u64) -> Result<Vec<u8>> {
