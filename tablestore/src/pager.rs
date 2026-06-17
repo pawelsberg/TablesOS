@@ -5,7 +5,7 @@
 //! TablesOS is single-user and every engine operation is exactly one
 //! transaction, so a single in-flight transaction is all that is ever needed.
 
-use crate::block::BlockDevice;
+use crate::block::{BlockDevice, SECTOR};
 use crate::journal::{self, FIRST_DATA_PAGE, PAGE};
 use crate::{Result, StoreError};
 use alloc::collections::BTreeMap;
@@ -33,9 +33,16 @@ pub struct Superblock {
     pub generation: u64,
 }
 
+/// The superblock lives in page 0 but rotates across its 8 sectors to spread
+/// flash wear (every commit rewrites it). Slot = `generation % SB_SLOTS`; the
+/// field layout within the chosen sector is unchanged from v0.2.0, so a v0.2.0
+/// volume (superblock at sector 0) is read transparently.
+const SB_SLOTS: usize = (PAGE / SECTOR) as usize; // 8
+
 impl Superblock {
-    fn encode(&self) -> Page {
-        let mut p = zeroed_page();
+    /// Encode into a single 512-B sector (fields occupy the first 56 B).
+    fn encode_sector(&self) -> alloc::vec::Vec<u8> {
+        let mut p = vec![0u8; SECTOR];
         p[0..4].copy_from_slice(&SB_MAGIC.to_le_bytes());
         p[4..8].copy_from_slice(&SB_VERSION.to_le_bytes());
         p[8..12].copy_from_slice(&(PAGE as u32).to_le_bytes());
@@ -68,6 +75,34 @@ impl Superblock {
     }
 }
 
+/// The page-0 sector this superblock generation is written to.
+fn sb_slot(generation: u64) -> usize {
+    (generation % SB_SLOTS as u64) as usize
+}
+
+/// Place `sb` into its rotating slot of a page-0 image, preserving the other
+/// sectors (which still hold older, valid superblock copies — so only the one
+/// changed sector is actually written by a wear-skipping device).
+fn place_sb(page: &mut [u8], sb: &Superblock) {
+    let off = sb_slot(sb.generation) * SECTOR;
+    page[off..off + SECTOR].copy_from_slice(&sb.encode_sector());
+}
+
+/// Scan all 8 sectors of a page-0 image and return the newest valid superblock
+/// (highest generation). A v0.2.0 volume only has one, at sector 0.
+fn scan_sb(page: &[u8]) -> Result<Superblock> {
+    let mut best: Option<Superblock> = None;
+    for s in 0..SB_SLOTS {
+        let off = s * SECTOR;
+        if let Ok(sb) = Superblock::decode(&page[off..off + SECTOR]) {
+            if best.map_or(true, |b| sb.generation > b.generation) {
+                best = Some(sb);
+            }
+        }
+    }
+    best.ok_or(StoreError::Corrupt("not a TablesOS volume"))
+}
+
 /// Upper bound on cached clean pages (`CACHE_MAX * PAGE` = 32 MiB). Browsing a
 /// table re-reads it on every keystroke; without a cache that is thousands of
 /// polled PIO sector reads per key and the GUI appears to freeze. A whole-table
@@ -78,6 +113,11 @@ const CACHE_MAX: usize = 8192;
 pub struct Pager<D: BlockDevice> {
     dev: D,
     pub sb: Superblock,
+    /// The current page-0 image (8 sectors). The superblock occupies one
+    /// rotating sector of it; the rest hold older valid copies. Kept in memory
+    /// so each commit changes only the one new sector (the others are byte-for-
+    /// byte unchanged, so a wear-skipping device skips them).
+    sb_image: Page,
     /// Staged page images for the active transaction (also a read cache so the
     /// transaction sees its own writes). Keyed by page number.
     dirty: BTreeMap<u64, Page>,
@@ -102,11 +142,14 @@ impl<D: BlockDevice> Pager<D> {
             catalog_head: 0,
             generation: 1,
         };
-        journal::write_page(&mut dev, 0, &sb.encode())?;
+        let mut sb_image = zeroed_page();
+        place_sb(&mut sb_image, &sb);
+        journal::write_page(&mut dev, 0, &sb_image)?;
         dev.flush()?;
         Ok(Pager {
             dev,
             sb,
+            sb_image,
             dirty: BTreeMap::new(),
             cache: BTreeMap::new(),
         })
@@ -118,10 +161,11 @@ impl<D: BlockDevice> Pager<D> {
         journal::recover(&mut dev)?;
         let mut p = zeroed_page();
         journal::read_page(&mut dev, 0, &mut p)?;
-        let sb = Superblock::decode(&p)?;
+        let sb = scan_sb(&p)?;
         Ok(Pager {
             dev,
             sb,
+            sb_image: p,
             dirty: BTreeMap::new(),
             cache: BTreeMap::new(),
         })
@@ -153,9 +197,12 @@ impl<D: BlockDevice> Pager<D> {
         let txid = self.sb.generation + 1;
         let mut sb = self.sb;
         sb.generation = txid;
-        let batch: Vec<(u64, Vec<u8>)> = alloc::vec![(0u64, sb.encode())];
+        let mut img = self.sb_image.clone();
+        place_sb(&mut img, &sb);
+        let batch: Vec<(u64, Vec<u8>)> = alloc::vec![(0u64, img.clone())];
         journal::commit(&mut self.dev, txid, &batch)?;
         self.sb = sb;
+        self.sb_image = img;
         Ok(())
     }
 
@@ -237,14 +284,17 @@ impl<D: BlockDevice> Pager<D> {
         let txid = self.sb.generation + 1;
         let mut sb = self.sb;
         sb.generation = txid;
+        let mut sb_image = self.sb_image.clone();
+        place_sb(&mut sb_image, &sb);
         let mut batch: Vec<(u64, Vec<u8>)> = Vec::with_capacity(self.dirty.len() + 1);
-        batch.push((0u64, sb.encode()));
+        batch.push((0u64, sb_image.clone()));
         for (p, img) in &self.dirty {
             debug_assert!(*p != 0);
             batch.push((*p, img.clone()));
         }
         journal::commit(&mut self.dev, txid, &batch)?;
         self.sb = sb;
+        self.sb_image = sb_image;
         // The just-committed images are now the clean on-disk content: fold
         // them into the read cache (keeping it warm and correct) before the
         // staging set is dropped. Page 0 (the superblock) is never cached.
@@ -263,7 +313,8 @@ impl<D: BlockDevice> Pager<D> {
         self.dirty.clear();
         let mut p = zeroed_page();
         journal::read_page(&mut self.dev, 0, &mut p)?;
-        self.sb = Superblock::decode(&p)?;
+        self.sb = scan_sb(&p)?;
+        self.sb_image = p;
         Ok(())
     }
 }

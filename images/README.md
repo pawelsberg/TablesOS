@@ -9,6 +9,8 @@ flashing an older image and upgrading it to the version you just built.
 | File | Version | Notes |
 |------|---------|-------|
 | `tablesos-v0.1.0-seed.img` | v0.1.0 | First release; seeded test dataset. |
+| `tablesos-v0.2.0-seed.img` | v0.2.0 | Adds the "top up version" upgrade path. |
+| `tablesos-v0.3.0-seed.img` | v0.3.0 | Flash wear-levelling (rotating journal/superblock). |
 
 ## Retention policy
 

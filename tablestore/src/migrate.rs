@@ -29,7 +29,7 @@ const fn v(major: u32, minor: u32, patch: u32) -> u32 {
 
 /// Every released on-disk version, oldest first. The migration ladder steps
 /// strictly upward through this list. Append new releases here as they ship.
-pub const KNOWN_VERSIONS: &[u32] = &[v(0, 1, 0), v(0, 2, 0)];
+pub const KNOWN_VERSIONS: &[u32] = &[v(0, 1, 0), v(0, 2, 0), v(0, 3, 0)];
 
 /// Is `version` a release this build knows how to migrate from?
 pub fn is_known(version: u32) -> bool {
@@ -79,6 +79,11 @@ fn apply_step<D: BlockDevice>(_store: &mut Store<D>, from: u32, to: u32) -> Resu
         // v0.1.0 -> v0.2.0: the on-disk data format is unchanged. Nothing to
         // transform; the version stamp is refreshed by `finalize_upgrade`.
         (a, b) if a == v(0, 1, 0) && b == v(0, 2, 0) => Ok(()),
+        // v0.2.0 -> v0.3.0: flash wear-levelling rotates the journal/superblock
+        // sectors but keeps the geometry and is read-compatible with v0.2.0, so
+        // no data transform is needed — the first commit after the re-stamp
+        // simply starts rotating.
+        (a, b) if a == v(0, 2, 0) && b == v(0, 3, 0) => Ok(()),
         _ => Err(StoreError::Corrupt("no migration step for this version pair")),
     }
 }

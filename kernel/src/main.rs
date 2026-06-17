@@ -608,6 +608,15 @@ impl BlockDevice for BootDisk {
             return Err(StoreError::Io);
         }
         let mut check = [0u8; 512];
+        // Skip-if-unchanged (flash-wear reduction): reading does not wear NAND,
+        // so if the medium already holds exactly these bytes there is nothing to
+        // gain by erasing/programming them again. The hot journal/superblock
+        // sectors and re-saved-but-unchanged data pages are the common case.
+        // Trust a successful, matching read; on any read error fall through and
+        // write (reads being unreliable is not a reason to skip a write).
+        if self.read_sector(lba, &mut check).is_ok() && check[..] == buf[..] {
+            return Ok(());
+        }
         for _ in 0..4 {
             self.write_sector_raw(lba, buf)?;
             self.read_sector(lba, &mut check)?;
