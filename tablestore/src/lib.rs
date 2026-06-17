@@ -42,6 +42,50 @@ pub use value::Value;
 
 use alloc::string::String;
 
+// ---- Unified product version ------------------------------------------------
+//
+// TablesOS has ONE version, declared once in the workspace `Cargo.toml`
+// (`[workspace.package] version`) and inherited by every crate. It is stamped
+// into every on-disk version field — the MBR boot header, the volume
+// superblock ([`pager`]) and the journal control header ([`journal`]). There
+// are deliberately no independent format numbers: a change to the version is
+// assumed to change every on-disk format, so one comparison distinguishes a
+// foreign or older image. The dependency-free `uefi-loader` duplicates this
+// packing (it cannot depend on this crate) and must stay byte-compatible.
+
+/// Parse a decimal string to `u32` in a `const` context — used on the
+/// Cargo-provided `CARGO_PKG_VERSION_*` components.
+const fn parse_dec(s: &str) -> u32 {
+    let b = s.as_bytes();
+    let mut v = 0u32;
+    let mut i = 0;
+    while i < b.len() {
+        v = v * 10 + (b[i] - b'0') as u32;
+        i += 1;
+    }
+    v
+}
+
+/// The single TablesOS version, packed `(major << 16) | (minor << 8) | patch`.
+/// This exact value is written to every on-disk version field.
+pub const VERSION: u32 = (parse_dec(env!("CARGO_PKG_VERSION_MAJOR")) << 16)
+    | (parse_dec(env!("CARGO_PKG_VERSION_MINOR")) << 8)
+    | parse_dec(env!("CARGO_PKG_VERSION_PATCH"));
+
+/// The human-readable product version, e.g. `"v0.1.0"`.
+pub const VERSION_STR: &str = concat!("v", env!("CARGO_PKG_VERSION"));
+
+/// Render any packed [`VERSION`]-form value back to `"vMAJOR.MINOR.PATCH"`
+/// (e.g. for a version read off another disk's header or superblock).
+pub fn version_string(packed: u32) -> String {
+    alloc::format!(
+        "v{}.{}.{}",
+        (packed >> 16) & 0xFF,
+        (packed >> 8) & 0xFF,
+        packed & 0xFF
+    )
+}
+
 /// Every fallible engine operation funnels through this. The GUI turns these
 /// into the inline / status-bar messages the UI spec calls for.
 #[derive(Debug, Clone, PartialEq, Eq)]

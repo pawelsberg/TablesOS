@@ -74,13 +74,16 @@ relational/journalling code runs in the kernel and under host tests.
 
 - 4 KiB pages over 512 B sectors: superblock (page 0), journal region, then
   catalog / per-table schema / per-row blob chains / free list.
-- **Format versions are independent of the release version.** Three on-disk /
-  wire formats each carry their own version (all `1` today): the OS/loader
-  version in the MBR header (`boot/stage1.s`, surfaced by the Drives
-  diagnostic), the volume/superblock `SB_VERSION` (`pager.rs`), and the journal
-  record version (`journal.rs`). None tracks the crates' `0.1.0` product
-  version; each is bumped only when its own layout changes (see
-  `boot/layout.md`).
+- **One unified version everywhere.** There are no independent format numbers:
+  the single product version (workspace `Cargo.toml`, surfaced as
+  `tablestore::VERSION` / `VERSION_STR`) is stamped — packed
+  `(major<<16)|(minor<<8)|patch` — into every on-disk version field: the MBR
+  header (`0x188`, written by the builder, surfaced by the Drives diagnostic),
+  the volume/superblock `SB_VERSION` (`pager.rs`), and the journal control
+  version (`journal.rs`). A change to the version is assumed to change every
+  on-disk format at once, so one comparison distinguishes a foreign/older image
+  (the uefi-loader already skips a non-matching MBR; store/journal checks are a
+  future migration hook). See `boot/layout.md`.
 - A value/row is a **blob chain** of linked pages, so a single value's size is
   bounded only by free space — *except* by the journal limit below.
 - **Write-ahead journal**, physical page-image redo. Per transaction: stage

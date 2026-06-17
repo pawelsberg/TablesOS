@@ -2537,15 +2537,15 @@ impl<D: BlockDevice> App<D> {
     /// Uptime comes from the calibrated TSC; before calibration it's omitted.
     fn hud_readout(&self) -> String {
         let per = time::tsc_per_us();
-        let ver = env!("CARGO_PKG_VERSION");
+        let ver = tablestore::VERSION_STR;
         if per == 0 {
-            return format!("TABLESOS v{ver} // SYS ONLINE");
+            return format!("TABLESOS {ver} // SYS ONLINE");
         }
         let secs = unsafe { core::arch::x86_64::_rdtsc() } / (per.saturating_mul(1_000_000)).max(1);
         // Last frame's present cost (VRAM copy) — diagnostic for graphics speed
         // on real hardware, where there is no serial console.
         let fbus = fbm::last_present_ticks() / per.max(1);
-        format!("TABLESOS v{ver} // T+{}s // FB {}us // ONLINE", secs, fbus)
+        format!("TABLESOS {ver} // T+{}s // FB {}us // ONLINE", secs, fbus)
     }
 
     fn render(&mut self) {
@@ -4210,8 +4210,8 @@ impl<D: BlockDevice> App<D> {
             ).hit(Hit::Activate(i)));
             let mbr_desc = match &d.mbr {
                 MbrInfo::TablesOs { version, sys_guid, .. } => alloc::format!(
-                    "  currently: TablesOS disk (OS/loader v{})  GUID {}",
-                    version,
+                    "  currently: TablesOS disk ({})  GUID {}",
+                    tablestore::version_string(*version),
                     ata::fmt_guid(sys_guid),
                 ),
                 MbrInfo::Partitioned { parts } => alloc::format!(
@@ -4372,7 +4372,7 @@ impl<D: BlockDevice> App<D> {
 fn about_lines() -> Vec<TextLine> {
     let mut out = Vec::new();
     out.push(line(
-        &format!("TablesOS v{}", env!("CARGO_PKG_VERSION")),
+        &format!("TablesOS {}", tablestore::VERSION_STR),
         LineKind::Accent,
     ));
     out.push(line(
@@ -4701,8 +4701,8 @@ fn push_drive_card(body: &mut Vec<TextLine>, d: &DriveInfo, selected: bool, idx:
         } => {
             body.push(line(
                 &format!(
-                    "  TablesOS MBR header — OS/loader version {}   data @ LBA {}",
-                    version, data_loc_lba
+                    "  TablesOS MBR header — version {}   data @ LBA {}",
+                    tablestore::version_string(*version), data_loc_lba
                 ),
                 LineKind::Accent,
             ));

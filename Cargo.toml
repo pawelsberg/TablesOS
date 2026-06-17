@@ -7,7 +7,7 @@
 
 [package]
 name = "tablesos-builder"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 publish = false
@@ -15,6 +15,15 @@ publish = false
 [workspace]
 members = ["kernel", "tablestore", "pngdec", "uefi-loader"]
 resolver = "2"
+
+# The single source of truth for the TablesOS version. Every crate inherits it
+# (`version.workspace = true`), and it is stamped — packed as a u32 via
+# `tablestore::VERSION` — into every on-disk version field (MBR boot header,
+# volume superblock, journal control header). There are deliberately no
+# independent format numbers: a change here is assumed to change every on-disk
+# format at once. The displayed form is `tablestore::VERSION_STR` (= "v0.1.0").
+[workspace.package]
+version = "0.1.0"
 
 # The kernel as an artifact dependency, compiled for bare metal. Because it is
 # a *normal* dependency, Cargo exposes `CARGO_BIN_FILE_KERNEL_kernel` to this

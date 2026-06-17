@@ -38,9 +38,12 @@ const KERNEL_LBA: u32 = 64;
 const KERNEL_LOAD: u32 = 0x0100_0000;
 const IMG_SECTORS: u64 = 64 * 1024 * 1024 / SECTOR as u64; // 64 MiB device
 
-// Custom MBR header field offsets, version 2 (see boot/layout.md /
-// boot/stage1.s). The header sits at 0x180 so the classic partition table
-// area at 0x1BE stays free for the ESP entry UEFI firmware needs.
+// Custom MBR header field offsets (see boot/layout.md / boot/stage1.s). The
+// header sits at 0x180 so the classic partition table area at 0x1BE stays free
+// for the ESP entry UEFI firmware needs. `H_VERSION` is the single product
+// version (`tablestore::VERSION`), written here from this crate's inherited
+// workspace version — stage1.s only reserves the bytes.
+const H_VERSION: usize = 0x188; // u32: unified product version
 const H_DATA_LBA: usize = 0x18C;
 const H_S2_LBA: usize = 0x194;
 const H_S2_SECS: usize = 0x198;
@@ -100,6 +103,7 @@ fn main() {
 
     let mut img = vec![0u8; IMG_SECTORS as usize * SECTOR];
     img[..SECTOR].copy_from_slice(&stage1);
+    put_u32(&mut img, H_VERSION, tablestore::VERSION);
     put_u64(&mut img, H_DATA_LBA, data_lba);
     put_u32(&mut img, H_S2_LBA, STAGE2_LBA);
     put_u16(&mut img, H_S2_SECS, s2_secs as u16);
@@ -161,7 +165,8 @@ fn main() {
     let image = out.join("tablesos.img");
     std::fs::write(&image, &img).expect("write image");
     println!(
-        "hybrid BIOS+UEFI image: {} ({} MiB)\n  stage2 = {s2_secs} sectors, kernel = {k_secs} sectors ({kernel_mem_mib} MiB in RAM), ESP @ LBA {esp_lba}, volume @ LBA {data_lba}",
+        "hybrid BIOS+UEFI image {}: {} ({} MiB)\n  stage2 = {s2_secs} sectors, kernel = {k_secs} sectors ({kernel_mem_mib} MiB in RAM), ESP @ LBA {esp_lba}, volume @ LBA {data_lba}",
+        tablestore::VERSION_STR,
         image.display(),
         img.len() / 1024 / 1024
     );

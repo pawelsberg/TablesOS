@@ -101,8 +101,8 @@ msg_err:    .asciz "stage1 disk error\r\n"
 # --- custom TBLSBOOT header (must end before the partition table at 0x1BE) ---
 .org 0x180
 .ascii  "TBLSBOOT"          # 0x180 format magic
-.word   2                   # 0x188 os loader format version (2: header @0x180)
-.word   0                   # 0x18A reserved
+.long   0                   # 0x188 os version, u32  (builder patches from the
+                            #       crate version; = tablestore::VERSION)
 .quad   0                   # 0x18C data location LBA   (builder patches)
 .long   1                   # 0x194 stage2 lba
 .word   0                   # 0x198 stage2 sectors      (builder patches)

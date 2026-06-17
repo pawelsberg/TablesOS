@@ -13,7 +13,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 const SB_MAGIC: u32 = 0x53_4c_42_54; // "TBLS" LE
-const SB_VERSION: u32 = 1;
+// The volume format version is the single product version (see `crate::VERSION`):
+// a change to the OS version is assumed to change the on-disk format too.
+const SB_VERSION: u32 = crate::VERSION;
 
 /// A heap page image. Heap-allocated to keep large arrays off the kernel stack.
 pub type Page = Vec<u8>;

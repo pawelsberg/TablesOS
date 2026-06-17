@@ -30,9 +30,9 @@ use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
 use efi::*;
 
-// ---- on-disk TBLSBOOT header, sector 0 (boot/layout.md, version 2) ---------
+// ---- on-disk TBLSBOOT header, sector 0 (boot/layout.md) --------------------
 const H_MAGIC: usize = 0x180;
-const H_VERSION: usize = 0x188;
+const H_VERSION: usize = 0x188; // u32: unified product version
 const H_DATA_LBA: usize = 0x18C;
 const H_KMEM_MIB: usize = 0x19A;
 const H_K_LBA: usize = 0x19C;
@@ -40,7 +40,27 @@ const H_K_SECS: usize = 0x1A0;
 const H_K_LOAD: usize = 0x1A4;
 const H_K_ENTRY: usize = 0x1A8;
 const H_SYS_GUID: usize = 0x1AC;
-const HEADER_VERSION: u16 = 2;
+
+/// Parse a decimal string to `u32` in a `const` context.
+const fn parse_dec(s: &str) -> u32 {
+    let b = s.as_bytes();
+    let mut v = 0u32;
+    let mut i = 0;
+    while i < b.len() {
+        v = v * 10 + (b[i] - b'0') as u32;
+        i += 1;
+    }
+    v
+}
+
+/// The single TablesOS version, packed `(major << 16) | (minor << 8) | patch`.
+/// This loader is dependency-free, so the packing of `tablestore::VERSION` is
+/// duplicated here and must stay byte-compatible with it. A disk whose header
+/// version differs is skipped — a version change is assumed to change the boot
+/// format, so this loader only ever loads a kernel built from the same version.
+const VERSION: u32 = (parse_dec(env!("CARGO_PKG_VERSION_MAJOR")) << 16)
+    | (parse_dec(env!("CARGO_PKG_VERSION_MINOR")) << 8)
+    | parse_dec(env!("CARGO_PKG_VERSION_PATCH"));
 
 const SECTOR: usize = 512;
 const PAGE: u64 = 4096;
@@ -266,7 +286,7 @@ fn find_tablesos_disk(bs: &mut BootServices) -> Result<BootDisk, &'static str> {
         if &s[H_MAGIC..H_MAGIC + 8] != b"TBLSBOOT" || s[510] != 0x55 || s[511] != 0xAA {
             continue;
         }
-        if rd16(s, H_VERSION) != HEADER_VERSION {
+        if rd32(s, H_VERSION) != VERSION {
             out("skipping TablesOS disk with unsupported header version\r\n");
             continue;
         }

@@ -261,10 +261,11 @@ pub struct DriveInfo {
 pub enum MbrInfo {
     /// `TBLSBOOT` magic at MBR offset 0x180 → our own custom MBR.
     TablesOs {
-        /// OS/BIOS-loader version from MBR header offset 0x188 — the boot
-        /// format version, distinct from the relational volume's superblock
-        /// format version (`tablestore` `SB_VERSION`) and the journal version.
-        version: u16,
+        /// The unified product version from MBR header offset 0x188 (u32,
+        /// packed `(major<<16)|(minor<<8)|patch` — the same value stamped into
+        /// the superblock and journal; see `tablestore::VERSION`). Render it
+        /// with `tablestore::version_string`.
+        version: u32,
         data_loc_lba: u64,
         stage2_lba: u32,
         stage2_sectors: u16,
@@ -504,7 +505,7 @@ pub fn parse_mbr(s: &[u8]) -> MbrInfo {
     }
     let boot_sig = s[510] == 0x55 && s[511] == 0xAA;
     if &s[0x180..0x188] == b"TBLSBOOT" && boot_sig {
-        let version = u16::from_le_bytes([s[0x188], s[0x189]]);
+        let version = u32::from_le_bytes(s[0x188..0x18C].try_into().unwrap());
         let data_loc_lba = u64::from_le_bytes(s[0x18C..0x194].try_into().unwrap());
         let stage2_lba = u32::from_le_bytes(s[0x194..0x198].try_into().unwrap());
         let stage2_sectors = u16::from_le_bytes([s[0x198], s[0x199]]);

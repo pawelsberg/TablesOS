@@ -109,7 +109,7 @@ fn render_ctrl(entries: &[u64], txid: u64, state: u32) -> Vec<u8> {
     let crc = crc32(&crc_in);
 
     put_u32(&mut buf, 0, MAGIC);
-    put_u32(&mut buf, 4, 1); // version
+    put_u32(&mut buf, 4, crate::VERSION); // unified product version (crate::VERSION)
     put_u32(&mut buf, 8, state);
     put_u32(&mut buf, 12, crc);
     put_u64(&mut buf, 16, txid);

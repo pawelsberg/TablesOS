@@ -47,8 +47,7 @@ classic partition table at 0x1BE could come back for the UEFI path.
 |------|------|------------------|--------------------------------------|
 |0x000 | 3    | `jmp short`+nop  | into stage-1 code                    |
 |0x180 | 8    | format magic     | ASCII `TBLSBOOT`                     |
-|0x188 | 2    | os loader version| OS-loader format version (=2)        |
-|0x18A | 2    | reserved         |                                      |
+|0x188 | 4    | version          | unified product version, packed `(major<<16)\|(minor<<8)\|patch` — the *same* value stamped in the superblock + journal (`tablestore::VERSION`). The builder writes it; stage1.s only reserves the bytes |
 |0x18C | 8    | data location    | LBA where the TablesOS volume starts |
 |0x194 | 4    | stage2 lba       |                                      |
 |0x198 | 2    | stage2 sectors   |                                      |
@@ -65,20 +64,25 @@ classic partition table at 0x1BE could come back for the UEFI path.
 The builder writes an **already-formatted** TablesOS volume at the data
 location (no runtime formatting); the kernel only ever *mounts*.
 
-### Format versions (all independent)
+### Version (unified)
 
-Three on-disk/wire format versions are tracked **separately** — they are *not*
-the product/release version (the crates' `0.1.0`), and each is bumped only when
-its own format changes:
+There is **one** TablesOS version. It is declared once in the workspace
+`Cargo.toml` (`[workspace.package] version`, e.g. `0.1.0`), inherited by every
+crate, and stamped — packed as `(major<<16)|(minor<<8)|patch` — into **every**
+on-disk version field. There are deliberately no independent format numbers: a
+change to the version is assumed to change every on-disk format at once, so a
+single comparison distinguishes a foreign or older image.
 
-| Version | Where | Source | Current |
-|---------|-------|--------|---------|
-| OS/loader format | MBR header `0x188` | `boot/stage1.s` | 2 (header @0x180 + ESP entry; v1 had the header at 0x1B0 and no partition table) |
-| Volume (store) format | superblock `SB_VERSION` | `tablestore/src/pager.rs` | 1 |
-| Journal format | journal record header | `tablestore/src/journal.rs` | 1 |
+| Field | Where | Written by | Read / checked by |
+|-------|-------|------------|-------------------|
+| MBR header version | sector 0 `0x188` (u32) | builder (`tablestore::VERSION`) | uefi-loader (skips a non-matching disk); kernel Drives diagnostic (display) |
+| Volume (store) format | superblock `SB_VERSION` | `tablestore::pager` (`crate::VERSION`) | — (migration hook, future) |
+| Journal format | journal control header | `tablestore::journal` (`crate::VERSION`) | — (migration hook, future) |
 
-The Drives diagnostic surfaces the **OS/loader** version (it reads the MBR, not
-the mounted superblock).
+Source of truth: `tablestore::VERSION` (packed u32) / `tablestore::VERSION_STR`
+(`"v0.1.0"`). The dependency-free `uefi-loader` re-derives the same packing from
+its inherited `CARGO_PKG_VERSION` and must stay byte-compatible. The Drives
+diagnostic renders the MBR field with `tablestore::version_string`.
 
 ## Fixed addresses (BIOS path)
 
