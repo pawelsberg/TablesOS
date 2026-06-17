@@ -1304,26 +1304,38 @@ fn drain_event(
     }
 }
 
-/// Like [`drain_event`] but for the Transfer Event of a **specific endpoint**:
-/// only a Transfer Event whose `(slot_id, endpoint_id/DCI)` matches the transfer
-/// we issued is accepted. HID interrupt completions are serviced inline and
-/// skipped, and any *other* transfer event is skipped too — so a mouse/keyboard
-/// report landing on the shared event ring mid-command can never be returned as
-/// this transfer's completion (which would hand back a wrong `transfer_length`
-/// and a garbage buffer: "corrupt store: chain length" on real hardware).
+/// Like [`drain_event`] but for the Transfer Event of a **specific endpoint**.
+/// HID interrupt completions are always serviced inline and skipped, so a
+/// mouse/keyboard report landing on the shared event ring mid-command can never
+/// be returned as this transfer's completion (which would hand back a wrong
+/// `transfer_length` and a garbage buffer: "corrupt store: chain length" on real
+/// hardware). The acceptance rule depends on `expect_trb`:
 ///
-/// We match on slot+endpoint rather than the exact TRB Pointer because an
-/// **errored** transfer raises its event pointing at the *failing* TRB (e.g. the
-/// data-stage TRB of a control TD) and halts the TD — the TRB we'd compute (the
-/// status/normal TRB) then never completes. Matching the endpoint still surfaces
-/// that error event so the caller can reset the endpoint and retry, instead of
-/// spinning to the deadline (the symptom that wedged config-descriptor reads on a
-/// flaky Alcor 058f:6387). HID lives on a different slot, so it's still excluded.
+/// * `Some(trb)` — **bulk** transfers. Accept only the event whose TRB Pointer
+///   is `trb`, the single Normal TRB we posted. This is the strongest match: a
+///   single-TRB TD raises *both* its success and its error events against that
+///   same TRB, so stalls/errors are still surfaced for BOT recovery, while a
+///   stale completion from a previous transfer on this *same* endpoint (one that
+///   timed out or was reset and landed late) carries a *different* TRB Pointer
+///   and is correctly skipped. Slot+endpoint matching could not tell the two
+///   apart — that residual hole was the "corrupt store: chain length" recurrence
+///   on real USB sticks.
+///
+/// * `None` — **control** (EP0) transfers. A control TD is multi-TRB, and an
+///   errored stage raises its event against the *failing* stage TRB (e.g. the
+///   data stage), not the status TRB we'd name — so we match on slot+endpoint
+///   instead, which still surfaces that error for EP0 reset+retry (the fix for
+///   the flaky Alcor 058f:6387 config read). HID lives on a different slot, so
+///   it's still excluded.
+///
+/// Do NOT "simplify" the bulk path back to slot+endpoint matching: it reopens
+/// the stale-event corruption on real hardware that QEMU never reproduces.
 fn drain_transfer_event(
     info: &XhciInfo,
     st: &mut XhciState,
     slot_id: u8,
     endpoint_id: u8,
+    expect_trb: Option<u64>,
     max_us: u64,
 ) -> Result<Event, &'static str> {
     let per = time::tsc_per_us().max(1);
@@ -1334,7 +1346,15 @@ fn drain_transfer_event(
                 if service_hid_transfer(st, &ev) {
                     continue;
                 }
-                if ev.trb_type == 32 && ev.slot_id == slot_id && ev.endpoint_id == endpoint_id {
+                let matched = match expect_trb {
+                    Some(trb) => ev.trb_type == 32 && ev.parameter == trb,
+                    None => {
+                        ev.trb_type == 32
+                            && ev.slot_id == slot_id
+                            && ev.endpoint_id == endpoint_id
+                    }
+                };
+                if matched {
                     return Ok(ev);
                 }
                 // Not our transfer (HID/stale/unrelated) — skip and keep draining.
@@ -1413,7 +1433,7 @@ fn arm_mouse(info: &XhciInfo, st: &mut XhciState, idx: usize) {
         return;
     }
     let (slot_idx, ep_idx, buf, len) = (m.slot_idx, m.ep_idx, m.report_buf, m.report_len);
-    let (slot_id, dci) = post_normal_trb(st, slot_idx, ep_idx, buf, len);
+    let (slot_id, dci, _) = post_normal_trb(st, slot_idx, ep_idx, buf, len);
     let db = (info.mmio_base + info.dboff as u64 + 4 * slot_id as u64) as *mut u32;
     unsafe { write_volatile(db, dci as u32) };
     st.mice[idx].armed = true;
@@ -1460,7 +1480,7 @@ fn arm_keyboard(info: &XhciInfo, st: &mut XhciState, idx: usize) {
         return;
     }
     let (slot_idx, ep_idx, buf, len) = (k.slot_idx, k.ep_idx, k.report_buf, k.report_len);
-    let (slot_id, dci) = post_normal_trb(st, slot_idx, ep_idx, buf, len);
+    let (slot_id, dci, _) = post_normal_trb(st, slot_idx, ep_idx, buf, len);
     let db = (info.mmio_base + info.dboff as u64 + 4 * slot_id as u64) as *mut u32;
     unsafe { write_volatile(db, dci as u32) };
     st.keyboards[idx].armed = true;
@@ -1948,7 +1968,7 @@ fn control_transfer_once(
     // success that's the Status Stage event; on a data-stage error it's the
     // error event for EP0 — either way it's ours, and surfacing the error lets
     // the caller reset EP0 and retry instead of hanging to the deadline.
-    let ev = drain_transfer_event(info, st, res.slot_id, 1, 2_000_000)?;
+    let ev = drain_transfer_event(info, st, res.slot_id, 1, None, 2_000_000)?;
     let bytes = match (length > 0, &buf) {
         (true, Some(b)) if ev.completion_code == 1 || ev.completion_code == 13 => {
             b.read_to_vec(length as usize)
@@ -2839,13 +2859,17 @@ pub fn probe_mass_storage(
 /// return `(slot_id, dci)` so the caller can ring the doorbell. Does not drain —
 /// shared by `bulk_transfer` (which then waits for completion) and the mouse arm
 /// (which leaves the TRB pending and checks for it on a later poll).
+/// Post a single Normal TRB to an endpoint's transfer ring. Returns
+/// `(slot_id, dci, trb_addr)` — the TRB's address is the physical address the
+/// controller reports back as the Transfer Event's TRB Pointer, so a bulk
+/// caller can match its completion *exactly* (see `drain_transfer_event`).
 fn post_normal_trb(
     st: &mut XhciState,
     slot_idx: usize,
     ep_idx: usize,
     buf: u64,
     length: u32,
-) -> (u8, u8) {
+) -> (u8, u8, u64) {
     let slot_id = st.slots[slot_idx].slot_id;
     let ep = &mut st.slots[slot_idx].endpoints[ep_idx];
     let dci = ep.dci;
@@ -2872,7 +2896,7 @@ fn post_normal_trb(
         ep.tr_enqueue = 0;
         ep.tr_pcs ^= 1;
     }
-    (slot_id, dci)
+    (slot_id, dci, trb as u64)
 }
 
 fn bulk_transfer(
@@ -2883,11 +2907,17 @@ fn bulk_transfer(
     buf: *mut u8,
     length: u32,
 ) -> Result<(u8, u32), &'static str> {
-    let (slot_id, dci) = post_normal_trb(st, slot_idx, ep_idx, buf as u64, length);
+    let (slot_id, dci, trb) = post_normal_trb(st, slot_idx, ep_idx, buf as u64, length);
     // Ring the doorbell after the &mut borrow inside `post_normal_trb` is dropped.
     let db = (info.mmio_base + info.dboff as u64 + 4 * slot_id as u64) as *mut u32;
     unsafe { write_volatile(db, dci as u32) };
-    let ev = drain_transfer_event(info, st, slot_id, dci, 2_000_000)?;
+    // Match this bulk completion by the *exact* TRB we posted: it's a single
+    // Normal TRB, so both its success AND error events carry this TRB Pointer.
+    // This excludes HID reports and — critically — a stale completion from a
+    // previous transfer on this same endpoint that timed out or was reset and
+    // landed late (which slot+endpoint matching would wrongly accept, handing
+    // back a wrong length + garbage buffer: "corrupt store: chain length").
+    let ev = drain_transfer_event(info, st, slot_id, dci, Some(trb), 2_000_000)?;
     Ok((ev.completion_code, ev.transfer_length))
 }
 
@@ -3905,6 +3935,25 @@ impl TsBlockDevice for UsbMscDevice {
             })
     }
 
+    fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> TsResult<()> {
+        let count = buf.len() / SECTOR;
+        if self.poisoned
+            || buf.is_empty()
+            || buf.len() % SECTOR != 0
+            || lba + count as u64 > self.sectors
+            || lba > u32::MAX as u64
+            || count > u16::MAX as usize
+        {
+            return Err(StoreError::Io);
+        }
+        let tag = self.next_tag();
+        msc_read_blocks(self.mmio_base, self.slot_id, lba as u32, count as u16, buf, tag)
+            .map_err(|e| {
+                record_msc_err(e);
+                StoreError::Io
+            })
+    }
+
     fn write_sector(&mut self, lba: u64, buf: &[u8]) -> TsResult<()> {
         if self.poisoned || buf.len() != SECTOR || lba >= self.sectors {
             return Err(StoreError::Io);
@@ -3990,6 +4039,44 @@ fn msc_read_sector(
         }
         match scsi_read10(
             &info, st, slot_idx, bulk_in_idx, bulk_out_idx, 0, lba, 1, SECTOR as u32, tag,
+        ) {
+            Ok((0, bytes)) if bytes.len() >= buf.len() => {
+                buf.copy_from_slice(&bytes[..buf.len()]);
+                return Ok(());
+            }
+            Ok((status, _)) if status != 0 => last = "READ(10) CSW status != 0",
+            Ok(_) => last = "READ(10) returned short data",
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// Read `count` consecutive sectors in a SINGLE READ(10) (one bulk data stage),
+/// rather than `count` separate single-sector commands. Same BOT recovery as
+/// `msc_read_sector`. `buf` must be `count * SECTOR` bytes.
+fn msc_read_blocks(
+    mmio_base: u64,
+    slot_id: u8,
+    lba: u32,
+    count: u16,
+    buf: &mut [u8],
+    tag: u32,
+) -> Result<(), &'static str> {
+    let mut guard = STATES.lock();
+    let st = state_for(&mut guard, mmio_base).ok_or("no such USB controller")?;
+    let info = st.info.clone();
+    let (slot_idx, bulk_in_idx, bulk_out_idx) = msc_resolve_bulk(st, slot_id)?;
+
+    let mut last = "READ(10) not attempted";
+    for attempt in 0..3 {
+        if attempt > 0 {
+            reset_bulk_endpoint(&info, st, slot_idx, bulk_in_idx);
+            reset_bulk_endpoint(&info, st, slot_idx, bulk_out_idx);
+            time::delay_ms(20);
+        }
+        match scsi_read10(
+            &info, st, slot_idx, bulk_in_idx, bulk_out_idx, 0, lba, count, SECTOR as u32, tag,
         ) {
             Ok((0, bytes)) if bytes.len() >= buf.len() => {
                 buf.copy_from_slice(&bytes[..buf.len()]);

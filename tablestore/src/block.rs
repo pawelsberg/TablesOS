@@ -17,6 +17,21 @@ pub trait BlockDevice {
     /// Read one sector into `buf` (`buf.len() == SECTOR`).
     fn read_sector(&mut self, lba: u64, buf: &mut [u8]) -> Result<()>;
 
+    /// Read `buf.len() / SECTOR` consecutive sectors starting at `lba`, in as
+    /// few device transactions as possible. The default loops [`read_sector`];
+    /// drivers that can move many sectors per request (USB mass storage) should
+    /// override it with a single multi-block transfer. Besides being far fewer
+    /// round-trips, a single transfer is a workaround for controllers that
+    /// mishandle a long run of tiny single-sector bulk reads. `buf.len()` must
+    /// be a whole multiple of `SECTOR`.
+    fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<()> {
+        debug_assert!(buf.len() % SECTOR == 0);
+        for (i, chunk) in buf.chunks_mut(SECTOR).enumerate() {
+            self.read_sector(lba + i as u64, chunk)?;
+        }
+        Ok(())
+    }
+
     /// Write one sector from `buf` (`buf.len() == SECTOR`).
     fn write_sector(&mut self, lba: u64, buf: &[u8]) -> Result<()>;
 

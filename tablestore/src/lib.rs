@@ -94,6 +94,11 @@ pub enum StoreError {
     Io,
     /// On-disk structure is corrupt or not a TablesOS volume.
     Corrupt(&'static str),
+    /// Like [`StoreError::Corrupt`] but with a runtime-built, page-level
+    /// diagnostic (page number, header fields, first bytes, and a fresh
+    /// uncached re-read comparison). Used to pinpoint hardware-specific read
+    /// corruption that reproduces on some machines but not others.
+    CorruptDetail(String),
     /// The volume is full (no free pages and the device cannot grow).
     OutOfSpace,
     /// A value did not parse as its column's declared type.

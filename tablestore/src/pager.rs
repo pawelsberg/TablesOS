@@ -152,6 +152,20 @@ impl<D: BlockDevice> Pager<D> {
         Ok(buf)
     }
 
+    /// Read a page straight from the device, bypassing both the active
+    /// transaction's staged writes and the clean-page cache. Used only by the
+    /// corruption diagnostics: comparing a suspect page against a fresh device
+    /// read distinguishes a deterministic bad device read (same bytes again)
+    /// from an intermittent one or a stomped in-RAM cache (different bytes).
+    pub fn reread_uncached(&mut self, page: u64) -> Result<Page> {
+        if page >= self.sb.total_pages {
+            return Err(StoreError::Corrupt("page out of range"));
+        }
+        let mut buf = zeroed_page();
+        journal::read_page(&mut self.dev, page, &mut buf)?;
+        Ok(buf)
+    }
+
     /// Stage a full page image into the active transaction.
     pub fn write_page(&mut self, page: u64, data: Page) {
         debug_assert!(data.len() == PAGE);

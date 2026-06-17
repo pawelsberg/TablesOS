@@ -94,12 +94,48 @@ impl<D: BlockDevice> Store<D> {
             let next = rd_u64(&page, 0);
             let len = rd_u64(&page, 8) as usize;
             if len > CHAIN_CAP {
-                return Err(StoreError::Corrupt("chain length"));
+                return Err(self.chain_corruption_detail("chain length", head, p, &page));
             }
             out.extend_from_slice(&page[CHAIN_HDR..CHAIN_HDR + len]);
             p = next;
         }
         Ok(out)
+    }
+
+    /// Build a page-level diagnostic for a corrupt chain page and re-read the
+    /// page straight from the device to test read determinism. The result is
+    /// surfaced verbatim in the on-screen "corrupt store" message so a machine
+    /// that fails only on certain hardware can report *what* it read wrong
+    /// (zeros = unfilled read, plausible-but-wrong = stale/wrong-LBA, SAME on
+    /// re-read = deterministic device read, DIFF = intermittent / stomped RAM).
+    fn chain_corruption_detail(
+        &mut self,
+        what: &str,
+        head: u64,
+        page_no: u64,
+        first: &[u8],
+    ) -> StoreError {
+        let mut s = format!(
+            "{what} @page {page_no} (chain head {head}) next={:#x} len={} head=",
+            rd_u64(first, 0),
+            rd_u64(first, 8),
+        );
+        for b in first.iter().take(16) {
+            s.push_str(&format!("{b:02x}"));
+        }
+        match self.pager.reread_uncached(page_no) {
+            Ok(again) => {
+                let same = again.len() == first.len() && again[..] == first[..];
+                s.push_str(if same { " reread=SAME" } else { " reread=DIFF " });
+                if !same {
+                    for b in again.iter().take(16) {
+                        s.push_str(&format!("{b:02x}"));
+                    }
+                }
+            }
+            Err(_) => s.push_str(" reread=ERR"),
+        }
+        StoreError::CorruptDetail(s)
     }
 
     fn write_chain(&mut self, bytes: &[u8]) -> Result<u64> {

@@ -574,6 +574,27 @@ impl BlockDevice for BootDisk {
             }
         }
     }
+    fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> TsResult<()> {
+        // USB: one multi-sector transfer (fewer round-trips + a workaround for
+        // controllers that mishandle long runs of single-sector bulk reads).
+        // ATA/EHCI keep the per-sector default loop (adds `base` via
+        // `read_sector`); those are the QEMU and pre-xHCI paths.
+        let count = (buf.len() / 512) as u64;
+        match self {
+            BootDisk::Usb { dev, base, sectors } => {
+                if buf.len() % 512 != 0 || lba + count > *sectors {
+                    return Err(StoreError::Io);
+                }
+                dev.read_blocks(*base + lba, buf)
+            }
+            _ => {
+                for (i, chunk) in buf.chunks_mut(512).enumerate() {
+                    self.read_sector(lba + i as u64, chunk)?;
+                }
+                Ok(())
+            }
+        }
+    }
     fn write_sector(&mut self, lba: u64, buf: &[u8]) -> TsResult<()> {
         // Read-after-write verify. Cheap USB sticks (and controllers brought up
         // through a forced BIOS handoff) can ACK a write yet leave wrong bytes on

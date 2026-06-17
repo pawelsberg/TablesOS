@@ -4985,6 +4985,7 @@ fn describe(e: &StoreError) -> String {
             None => "I/O error".into(),
         },
         StoreError::Corrupt(m) => format!("corrupt store: {m}"),
+        StoreError::CorruptDetail(m) => format!("corrupt store: {m}"),
         StoreError::OutOfSpace => "out of space (or transaction too large)".into(),
         StoreError::Parse(m) => m.clone(),
         StoreError::NullViolation { column } => format!("'{column}' must not be NULL"),

@@ -43,13 +43,10 @@ const STATE_COMMITTED: u32 = 1;
 /// Read one 4 KiB page (8 sectors) from the device.
 pub fn read_page(dev: &mut dyn BlockDevice, page: u64, out: &mut [u8]) -> Result<()> {
     debug_assert!(out.len() == PAGE);
-    let mut sec = [0u8; SECTOR];
-    for i in 0..PAGE_SECTORS {
-        dev.read_sector(page * PAGE_SECTORS + i, &mut sec)?;
-        let o = i as usize * SECTOR;
-        out[o..o + SECTOR].copy_from_slice(&sec);
-    }
-    Ok(())
+    // One multi-sector request where the driver supports it (USB): fewer
+    // round-trips, and avoids the long run of tiny single-sector bulk reads
+    // that some xHCI controllers mishandle (returning phantom data).
+    dev.read_blocks(page * PAGE_SECTORS, out)
 }
 
 /// Write one 4 KiB page (8 sectors). Sectors go out in order so a torn write
