@@ -160,6 +160,9 @@ enum Screen {
     Xhci {
         info: XhciInfo,
         dev: PciDevice,
+        /// First content line shown — the register/port/probe dump easily
+        /// overflows the panel, so the view scrolls (↑↓/PgUp/PgDn).
+        top: usize,
     },
     /// Pick a target USB drive on which to install a fresh TablesOS
     /// image. Reached from the Table List via `n`.
@@ -1262,7 +1265,7 @@ impl<D: BlockDevice> App<D> {
                                         info.max_slots,
                                         info.max_ports
                                     );
-                                    nav = Nav::Push(Screen::Xhci { info, dev: d });
+                                    nav = Nav::Push(Screen::Xhci { info, dev: d, top: 0 });
                                 }
                                 None => {
                                     self.status =
@@ -1404,9 +1407,17 @@ impl<D: BlockDevice> App<D> {
                 }
                 Screen::About { top }
             }
-            Screen::Xhci { mut info, dev } => {
+            Screen::Xhci { mut info, dev, mut top } => {
+                // Window size for the scrollable content (one fewer than the
+                // generic body region: this screen carries an extra header
+                // line — the pipeline hint — above the content).
+                let vis = visible_rows().saturating_sub(1).max(1);
                 match k {
                     Key::Esc => nav = Nav::Pop,
+                    Key::Up => top = top.saturating_sub(1),
+                    Key::Down => top += 1,
+                    Key::PageUp => top = top.saturating_sub(vis),
+                    Key::PageDown => top += vis,
                     Key::Char('r') | Key::Char('R') => {
                         if let Some(fresh) = xhci::inspect(&dev) {
                             info = fresh;
@@ -1555,7 +1566,11 @@ impl<D: BlockDevice> App<D> {
                     }
                     _ => {}
                 }
-                Screen::Xhci { info, dev }
+                // Clamp against the (possibly just-grown) content: a pipeline
+                // step can add many lines, so re-derive the max each time.
+                let max_top = self.xhci_content(&info, &dev).len().saturating_sub(vis);
+                top = top.min(max_top);
+                Screen::Xhci { info, dev, top }
             }
             // Handled before `dispatch` is reached, by the variant match in
             // `on_key` that routes to their dedicated `key_*` handlers. Listed
@@ -3405,7 +3420,7 @@ impl<D: BlockDevice> App<D> {
             LineKind::Dim,
         ).hit(Hit::Shortcuts));
         body.push(line(
-            "PCI bus enumeration. The kernel currently only drives legacy IDE — xHCI / AHCI / NVMe are listed but not used.",
+            "PCI bus enumeration. The kernel drives legacy IDE plus USB (xHCI/EHCI) mass storage; AHCI / NVMe are listed but not yet used.",
             LineKind::Dim,
         ));
         body.push(line(
@@ -3424,7 +3439,20 @@ impl<D: BlockDevice> App<D> {
             let usb = pci::is_usb_host(d);
             let storage = pci::is_mass_storage(d);
             let tag = if usb {
-                "  ← USB (needs USB stack — not implemented)"
+                // The kernel really does drive USB now. Reflect that, and flag
+                // the controller this session has actually brought up so the
+                // user can tell the live one from the dormant siblings.
+                let bar0 = pci::bar_address(d, 0);
+                let driven = bar0 != 0
+                    && xhci::current_bringup().is_some_and(|b| b.mmio_base == bar0);
+                match d.prog_if {
+                    0x30 if driven => "  ← USB xHCI (driven — [Enter] to manage)",
+                    0x30 => "  ← USB xHCI ([Enter] to drive)",
+                    0x20 => "  ← USB EHCI (driven at boot)",
+                    0x10 => "  ← USB OHCI (legacy — not driven)",
+                    0x00 => "  ← USB UHCI (legacy — not driven)",
+                    _ => "  ← USB host controller",
+                }
             } else if storage {
                 "  ← storage"
             } else {
@@ -3518,14 +3546,38 @@ impl<D: BlockDevice> App<D> {
             }
             if pci::is_usb_host(d) {
                 body.push(line("", LineKind::Normal));
-                body.push(line(
-                    "This is a USB host controller. Driving it is phase 4 of the USB-stack roadmap;",
-                    LineKind::Accent,
-                ));
-                body.push(line(
-                    "until then, USB pendrives plugged into this controller are invisible.",
-                    LineKind::Accent,
-                ));
+                match d.prog_if {
+                    0x30 => {
+                        body.push(line(
+                            "USB 3.x host controller (xHCI). The kernel drives this controller:",
+                            LineKind::Accent,
+                        ));
+                        body.push(line(
+                            "press [Enter] to inspect ports, enumerate devices, and run the MSC pipeline.",
+                            LineKind::Accent,
+                        ));
+                    }
+                    0x20 => {
+                        body.push(line(
+                            "USB 2.0 host controller (EHCI). The kernel drives EHCI mass storage at",
+                            LineKind::Accent,
+                        ));
+                        body.push(line(
+                            "boot; a pendrive on this controller can hold the TablesOS volume.",
+                            LineKind::Accent,
+                        ));
+                    }
+                    _ => {
+                        body.push(line(
+                            "Legacy USB host controller (UHCI/OHCI). Not driven by the kernel —",
+                            LineKind::Accent,
+                        ));
+                        body.push(line(
+                            "connect storage through an xHCI or EHCI port instead.",
+                            LineKind::Accent,
+                        ));
+                    }
+                }
             }
         }
         Frame {
@@ -3539,13 +3591,13 @@ impl<D: BlockDevice> App<D> {
     }
 
     fn frame_xhci(&mut self, status: String) -> Frame {
-        let (info, dev) = match self.top() {
-            Screen::Xhci { info, dev } => (info.clone(), *dev),
+        let (info, dev, top) = match self.top() {
+            Screen::Xhci { info, dev, top } => (info.clone(), *dev, *top),
             _ => unreachable!(),
         };
         let mut body = Vec::new();
         body.push(line(
-            "[r] re-read  [b] up  [e] enable-slot  [a] addr+desc  [c] config-desc  [g] configure EPs  [m] MSC probe  [w] write+verify  [Esc] back",
+            "[↑↓ PgUp/Dn] scroll  [r] re-read  [b] up  [e] enable-slot  [a] addr+desc  [c] config-desc  [g] configure EPs  [m] MSC probe  [w] write+verify  [Esc] back",
             LineKind::Dim,
         ).hit(Hit::Shortcuts));
         body.push(line(
@@ -3554,6 +3606,29 @@ impl<D: BlockDevice> App<D> {
         ));
         body.push(line("", LineKind::Normal));
 
+        // The content overflows the panel, so window it against `top`. One
+        // fewer than `visible_rows()` because the pipeline hint above is an
+        // extra header line beyond the two `visible_rows()` already reserves.
+        let vis = visible_rows().saturating_sub(1).max(1);
+        for tl in self.xhci_content(&info, &dev).into_iter().skip(top).take(vis) {
+            body.push(tl);
+        }
+        Frame {
+            title: "xHCI controller — read-only inspection".into(),
+            bg: fbm::C_BG_SCHEMA,
+            body,
+            status,
+            cell_hls: Vec::new(),
+            cursor: None,
+        }
+    }
+
+    /// Build the scrollable body of the xHCI inspector — register dumps, port
+    /// state, and the results of each pipeline step. Every line is wrapped to
+    /// the current panel width so long literals stay fully visible; the caller
+    /// windows the result against the screen's `top` scroll offset.
+    fn xhci_content(&self, info: &XhciInfo, dev: &PciDevice) -> Vec<TextLine> {
+        let mut body = Vec::new();
         body.push(line(
             &format!(
                 "Location: PCI {:02X}:{:02X}.{}   vendor:device 0x{:04X}:0x{:04X}",
@@ -3573,14 +3648,7 @@ impl<D: BlockDevice> App<D> {
                 "MMIO BAR is above 4 GiB — would need extended paging to read.",
                 LineKind::Error,
             ));
-            return Frame {
-                title: "xHCI controller".into(),
-                bg: fbm::C_BG_SCHEMA,
-                body,
-                status,
-                cell_hls: Vec::new(),
-                cursor: None,
-            };
+            return wrap_body(body, self.body_cols());
         }
         body.push(line("", LineKind::Normal));
 
@@ -4054,14 +4122,7 @@ impl<D: BlockDevice> App<D> {
             }
         }
 
-        Frame {
-            title: "xHCI controller — read-only inspection".into(),
-            bg: fbm::C_BG_SCHEMA,
-            body,
-            status,
-            cell_hls: Vec::new(),
-            cursor: None,
-        }
+        wrap_body(body, self.body_cols())
     }
 
     fn frame_create_os_pick(&mut self, status: String) -> Frame {
@@ -4750,6 +4811,22 @@ fn wrap(s: &str, n: usize) -> Vec<String> {
         return alloc::vec![String::new()];
     }
     chars.chunks(n).map(|c| c.iter().collect()).collect()
+}
+
+/// Reflow a body so every line fits within `cols` character cells: each line
+/// is split into `cols`-wide chunks (over-wide register/literal dumps spill
+/// onto continuation lines instead of running off the right edge), preserving
+/// each line's [`LineKind`]. Used by the scrollable xHCI inspector so its
+/// content is fully visible at any resolution.
+fn wrap_body(lines: Vec<TextLine>, cols: usize) -> Vec<TextLine> {
+    let cols = cols.max(16);
+    let mut out = Vec::with_capacity(lines.len());
+    for tl in lines {
+        for chunk in wrap(&tl.text, cols) {
+            out.push(line(&chunk, tl.kind));
+        }
+    }
+    out
 }
 
 /// Reflow every key-hint / options bar in `frame` so it fits within `max_cols`
