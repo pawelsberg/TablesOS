@@ -93,6 +93,9 @@ enum Screen {
         row: usize,
         col: usize,
         top: usize,
+        /// Leftmost visible column — the grid scrolls horizontally so the
+        /// selected `col` stays on screen when a table is wider than the panel.
+        col_off: usize,
         filter: Option<(String, Value)>,
         // (column index, ascending). NULLs always sort last regardless of
         // direction. `None` keeps the engine's natural retrieval order.
@@ -823,6 +826,7 @@ impl<D: BlockDevice> App<D> {
                             row: 0,
                             col: 0,
                             top: 0,
+                            col_off: 0,
                             filter: None,
                             sort: None,
                         });
@@ -903,6 +907,7 @@ impl<D: BlockDevice> App<D> {
                 mut row,
                 mut col,
                 mut top,
+                mut col_off,
                 filter,
                 mut sort,
             } => {
@@ -992,11 +997,14 @@ impl<D: BlockDevice> App<D> {
                 if row >= top + vis {
                     top = row + 1 - vis;
                 }
+                // Horizontal scroll: keep the selected column on screen.
+                col_off = self.browser_col_off(&table, col, col_off);
                 Screen::Browser {
                     table,
                     row,
                     col,
                     top,
+                    col_off,
                     filter,
                     sort,
                 }
@@ -1019,6 +1027,7 @@ impl<D: BlockDevice> App<D> {
                             row: 0,
                             col: 0,
                             top: 0,
+                            col_off: 0,
                             filter: Some((colname, val)),
                             sort: None,
                         });
@@ -2725,6 +2734,38 @@ impl<D: BlockDevice> App<D> {
         w.saturating_sub(BODY_X + PANEL_X + CELL_W) / CELL_W
     }
 
+    /// Choose the leftmost visible Browser column so the selected `col` stays on
+    /// screen. Keeps as many left columns as fit: scrolls left when the cursor
+    /// moves before the window, and advances the window from the left only as
+    /// far as needed to bring a rightward cursor fully into view. A wide column
+    /// can still exceed the panel on its own — then it anchors the left edge.
+    fn browser_col_off(&mut self, table: &str, col: usize, mut col_off: usize) -> usize {
+        let widths: Vec<usize> = self
+            .store
+            .get_table(table)
+            .ok()
+            .map(|t| {
+                t.columns
+                    .iter()
+                    .map(|c| c.display_width.map(|w| w as usize).unwrap_or(DEFAULT_COL_W))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let slot = |ci: usize| widths.get(ci).copied().unwrap_or(DEFAULT_COL_W) + 1;
+        if col < col_off {
+            col_off = col;
+        }
+        let avail = self.body_cols();
+        while col_off < col {
+            let span: usize = (col_off..=col).map(slot).sum();
+            if span <= avail {
+                break;
+            }
+            col_off += 1;
+        }
+        col_off
+    }
+
     fn frame_list(&mut self, status: String) -> Frame {
         let sel = if let Screen::List { sel } = self.top() {
             *sel
@@ -2768,16 +2809,16 @@ impl<D: BlockDevice> App<D> {
     }
 
     fn frame_browser(&mut self, status: String) -> Frame {
-        let (table, row, col, top, filter, sort) = match self.top() {
+        let (table, row, col, top, col_off, filter, sort) = match self.top() {
             Screen::Browser {
                 table,
                 row,
                 col,
                 top,
+                col_off,
                 filter,
                 sort,
-                ..
-            } => (table.clone(), *row, *col, *top, filter.clone(), *sort),
+            } => (table.clone(), *row, *col, *top, *col_off, filter.clone(), *sort),
             _ => unreachable!(),
         };
         let schema = self.store.get_table(&table).ok();
@@ -2802,6 +2843,9 @@ impl<D: BlockDevice> App<D> {
         if let Some(t) = &schema {
             let mut hdr = String::new();
             for (ci, c) in t.columns.iter().enumerate() {
+                if ci < col_off {
+                    continue;
+                }
                 let fk_mark = if t.fks.iter().any(|f| f.from_col == c.name) {
                     "*"
                 } else {
@@ -2852,6 +2896,9 @@ impl<D: BlockDevice> App<D> {
         for (vi, (_, cells)) in rows.iter().enumerate().skip(top).take(vis) {
             let mut s = String::new();
             for (ci, cell) in cells.iter().enumerate() {
+                if ci < col_off {
+                    continue;
+                }
                 let txt = match cell {
                     None => "NULL".to_string(),
                     Some(Value::Str(v)) if v.is_empty() => "\"\"".to_string(),
@@ -2890,7 +2937,9 @@ impl<D: BlockDevice> App<D> {
         // cell within the highlighted row. The slot is the column's content
         // width plus the one-char gap; its x is the sum of the slots before it.
         let mut cell_hls: Vec<(usize, usize, usize, Rgb)> = Vec::new();
-        let col_x: usize = (0..col).map(|ci| content_w(ci) + 1).sum();
+        // x is measured from the first *visible* column, so the cursor lines up
+        // after the grid has been scrolled horizontally.
+        let col_x: usize = (col_off..col).map(|ci| content_w(ci) + 1).sum();
         let col_slot = content_w(col) + 1;
         if let Some(li) = hdr_line_idx {
             cell_hls.push((li, col_x, col_slot, fbm::C_CELL_SEL_FILL));
