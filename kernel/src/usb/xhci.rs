@@ -4194,11 +4194,16 @@ pub fn msc_write_blocks(
     Ok(())
 }
 
-/// Slot-addressed batched read — the read counterpart of [`msc_write_blocks`],
-/// used by the upgrade flow to relocate a volume quickly. Thin wrapper over the
-/// retrying [`msc_read_blocks`]: it resolves the owning controller's MMIO base
-/// from `slot_id` and supplies a fresh tag. `buf.len()` must be at least
-/// `blocks * 512`; exactly that many bytes are filled.
+/// Slot-addressed batched read — the read counterpart of [`msc_write_blocks`].
+/// Thin wrapper over the retrying [`msc_read_blocks`]: it resolves the owning
+/// controller's MMIO base from `slot_id` and supplies a fresh tag. `buf.len()`
+/// must be at least `blocks * 512`; exactly that many bytes are filled.
+///
+/// Currently unused — the upgrade flow used to relocate a volume by copying a
+/// physical sector range with this, but the copy-on-write rebuild now reads the
+/// old volume *logically* (scattered pages) instead. Retained as the read-side
+/// counterpart of the still-used [`msc_write_blocks`].
+#[allow(dead_code)]
 pub fn msc_read_blocks_slot(
     slot_id: u8,
     lba: u32,

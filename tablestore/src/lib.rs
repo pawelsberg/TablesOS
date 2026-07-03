@@ -15,8 +15,11 @@
 //! * [`codec`]   — canonical byte encoding of values and rows.
 //! * [`schema`]  — tables, columns, nullability, `UNIQUE`, foreign keys.
 //! * [`block`]   — the `BlockDevice` abstraction + an in-memory device.
-//! * [`pager`]   — 4 KiB pages, free-list allocator, the on-disk superblock.
-//! * [`journal`] — physical (page-image) write-ahead log + crash recovery.
+//! * [`journal`] — shared page-I/O primitives (4 KiB geometry, CRC, page r/w).
+//! * [`pager`]   — copy-on-write 4 KiB pager: logical→physical remap, rotating
+//!   allocator, anchor ring; the durability + flash wear-levelling core.
+//! * [`compat_v3`] — frozen read-only reader for the retired v0.3.0 journalled
+//!   format, used only to migrate old volumes forward.
 //! * [`store`]   — the relational operations the GUI drives.
 
 #![cfg_attr(not(test), no_std)]
@@ -27,6 +30,7 @@ extern crate alloc;
 pub mod bignum;
 pub mod block;
 pub mod codec;
+pub mod compat_v3;
 pub mod journal;
 pub mod migrate;
 pub mod pager;

@@ -6,12 +6,14 @@
 //!
 //! 1. Confirms the target is a TablesOS volume of a *known, not-newer* version
 //!    (downgrades are refused) and is **not** the disk we booted from.
-//! 2. Mounts the target's volume, runs the engine's data migration ladder
-//!    ([`tablestore::migrate`]) from the target's version up to ours, and reads
-//!    the live page high-water mark.
-//! 3. Relocates the live volume pages to the data location the *new* boot prefix
-//!    expects (kernels of different versions differ in size, so the volume's
-//!    start LBA can move) and re-stamps the superblock with the current version.
+//! 2. Reads the target volume's live logical pages into RAM through the reader
+//!    matching its on-disk format ([`tablestore::compat_v3`] for the retired
+//!    journalled format, the copy-on-write [`tablestore::pager`] for v0.4.0+).
+//! 3. Rebuilds a *fresh* copy-on-write volume at the data location the new boot
+//!    prefix expects (kernels of different versions differ in size, so the
+//!    volume's start LBA can move), writing each logical page under its original
+//!    number. This both relocates and — for a pre-CoW source — converts the
+//!    format, and stamps the current version into every anchor it writes.
 //! 4. Replaces the boot prefix (custom MBR + stage2 + kernel + ESP) with the
 //!    running version's, **preserving the target's existing system GUID** so it
 //!    stays its own disk.
@@ -23,13 +25,20 @@
 use alloc::format;
 use alloc::string::String;
 use alloc::vec;
+use alloc::vec::Vec;
 use tablestore::block::SECTOR;
-use tablestore::journal::PAGE_SECTORS;
+use tablestore::compat_v3::V3Volume;
+use tablestore::journal::{FIRST_DATA_PAGE, PAGE_SECTORS};
+use tablestore::pager::Pager;
 use tablestore::{migrate, BlockDevice, Store};
 
-use crate::ata;
-use crate::install::BaseOffsetDevice;
+use crate::install::{self, BaseOffsetDevice};
 use crate::usb::xhci::{self, UsbMscDevice};
+
+/// On-disk version at/above which the volume uses the copy-on-write format
+/// (v0.4.0). Anything below it is the retired journalled format and is read
+/// through [`V3Volume`].
+const COW_FORMAT_VERSION: u32 = 4 << 8; // packed v0.4.0
 
 const H_MAGIC: usize = 0x180; // "TBLSBOOT"
 const H_VERSION: usize = 0x188; // u32 packed product version
@@ -84,6 +93,49 @@ impl UpgradeReport {
     fn fail(mut self, msg: String) -> Self {
         self.message = msg;
         self
+    }
+}
+
+/// Read the old volume's live logical pages `[FIRST_DATA_PAGE, hwm)` into RAM,
+/// plus its logical header pointers, choosing the reader by on-disk format
+/// version. Consumes the source device (a USB stick or the SD card) so the
+/// target region can then be re-opened for writing.
+///
+/// Returns `(pages, hwm, catalog_head, free_head)` where `pages[i]` is logical
+/// page `FIRST_DATA_PAGE + i`.
+fn read_old_logical<D: BlockDevice>(
+    dev: D,
+    old_data_lba: u64,
+    old_vol_sectors: u64,
+    from_version: u32,
+) -> core::result::Result<(Vec<Vec<u8>>, u64, u64, u64), String> {
+    let mut base = BaseOffsetDevice::new(dev, old_data_lba, old_vol_sectors);
+    if from_version >= COW_FORMAT_VERSION {
+        // Already copy-on-write: read through the current pager.
+        let mut pager =
+            Pager::mount(base).map_err(|e| format!("mount target volume: {:?}", e))?;
+        let sb = pager.superblock();
+        let mut pages = Vec::with_capacity(sb.hwm.saturating_sub(FIRST_DATA_PAGE) as usize);
+        for lpn in FIRST_DATA_PAGE..sb.hwm {
+            pages.push(
+                pager
+                    .read_page(lpn)
+                    .map_err(|e| format!("read old page {}: {:?}", lpn, e))?,
+            );
+        }
+        Ok((pages, sb.hwm, sb.catalog_head, sb.free_head))
+    } else {
+        // Retired journalled format: read through the frozen compat reader.
+        let v3 = V3Volume::mount(&mut base)
+            .map_err(|e| format!("mount target volume (pre-CoW): {:?}", e))?;
+        let mut pages = Vec::with_capacity(v3.sb.hwm.saturating_sub(FIRST_DATA_PAGE) as usize);
+        for lpn in FIRST_DATA_PAGE..v3.sb.hwm {
+            pages.push(
+                v3.read_page(&mut base, lpn)
+                    .map_err(|e| format!("read old page {}: {:?}", lpn, e))?,
+            );
+        }
+        Ok((pages, v3.sb.hwm, v3.sb.catalog_head, v3.sb.free_head))
     }
 }
 
@@ -142,113 +194,76 @@ pub fn upgrade_usb(
         return report.fail(format!("target MBR has an implausible data LBA {}", old_data_lba));
     }
 
-    // ---- Mount, migrate data, learn the live size ---------------------
+    // ---- Read the old volume's live logical pages into RAM ------------
+    // The copy-on-write format (v0.4.0+) scatters live pages across the whole
+    // volume, so relocation can no longer copy a physical prefix. Instead we
+    // read the old volume *logically* (through the reader matching its format)
+    // into RAM, then rebuild a fresh CoW volume at the new location. This both
+    // moves and, for a pre-CoW source, converts the format in one pass. RAM use
+    // is bounded by the live page count (hwm), not the device size.
     let old_vol_sectors = usb_total - old_data_lba;
     let new_vol_sectors = usb_total - booted_data_lba;
     let new_total_pages = new_vol_sectors / PAGE_SECTORS;
 
-    let (hwm, steps) = {
-        let base = BaseOffsetDevice::new(usb, old_data_lba, old_vol_sectors);
-        let mut store = match Store::open(base) {
-            Ok(s) => s,
-            Err(e) => return report.fail(format!("mount target volume: {:?}", e)),
+    let (pages, hwm, catalog_head, free_head) =
+        match read_old_logical(usb, old_data_lba, old_vol_sectors, from_version) {
+            Ok(v) => v,
+            Err(e) => return report.fail(e),
         };
-        let steps = match migrate::migrate_data(&mut store, from_version, tablestore::VERSION) {
-            Ok(n) => n,
-            Err(e) => return report.fail(format!("data migration: {:?}", e)),
-        };
-        (store.hwm(), steps)
-        // `store` drops here, releasing the USB handle; subsequent device I/O
-        // goes through the slot-keyed batched helpers and a fresh re-open.
-    };
-    report.migration_steps = steps;
+    // Number of released versions between the target's and ours (cosmetic).
+    report.migration_steps = migrate::KNOWN_VERSIONS
+        .iter()
+        .filter(|&&kv| kv > from_version && kv <= tablestore::VERSION)
+        .count() as u32;
 
-    if hwm > new_total_pages {
+    if hwm > new_total_pages || new_total_pages <= FIRST_DATA_PAGE + 1 {
         return report.fail(format!(
-            "target too small for the new layout: {} live pages but only {} fit after the larger boot prefix",
+            "target too small for the new layout: {} live pages, only {} pages available after the boot prefix",
             hwm, new_total_pages
         ));
     }
 
-    // ---- Relocate the live volume pages (0..hwm) ----------------------
-    // Only the pages at/below the high-water mark hold live content; free
-    // space beyond it need not move. If the data location is unchanged there
-    // is nothing to relocate.
-    if booted_data_lba != old_data_lba {
-        let n_sectors = hwm * PAGE_SECTORS;
-        // Buffer the whole live region in RAM, then write it at the new base.
-        // This sidesteps any source/destination overlap between the two
-        // locations on the device. The live region is bounded by `hwm`
-        // (journal + catalog + rows), comfortably within the kernel heap.
-        let mut buf = vec![0u8; n_sectors as usize * SECTOR];
-        let mut off = 0u64;
-        while off < n_sectors {
-            let n = CHUNK_SECTORS.min(n_sectors - off);
-            let b = off as usize * SECTOR;
-            if let Err(e) = xhci::msc_read_blocks_slot(
-                target_slot_id,
-                (old_data_lba + off) as u32,
-                n as u16,
-                &mut buf[b..b + n as usize * SECTOR],
-            ) {
-                return report.fail(format!("read old volume at +{}: {}", off, e));
-            }
-            off += n;
-        }
-        let mut off = 0u64;
-        while off < n_sectors {
-            let n = CHUNK_SECTORS.min(n_sectors - off);
-            let b = off as usize * SECTOR;
-            if let Err(e) = xhci::msc_write_blocks(
-                target_slot_id,
-                (booted_data_lba + off) as u32,
-                n as u16,
-                &buf[b..b + n as usize * SECTOR],
-            ) {
-                return report.fail(format!("write relocated volume at +{}: {}", off, e));
-            }
-            off += n;
-        }
-        report.pages_relocated = hwm;
-    }
-
-    // ---- Re-stamp the superblock (sets new size + current version) ----
+    // ---- Rebuild a fresh CoW volume at the new data location ----------
+    // All old data is now in RAM, so writing the target region (which may
+    // overlap the old volume) is safe. The new volume is stamped with the
+    // current version by every anchor it writes.
     {
         let usb2 = match UsbMscDevice::open(target_slot_id) {
             Ok(d) => d,
-            Err(e) => return report.fail(format!("re-open USB after relocate: {:?}", e)),
+            Err(e) => return report.fail(format!("re-open USB to write volume: {:?}", e)),
         };
         let base = BaseOffsetDevice::new(usb2, booted_data_lba, new_vol_sectors);
-        let mut store = match Store::open(base) {
-            Ok(s) => s,
-            Err(e) => return report.fail(format!("mount relocated volume: {:?}", e)),
+        let mut newp = match Pager::format(base) {
+            Ok(p) => p,
+            Err(e) => return report.fail(format!("format new volume: {:?}", e)),
         };
-        if let Err(e) = store.finalize_upgrade(new_total_pages) {
-            return report.fail(format!("finalize (re-stamp superblock): {:?}", e));
+        if let Err(e) = migrate::rebuild_into(&mut newp, hwm, catalog_head, free_head, |lpn| {
+            Ok(pages[(lpn - FIRST_DATA_PAGE) as usize].clone())
+        }) {
+            return report.fail(format!("rebuild volume: {:?}", e));
         }
-        let _ = store.device_mut().flush();
+        let _ = newp.device_mut().flush();
+        report.pages_relocated = hwm.saturating_sub(FIRST_DATA_PAGE);
     }
 
     // ---- Write the new boot prefix, preserving the target's GUID ------
-    // Copy LBAs 0..booted_data_lba from the booted disk (primary IDE master),
-    // stamping the target's *existing* system GUID back into LBA 0 so the
-    // upgraded stick keeps its identity. The new MBR already carries this
-    // version and a data LBA of `booted_data_lba`, so it is self-consistent
-    // with the relocated volume.
+    // Copy LBAs 0..booted_data_lba from the disk we booted from, stamping the
+    // target's *existing* system GUID back into LBA 0 so the upgraded stick keeps
+    // its identity. The new MBR already carries this version and a data LBA of
+    // `booted_data_lba`, so it is self-consistent with the relocated volume.
+    let mut booted = match install::BootedReader::open(booted_sys_guid) {
+        Some(b) => b,
+        None => return report.fail("could not reach the booted disk to copy the boot prefix".into()),
+    };
     let mut chunk = vec![0u8; CHUNK_SECTORS as usize * SECTOR];
-    let mut sector = [0u8; SECTOR];
     let mut lba = 0u64;
     while lba < booted_data_lba {
         let n = CHUNK_SECTORS.min(booted_data_lba - lba);
-        for i in 0..n {
-            if !ata::read_sector_at(0x1F0, false, lba + i, &mut sector) {
-                return report.fail(format!("read booted disk sector {} failed", lba + i));
-            }
-            if lba + i == 0 {
-                sector[H_SYS_GUID..H_SYS_GUID + 16].copy_from_slice(&sys_guid);
-            }
-            let o = i as usize * SECTOR;
-            chunk[o..o + SECTOR].copy_from_slice(&sector);
+        if !booted.read(lba, n, &mut chunk[..n as usize * SECTOR]) {
+            return report.fail(format!("read booted disk sectors at {} failed", lba));
+        }
+        if lba == 0 {
+            chunk[H_SYS_GUID..H_SYS_GUID + 16].copy_from_slice(&sys_guid);
         }
         if let Err(e) = xhci::msc_write_blocks(
             target_slot_id,

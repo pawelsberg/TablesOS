@@ -84,9 +84,11 @@ impl<D: BlockDevice> Store<D> {
         })
     }
 
-    /// Allocator high-water mark — the count of pages at or below which all
-    /// live content (superblock, journal region, catalog, schema, rows, free
-    /// list) lives. The upgrade path relocates exactly pages `0..hwm`.
+    /// Allocator high-water mark — the next never-used **logical** page. All
+    /// live content (catalog, schema, rows, free list) is addressed by logical
+    /// pages below it; the upgrade path reads logical pages `0..hwm` to rebuild
+    /// the volume. (Under copy-on-write these are logical handles — their
+    /// physical locations are spread across the device, not a `0..hwm` prefix.)
     pub fn hwm(&self) -> u64 {
         self.pager.superblock().hwm
     }

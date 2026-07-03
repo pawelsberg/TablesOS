@@ -33,8 +33,17 @@ resolver = "2"
 # now rotate across their regions, and the journal-data images rotate too. The
 # on-disk geometry is unchanged and a v0.2.0 volume is read transparently, so
 # 0.2.0 → 0.3.0 is a no-op data migration (just a re-stamp + new boot code).
+#
+# v0.4.0: copy-on-write pager — eliminates ALL flash hot spots. A logical page no
+# longer has a fixed physical home; every commit writes changed pages to fresh
+# physical pages chosen by a cursor sweeping the whole device, then flips one
+# anchor record (rotating across a device-wide ring). This replaces the in-place
+# journal entirely. The on-disk format changes fundamentally, so a v0.3.0 volume
+# is migrated with data preserved by reading it through the frozen `compat_v3`
+# reader and rebuilding it into the new layout (see `migrate.rs` /
+# `kernel/src/upgrade.rs`).
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 
 # The kernel as an artifact dependency, compiled for bare metal. Because it is
 # a *normal* dependency, Cargo exposes `CARGO_BIN_FILE_KERNEL_kernel` to this

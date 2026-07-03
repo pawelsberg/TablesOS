@@ -65,7 +65,8 @@ const BODY_TOP: usize = PANEL_Y + fbm::EMBLEM_PX + 8;
 #[derive(Clone)]
 enum Action {
     CreateTable,
-    Shutdown,
+    /// Resolves the Power picker ("Shut down" / "Reboot").
+    PowerMenu,
     DeleteRow(String, RowId),
     DropTable(String),
     DropColumn(String, String),
@@ -856,10 +857,12 @@ impl<D: BlockDevice> App<D> {
                             action: Action::CreateTable,
                         });
                     }
-                    Key::Char('s') | Key::Char('S') => {
-                        nav = Nav::Push(Screen::Confirm {
-                            msg: "Shut down the computer?".into(),
-                            action: Action::Shutdown,
+                    Key::Char('p') | Key::Char('P') => {
+                        nav = Nav::Push(Screen::Pick {
+                            title: "Power".into(),
+                            options: alloc::vec!["Shut down".into(), "Reboot".into()],
+                            sel: 0,
+                            action: Action::PowerMenu,
                         });
                     }
                     Key::Char('d') | Key::Char('D') => {
@@ -874,15 +877,6 @@ impl<D: BlockDevice> App<D> {
                         );
                         nav = Nav::Push(Screen::Drives {
                             drives,
-                            sel: 0,
-                            top: 0,
-                        });
-                    }
-                    Key::Char('p') | Key::Char('P') => {
-                        let devices = pci::enumerate();
-                        self.status = format!("found {} PCI device(s)", devices.len());
-                        nav = Nav::Push(Screen::Pci {
-                            devices,
                             sel: 0,
                             top: 0,
                         });
@@ -920,20 +914,21 @@ impl<D: BlockDevice> App<D> {
                         // an older-or-equal, known version (never the booted disk,
                         // never a newer one) as upgrade targets.
                         let _ = xhci::autopilot_usb_drives(&self.booted_sys_guid);
+                        let upgradable = |d: &DriveInfo| -> bool {
+                            if d.booted {
+                                return false;
+                            }
+                            if let ata::MbrInfo::TablesOs { version, .. } = d.mbr {
+                                version <= tablestore::VERSION
+                                    && tablestore::migrate::is_known(version)
+                            } else {
+                                false
+                            }
+                        };
                         let candidates: Vec<(u8, DriveInfo)> =
                             xhci::usb_drives_with_slots(&self.booted_sys_guid)
                                 .into_iter()
-                                .filter(|(_, _, d)| {
-                                    if d.booted {
-                                        return false;
-                                    }
-                                    if let ata::MbrInfo::TablesOs { version, .. } = d.mbr {
-                                        version <= tablestore::VERSION
-                                            && tablestore::migrate::is_known(version)
-                                    } else {
-                                        false
-                                    }
-                                })
+                                .filter(|(_, _, d)| upgradable(d))
                                 .map(|(_, slot, d)| (slot, d))
                                 .collect();
                         if candidates.is_empty() {
@@ -1292,6 +1287,15 @@ impl<D: BlockDevice> App<D> {
                             "re-enumerated drives ({} present of {}; was {} of {})",
                             new_present, new_total, present_count, n
                         );
+                    }
+                    Key::Char('p') | Key::Char('P') => {
+                        let devices = pci::enumerate();
+                        self.status = format!("found {} PCI device(s)", devices.len());
+                        nav = Nav::Push(Screen::Pci {
+                            devices,
+                            sel: 0,
+                            top: 0,
+                        });
                     }
                     _ => {}
                 }
@@ -1839,6 +1843,13 @@ impl<D: BlockDevice> App<D> {
 
     fn resolve_pick(&mut self, action: Action, choice: String) {
         match action {
+            Action::PowerMenu => {
+                if choice == "Reboot" {
+                    reboot();
+                } else {
+                    shutdown();
+                }
+            }
             Action::AddColPickType(table, name) => {
                 let ty = Type::from_name(&choice).unwrap_or(Type::String);
                 // Spec: a freshly added column must be nullable; existing rows
@@ -1909,7 +1920,6 @@ impl<D: BlockDevice> App<D> {
 
     fn resolve_confirm(&mut self, action: Action) {
         match action {
-            Action::Shutdown => shutdown(),
             Action::DeleteRow(t, id) => match self.store.delete(&t, id) {
                 Ok(_) => self.status = "row deleted".into(),
                 Err(e) => self.err(e),
@@ -2884,7 +2894,7 @@ impl<D: BlockDevice> App<D> {
         let tables = self.store.list_tables().unwrap_or_default();
         let mut body = Vec::new();
         body.push(line(
-            "Tables  [↑↓] select  [Enter] open  [c]reate  [d]rives  [p]ci  [n]ew OS on USB  top [u]p USB  [a]bout  [s]hutdown",
+            "Tables  [↑↓] select  [Enter] open  [c]reate  [d]rives  [n]ew OS on USB  top [u]p USB  [a]bout  [p]ower",
             LineKind::Dim,
         ).hit(Hit::Shortcuts));
         body.push(line("", LineKind::Normal));
@@ -3544,7 +3554,7 @@ impl<D: BlockDevice> App<D> {
         };
         let mut body = Vec::new();
         body.push(line(
-            "[↑↓] select drive   [r] re-enumerate   [Esc] back",
+            "[↑↓] select drive   [r] re-enumerate   [p]ci   [Esc] back",
             LineKind::Dim,
         ).hit(Hit::Shortcuts));
         body.push(line(
@@ -5272,6 +5282,37 @@ fn column_for_error(cols: &[Column], fks: &[ForeignKey], e: &StoreError) -> usiz
 ///   3. **Halt with an explicit on-screen message** — so a machine that truly
 ///      can't self-power-off shows "safe to turn off" plus the ACPI failure
 ///      reason, instead of a frozen-looking UI (the laptop has no serial).
+fn reboot() -> ! {
+    use x86_64::instructions::port::Port;
+
+    x86_64::instructions::interrupts::disable();
+    fbm::with(|d| {
+        let (w, h) = (d.width(), d.height());
+        d.fill_rect(0, 0, w, h, fbm::C_BAR);
+        let x = MARGIN * 2;
+        d.draw_text_glow(x, h / 2 - CELL_H, "TABLESOS - REBOOTING", fbm::C_FG, fbm::C_GLOW, Font::Display);
+        d.draw_text(x, h / 2 + CELL_H, "Restarting...", fbm::C_DIM, Font::Body);
+        d.blit();
+    });
+
+    unsafe {
+        // 0xCF9 reset-control port (modern PCH): pulse RST_CPU|SYS_RST. This is
+        // the reliable hardware reset on real machines and QEMU.
+        let mut cf9 = Port::<u8>::new(0xCF9);
+        cf9.write(0x02);
+        cf9.write(0x06);
+        cf9.write(0x0E);
+        // Fall back to the legacy 8042 keyboard-controller pulse-reset line.
+        let mut kbd = Port::<u8>::new(0x64);
+        kbd.write(0xFE);
+    }
+    // Nothing reset us — halt (a triple fault would also reboot, but halting is
+    // safer than provoking undefined state).
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
 fn shutdown() -> ! {
     use x86_64::instructions::port::Port;
 

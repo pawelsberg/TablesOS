@@ -1,7 +1,8 @@
 //! Install a fresh TablesOS image onto another drive.
 //!
 //! Reads the booted disk's `[custom MBR | stage2 | kernel]` prefix
-//! verbatim via direct absolute-LBA ATA reads, stamps a fresh random
+//! verbatim via [`BootedReader`] (the actual boot device — IDE, xHCI or
+//! EHCI USB — not just the IDE master), stamps a fresh random
 //! 16-byte system GUID into the MBR header (offset 0x1AC), writes
 //! everything to the chosen target, then formats an empty TablesOS
 //! volume at the target's data-location LBA. Verifies by re-reading
@@ -21,7 +22,86 @@ use tablestore::journal::{FIRST_DATA_PAGE, PAGE_SECTORS};
 use tablestore::{BlockDevice, Result as TsResult, Store, StoreError};
 
 use crate::ata;
+use crate::usb::ehci;
 use crate::usb::xhci::{self, UsbMscDevice};
+
+/// A read handle to the disk the machine **booted from**, used to copy the
+/// `[MBR | stage2 | kernel]` boot prefix onto an install/upgrade target.
+///
+/// The boot prefix lives on whichever device the kernel started from — IDE
+/// (QEMU), an xHCI USB pendrive, or an EHCI USB pendrive (old machines). The
+/// original code read it from the primary IDE master unconditionally, which is
+/// correct only when booted from IDE; on a machine booted from USB that read
+/// fails and install/upgrade aborts with "read booted disk sector … failed".
+/// [`open`](BootedReader::open) resolves the actual boot device by matching the
+/// booted system GUID, so the prefix copy works regardless of how we booted.
+pub enum BootedReader {
+    /// Legacy ATA PIO, primary IDE master (QEMU's boot disk).
+    Ata,
+    Usb(UsbMscDevice),
+    Ehci(ehci::EhciMscDevice),
+}
+
+impl BootedReader {
+    /// Open a reader for the booted disk. Prefers the USB/EHCI drive whose MBR
+    /// system GUID matches `sys_guid` (a definitive identity match), and falls
+    /// back to the IDE master — the QEMU boot path, where the boot disk is not a
+    /// USB device. Returns `None` if no booted disk can be reached.
+    pub fn open(sys_guid: &[u8; 16]) -> Option<BootedReader> {
+        // xHCI: the enumerated drive flagged `booted` is the one we started from.
+        for (mmio, slot, di) in xhci::usb_drives_with_slots(sys_guid) {
+            if di.booted {
+                if let Ok(dev) = UsbMscDevice::open_with_identity_gate(mmio, slot, *sys_guid) {
+                    return Some(BootedReader::Usb(dev));
+                }
+            }
+        }
+        // EHCI (pre-xHCI machines): same identity gate inside find_boot_drive.
+        if let Some((dev, _total)) = ehci::find_boot_drive(sys_guid) {
+            return Some(BootedReader::Ehci(dev));
+        }
+        // IDE primary master: present in QEMU, absent on a USB-booting laptop.
+        let mut probe = [0u8; SECTOR];
+        if ata::read_sector_at(0x1F0, false, 0, &mut probe) {
+            return Some(BootedReader::Ata);
+        }
+        None
+    }
+
+    /// Read `count` sectors starting at absolute `lba` into `buf` (must be
+    /// `count * 512` bytes). Returns false on any I/O failure.
+    pub fn read(&mut self, lba: u64, count: u64, buf: &mut [u8]) -> bool {
+        let bytes = count as usize * SECTOR;
+        if buf.len() < bytes {
+            return false;
+        }
+        match self {
+            BootedReader::Ata => {
+                let mut s = [0u8; SECTOR];
+                for i in 0..count {
+                    if !ata::read_sector_at(0x1F0, false, lba + i, &mut s) {
+                        return false;
+                    }
+                    let off = i as usize * SECTOR;
+                    buf[off..off + SECTOR].copy_from_slice(&s);
+                }
+                true
+            }
+            BootedReader::Usb(dev) => dev.read_blocks(lba, &mut buf[..bytes]).is_ok(),
+            BootedReader::Ehci(dev) => {
+                let mut s = [0u8; SECTOR];
+                for i in 0..count {
+                    if dev.read_sector(lba + i, &mut s).is_err() {
+                        return false;
+                    }
+                    let off = i as usize * SECTOR;
+                    buf[off..off + SECTOR].copy_from_slice(&s);
+                }
+                true
+            }
+        }
+    }
+}
 
 /// Outcome of a single install attempt. Always returned (success or
 /// failure) so the UI can surface per-step status.
@@ -139,15 +219,15 @@ pub fn install_to_usb(
         }
     };
     let usb_total = usb.sector_count();
-    // The volume region (everything after the boot prefix) must hold at
-    // least the superblock + journal region + one data page, i.e.
-    // `FIRST_DATA_PAGE + 1` pages. Check up front so we fail fast with a
-    // clear message instead of after copying the whole prefix.
+    // The volume region (everything after the boot prefix) must hold at least
+    // the reserved low logical pages + one data page, i.e. `FIRST_DATA_PAGE + 1`
+    // pages (the copy-on-write pager's `format` guard). Check up front so we
+    // fail fast with a clear message instead of after copying the whole prefix.
     let min_volume_sectors = (FIRST_DATA_PAGE + 1) * PAGE_SECTORS;
     let need = data_lba + min_volume_sectors;
     if usb_total < need {
         report.message = format!(
-            "USB target too small: {} sectors ({} MiB); need >= {} ({} MiB) — {} for boot prefix + {} for the volume's journal region",
+            "USB target too small: {} sectors ({} MiB); need >= {} ({} MiB) — {} for boot prefix + {} for the volume's minimum reserved pages",
             usb_total,
             usb_total / 2048,
             need,
@@ -162,31 +242,32 @@ pub fn install_to_usb(
         return report;
     }
 
-    // Copy boot prefix (LBAs 0 .. data_lba) from booted disk (primary
-    // IDE master) to target, stamping the new system GUID into LBA 0.
-    // Batch into 64-sector (32 KiB) chunks so the whole prefix is a
-    // few dozen USB transfers rather than several thousand single-sector
-    // ones — much faster, and the SCSI write path frees its DMA buffer
-    // after each chunk.
+    // Copy boot prefix (LBAs 0 .. data_lba) from the disk we booted from to the
+    // target, stamping the new system GUID into LBA 0. Batch into 64-sector
+    // (32 KiB) chunks so the whole prefix is a few dozen USB transfers rather
+    // than several thousand single-sector ones — much faster, and the SCSI write
+    // path frees its DMA buffer after each chunk.
     // The prefix is written via the batched `xhci::msc_write_blocks`
     // rather than the per-sector `usb.write_sector`; `usb` is still used
     // afterwards for `flush` and as the `Store::format` backing device.
+    let mut booted = match BootedReader::open(booted_sys_guid) {
+        Some(b) => b,
+        None => {
+            report.message = "could not reach the booted disk to copy the boot prefix".into();
+            return report;
+        }
+    };
     const CHUNK_SECTORS: u64 = 64;
     let mut chunk = alloc::vec![0u8; CHUNK_SECTORS as usize * SECTOR];
-    let mut sector = [0u8; SECTOR];
     let mut lba = 0u64;
     while lba < data_lba {
         let n = CHUNK_SECTORS.min(data_lba - lba);
-        for i in 0..n {
-            if !ata::read_sector_at(0x1F0, false, lba + i, &mut sector) {
-                report.message = format!("read booted disk sector {} failed", lba + i);
-                return report;
-            }
-            if lba + i == 0 {
-                sector[0x1AC..0x1AC + 16].copy_from_slice(&new_sys_guid);
-            }
-            let off = i as usize * SECTOR;
-            chunk[off..off + SECTOR].copy_from_slice(&sector);
+        if !booted.read(lba, n, &mut chunk[..n as usize * SECTOR]) {
+            report.message = format!("read booted disk sectors at {} failed", lba);
+            return report;
+        }
+        if lba == 0 {
+            chunk[0x1AC..0x1AC + 16].copy_from_slice(&new_sys_guid);
         }
         if let Err(e) = xhci::msc_write_blocks(
             target_slot_id,
