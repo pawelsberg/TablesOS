@@ -67,6 +67,8 @@ enum Action {
     CreateTable,
     /// Resolves the Power picker ("Shut down" / "Reboot").
     PowerMenu,
+    /// Resolves the keyboard-layout picker (choice = layout display name).
+    KbdLayout,
     DeleteRow(String, RowId),
     DropTable(String),
     DropColumn(String, String),
@@ -802,6 +804,15 @@ impl<D: BlockDevice> App<D> {
             | Screen::About { .. }
             | Screen::FkPick { .. } => {}
         }
+        // Hotkey screens: a letter typed on a non-Latin layout (Greek) folds
+        // back to the Latin letter on the same physical key, so `[c]reate`,
+        // `[p]ower` … work regardless of the active layout. Text entry
+        // (Prompt/Editor/Builder) returned above and keeps the layout's
+        // characters.
+        let k = match k {
+            Key::Char(c) => Key::Char(crate::keymap::hotkey_fold(c)),
+            other => other,
+        };
         // Pull the current screen out so screen logic can freely borrow
         // `self` (the store). It is put back *before* any navigation, so a
         // pushed screen is never clobbered.
@@ -863,6 +874,20 @@ impl<D: BlockDevice> App<D> {
                             options: alloc::vec!["Shut down".into(), "Reboot".into()],
                             sel: 0,
                             action: Action::PowerMenu,
+                        });
+                    }
+                    Key::Char('k') | Key::Char('K') => {
+                        let options: Vec<String> =
+                            crate::keymap::layout_names().map(String::from).collect();
+                        let sel = options
+                            .iter()
+                            .position(|n| n == crate::keymap::active_name())
+                            .unwrap_or(0);
+                        nav = Nav::Push(Screen::Pick {
+                            title: "Keyboard layout".into(),
+                            options,
+                            sel,
+                            action: Action::KbdLayout,
                         });
                     }
                     Key::Char('d') | Key::Char('D') => {
@@ -1781,6 +1806,18 @@ impl<D: BlockDevice> App<D> {
             Action::CreateTable => match self.store.create_table(&text) {
                 Ok(_) => {
                     self.status = format!("created table '{text}'");
+                    // Stack a Browser under the Schema Editor so that leaving
+                    // the column-definition step lands in the new table, not
+                    // back on the table list.
+                    self.push(Screen::Browser {
+                        table: text.clone(),
+                        row: 0,
+                        col: 0,
+                        top: 0,
+                        col_off: 0,
+                        filter: None,
+                        sort: None,
+                    });
                     self.push(Screen::Schema {
                         table: text,
                         sel: 0,
@@ -1848,6 +1885,13 @@ impl<D: BlockDevice> App<D> {
                     reboot();
                 } else {
                     shutdown();
+                }
+            }
+            Action::KbdLayout => {
+                if crate::keymap::set_layout(&choice) {
+                    self.status = format!("keyboard layout: {choice}");
+                } else {
+                    self.status = "unknown keyboard layout".into();
                 }
             }
             Action::AddColPickType(table, name) => {
@@ -2894,7 +2938,7 @@ impl<D: BlockDevice> App<D> {
         let tables = self.store.list_tables().unwrap_or_default();
         let mut body = Vec::new();
         body.push(line(
-            "Tables  [↑↓] select  [Enter] open  [c]reate  [d]rives  [n]ew OS on USB  top [u]p USB  [a]bout  [p]ower",
+            "Tables  [↑↓] select  [Enter] open  [c]reate  [d]rives  [n]ew OS on USB  top [u]p USB  [k]eyboard  [a]bout  [p]ower",
             LineKind::Dim,
         ).hit(Hit::Shortcuts));
         body.push(line("", LineKind::Normal));

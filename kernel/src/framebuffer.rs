@@ -160,12 +160,19 @@ struct GlyphAtlas {
 }
 
 /// Atlas cell index for a code point, matching the layout in `ASSET_PROMPTS.md`
-/// (ASCII `0x20`..=`0x7E` then the specials the UI uses). `None` => not in the
-/// atlas, use the 8×8 fallback.
+/// (ASCII `0x20`..=`0x7E`, the specials the UI uses, then the keyboard-layout
+/// blocks: currency/accents, the Greek block in code-point order, Polish).
+/// `None` => not in the atlas, use the 8×8 fallback. A mapped-but-blank cell
+/// (unassigned holes inside the Greek range) also falls back via `filled`.
 fn atlas_cell(ch: char) -> Option<usize> {
     let c = ch as u32;
     if (0x20..=0x7E).contains(&c) {
         return Some((c - 0x20) as usize);
+    }
+    // Greek: tonos ΄ / dialytika-tonos ΅ / accented capitals / Α–Ω / α–ω /
+    // accented vowels — one contiguous code-point run, cells 112..=186.
+    if (0x0384..=0x03CE).contains(&c) {
+        return Some(112 + (c - 0x0384) as usize);
     }
     Some(match c {
         0x00B5 => 96,  // µ
@@ -177,6 +184,30 @@ fn atlas_cell(ch: char) -> Option<usize> {
         0x2192 => 102, // →
         0x2193 => 103, // ↓
         0x2BA1 => 104, // ⮡
+        0x00A3 => 105, // £
+        0x00AC => 106, // ¬
+        0x20AC => 107, // €
+        0x00A6 => 108, // ¦
+        0x00A8 => 109, // ¨
+        // Polish, cells 187..=204.
+        0x0104 => 187, // Ą
+        0x0105 => 188, // ą
+        0x0106 => 189, // Ć
+        0x0107 => 190, // ć
+        0x0118 => 191, // Ę
+        0x0119 => 192, // ę
+        0x0141 => 193, // Ł
+        0x0142 => 194, // ł
+        0x0143 => 195, // Ń
+        0x0144 => 196, // ń
+        0x00D3 => 197, // Ó
+        0x00F3 => 198, // ó
+        0x015A => 199, // Ś
+        0x015B => 200, // ś
+        0x0179 => 201, // Ź
+        0x017A => 202, // ź
+        0x017B => 203, // Ż
+        0x017C => 204, // ż
         _ => return None,
     })
 }
@@ -458,8 +489,10 @@ impl Display {
         let bw = font::GLYPH_W * scale;
         let bh = font::GLYPH_H * scale;
         let info = self.info;
-        let lookup = if font == Font::Display && ch.is_ascii_lowercase() {
-            ((ch as u8) - 0x20) as char
+        // Display face is all-caps chrome: Unicode-fold so ż→Ż and α→Α (the
+        // 8×8 fallback in `font.rs` applies the same fold).
+        let lookup = if font == Font::Display {
+            ch.to_uppercase().next().unwrap_or(ch)
         } else {
             ch
         };
@@ -512,11 +545,17 @@ impl Display {
     /// cell grid (see `ASSET_PROMPTS.md`); a size that isn't an exact multiple
     /// is rejected and the 8×8 font stays in use.
     pub fn set_atlas(&mut self, w: usize, h: usize, rgba: Vec<u8>) {
-        let (cols, rows) = (16usize, 7usize);
-        if w == 0 || h == 0 || w % cols != 0 || h % rows != 0 || rgba.len() < w * h * 4 {
+        // 16 columns of square cells; the row count comes from the image
+        // height, so the atlas can grow more glyph rows without a code change.
+        let cols = 16usize;
+        if w == 0 || h == 0 || w % cols != 0 || rgba.len() < w * h * 4 {
             return;
         }
-        let (cellw, cellh) = (w / cols, h / rows);
+        let (cellw, cellh) = (w / cols, w / cols);
+        if h % cellh != 0 {
+            return;
+        }
+        let rows = h / cellh;
         let mut cov = vec![0u8; w * h];
         for (i, c) in cov.iter_mut().enumerate() {
             // White-on-black: coverage = brightest channel.

@@ -1452,13 +1452,17 @@ fn service_keyboard(st: &mut XhciState, idx: usize, cc: u8) {
     }
     let armed_ok = cc == 1 || cc == 13;
     if armed_ok {
-        let shift = report[0] & 0x22 != 0;
+        // HID modifier byte: bit1/5 = Shift, bit6 = Right Alt (AltGr).
+        let mods = crate::keymap::Mods {
+            shift: report[0] & 0x22 != 0,
+            altgr: report[0] & 0x40 != 0,
+        };
         for i in 2..8 {
             let usage = report[i];
             if usage < 4 || last[2..8].contains(&usage) {
                 continue; // empty/rollover, or held since the last report
             }
-            if let Some(key) = super::ehci::hid_usage_to_key(usage, shift) {
+            if let Some(key) = crate::keymap::translate(usage, mods) {
                 crate::ps2::feed_key(key);
             }
         }

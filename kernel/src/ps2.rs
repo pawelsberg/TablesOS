@@ -40,6 +40,7 @@ pub enum Event {
 
 struct Kbd {
     shift: bool,
+    altgr: bool,
     extended: bool,
 }
 
@@ -88,6 +89,7 @@ impl EventRing {
 static QUEUE: Mutex<EventRing> = Mutex::new(EventRing::new());
 static KBD: Mutex<Kbd> = Mutex::new(Kbd {
     shift: false,
+    altgr: false,
     extended: false,
 });
 
@@ -158,63 +160,32 @@ pub fn on_keyboard_byte(code: u8) {
     let ext = k.extended;
     k.extended = false;
 
-    // Shift state.
-    if make == 0x2A || make == 0x36 {
+    // Modifier state. Right Alt is `E0 38` (AltGr); plain `38` is left Alt.
+    if !ext && (make == 0x2A || make == 0x36) {
         k.shift = !released;
+        return;
+    }
+    if ext && make == 0x38 {
+        k.altgr = !released;
         return;
     }
     if released {
         return;
     }
-    let shift = k.shift;
+    let mods = crate::keymap::Mods {
+        shift: k.shift,
+        altgr: k.altgr,
+    };
     drop(k);
 
-    if ext {
-        let key = match make {
-            0x48 => Key::Up,
-            0x50 => Key::Down,
-            0x4B => Key::Left,
-            0x4D => Key::Right,
-            0x47 => Key::Home,
-            0x4F => Key::End,
-            0x53 => Key::Delete,
-            0x49 => Key::PageUp,
-            0x51 => Key::PageDown,
-            _ => return,
-        };
-        push(Event::Key(key));
+    // Everything else goes through the shared layout engine: scancode → HID
+    // usage → (layout, modifiers) → Key. `translate` is heap-free, so it is
+    // safe here inside the keyboard IRQ.
+    let Some(usage) = crate::keymap::ps2_to_usage(make, ext) else {
         return;
-    }
-    let ev = match make {
-        0x1C => Key::Enter,
-        0x01 => Key::Esc,
-        0x0E => Key::Backspace,
-        0x0F => Key::Tab,
-        _ => {
-            if let Some(c) = scancode_char(make, shift) {
-                Key::Char(c)
-            } else {
-                return;
-            }
-        }
     };
-    push(Event::Key(ev));
-}
-
-fn scancode_char(code: u8, shift: bool) -> Option<char> {
-    const LOW: &[u8] = b"\
-\x00\x001234567890-=\x00\x00qwertyuiop[]\x00\x00asdfghjkl;'`\x00\\zxcvbnm,./";
-    const UP: &[u8] = b"\
-\x00\x00!@#$%^&*()_+\x00\x00QWERTYUIOP{}\x00\x00ASDFGHJKL:\"~\x00|ZXCVBNM<>?";
-    if code == 0x39 {
-        return Some(' ');
-    }
-    let table = if shift { UP } else { LOW };
-    let i = code as usize;
-    if i < table.len() && table[i] != 0 {
-        Some(table[i] as char)
-    } else {
-        None
+    if let Some(key) = crate::keymap::translate(usage, mods) {
+        push(Event::Key(key));
     }
 }
 

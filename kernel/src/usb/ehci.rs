@@ -1297,7 +1297,11 @@ fn decode_keyboard(h: &mut HidDev, report: &[u8]) {
     if report.len() < 8 {
         return;
     }
-    let shift = report[0] & 0x22 != 0;
+    // HID modifier byte: bit1/5 = Shift, bit6 = Right Alt (AltGr).
+    let mods = crate::keymap::Mods {
+        shift: report[0] & 0x22 != 0,
+        altgr: report[0] & 0x40 != 0,
+    };
     // Edge detection: emit a key once when its usage appears in the report.
     for i in 2..8 {
         let usage = report[i];
@@ -1307,56 +1311,11 @@ fn decode_keyboard(h: &mut HidDev, report: &[u8]) {
         if h.last[2..8].contains(&usage) {
             continue; // still held from the previous poll
         }
-        if let Some(key) = hid_usage_to_key(usage, shift) {
+        if let Some(key) = crate::keymap::translate(usage, mods) {
             crate::ps2::feed_key(key);
         }
     }
     h.last.copy_from_slice(&report[..8]);
-}
-
-/// HID boot-keyboard usage → the kernel's key events (US layout, mirroring
-/// the PS/2 scancode tables in `ps2.rs`).
-pub(crate) fn hid_usage_to_key(usage: u8, shift: bool) -> Option<crate::ps2::Key> {
-    use crate::ps2::Key;
-    let ch = |a: char, b: char| Some(Key::Char(if shift { b } else { a }));
-    match usage {
-        0x04..=0x1D => {
-            let c = (b'a' + usage - 0x04) as char;
-            Some(Key::Char(if shift { c.to_ascii_uppercase() } else { c }))
-        }
-        0x1E..=0x27 => {
-            const PLAIN: [char; 10] = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'];
-            const SHIFTED: [char; 10] = ['!', '@', '#', '$', '%', '^', '&', '*', '(', ')'];
-            let i = (usage - 0x1E) as usize;
-            Some(Key::Char(if shift { SHIFTED[i] } else { PLAIN[i] }))
-        }
-        0x28 => Some(Key::Enter),
-        0x29 => Some(Key::Esc),
-        0x2A => Some(Key::Backspace),
-        0x2B => Some(Key::Tab),
-        0x2C => Some(Key::Char(' ')),
-        0x2D => ch('-', '_'),
-        0x2E => ch('=', '+'),
-        0x2F => ch('[', '{'),
-        0x30 => ch(']', '}'),
-        0x31 => ch('\\', '|'),
-        0x33 => ch(';', ':'),
-        0x34 => ch('\'', '"'),
-        0x35 => ch('`', '~'),
-        0x36 => ch(',', '<'),
-        0x37 => ch('.', '>'),
-        0x38 => ch('/', '?'),
-        0x4A => Some(Key::Home),
-        0x4B => Some(Key::PageUp),
-        0x4C => Some(Key::Delete),
-        0x4D => Some(Key::End),
-        0x4E => Some(Key::PageDown),
-        0x4F => Some(Key::Right),
-        0x50 => Some(Key::Left),
-        0x51 => Some(Key::Down),
-        0x52 => Some(Key::Up),
-        _ => None,
-    }
 }
 
 // ---- BlockDevice ----------------------------------------------------------------------

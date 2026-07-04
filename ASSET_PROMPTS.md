@@ -171,8 +171,10 @@ lines. Architectural, precise, "the structure behind the data".
 
 ### 2.1 Exact atlas layout (the kernel reads this fixed grid)
 
-- **Grid:** 16 columns × 7 rows of glyph cells.
-- **Cell size:** **32 × 32 px** per glyph → total image **512 × 224 px**.
+- **Grid:** 16 columns × 13 rows of glyph cells. (The kernel derives the row
+  count from the image height — square cells, `cellh = width / 16` — so more
+  rows can be appended without a code change.)
+- **Cell size:** **32 × 32 px** per glyph → total image **512 × 416 px**.
 - **Monospace, fills the cell width:** every glyph centered in its own 32×32
   cell, identical advance. The kernel maps each square cell into a square
   on-screen box, so a tall-narrow face left at its natural width looks sparse
@@ -183,22 +185,31 @@ lines. Architectural, precise, "the structure behind the data".
   UI color at draw time, so do **not** color the glyphs.
 - **Order:** cell index `= codepoint − 0x20`, filled **left-to-right,
   top-to-bottom**. Rows 0–5 are ASCII `0x20`–`0x7E`; cell 95 (DEL) is blank;
-  row 6 holds the special glyphs the UI uses, in this order:
+  the remaining rows hold the non-ASCII glyphs, in this order:
 
 ```
-Row 0:  (space) ! " # $ % & ' ( ) * + , - . /
-Row 1:  0 1 2 3 4 5 6 7 8 9 : ; < = > ?
-Row 2:  @ A B C D E F G H I J K L M N O
-Row 3:  P Q R S T U V W X Y Z [ \ ] ^ _
-Row 4:  `(backtick) a b c d e f g h i j k l m n o
-Row 5:  p q r s t u v w x y z { | } ~ (blank)
-Row 6:  µ × — … ← ↑ → ↓ ⮡  (then 7 blank cells)
+Row 0:   (space) ! " # $ % & ' ( ) * + , - . /
+Row 1:   0 1 2 3 4 5 6 7 8 9 : ; < = > ?
+Row 2:   @ A B C D E F G H I J K L M N O
+Row 3:   P Q R S T U V W X Y Z [ \ ] ^ _
+Row 4:   `(backtick) a b c d e f g h i j k l m n o
+Row 5:   p q r s t u v w x y z { | } ~ (blank)
+Row 6:   µ × — … ← ↑ → ↓ ⮡ £ ¬ € ¦ ¨ (2 blank)
+Rows 7–11 (cells 112–186): the Greek block U+0384–U+03CE in code-point
+         order — ΄ ΅ Ά · Έ Ή Ί (blank) Ό (blank) Ύ Ώ ΐ, capitals Α–Ρ,
+         (blank at unassigned U+03A2), Σ–Ω, Ϊ Ϋ ά έ ή ί ΰ, lower α–ω,
+         ϊ ϋ ό ύ ώ. The three blanks are unassigned code points.
+Row 11/12 (cells 187–204): Polish — Ą ą Ć ć Ę ę Ł ł Ń ń Ó ó Ś ś Ź ź Ż ż,
+         then 3 blank cells.
 ```
 
-(`µ` U+00B5, `×` U+00D7, `—` U+2014, `…` U+2026, `←` U+2190, `↑` U+2191,
-`→` U+2192, `↓` U+2193, `⮡` U+2BA1.) These are every non-ASCII glyph `ui.rs`
-renders — the built-in 8×8 face is currently **missing `µ` and `×`**, so the
-atlas is also a coverage fix.
+(Cell numbering for the specials: `µ` 96, `×` 97, `—` 98, `…` 99, `←` 100,
+`↑` 101, `→` 102, `↓` 103, `⮡` 104, `£` 105, `¬` 106, `€` 107, `¦` 108,
+`¨` 109. Greek: cell `= 112 + codepoint − 0x384`. These match
+`atlas_cell` in `kernel/src/framebuffer.rs` — keep the two in sync.) The
+ASCII rows cover the UI chrome; the Greek and Polish blocks cover everything
+the keyboard layouts (`kernel/src/keymap.rs`) can type, plus `£ ¬ € ¦` from
+the UK layout.
 
 ### 2.2 Generation prompt (best-effort, expect cleanup)
 
@@ -233,7 +244,7 @@ same atlas from any installed monospace face with this PowerShell one-shot
 
 ```powershell
 Add-Type -AssemblyName System.Drawing
-$cell=32; $cols=16; $rows=7
+$cell=32; $cols=16; $rows=13
 $bmp=New-Object System.Drawing.Bitmap (($cols*$cell),($rows*$cell))
 $g=[System.Drawing.Graphics]::FromImage($bmp)
 $g.Clear([System.Drawing.Color]::Black)
@@ -245,13 +256,18 @@ $font=New-Object System.Drawing.Font('Cascadia Mono',$size,[System.Drawing.FontS
 $fmt=New-Object System.Drawing.StringFormat
 $fmt.Alignment='Center'; $fmt.LineAlignment='Center'
 $white=[System.Drawing.Brushes]::White
-# codepoints in atlas order: ASCII 0x20..0x7E, then cell 95 (DEL) left blank,
-# then the specials at cell 96+ — this gap is mandatory: the kernel's
-# `atlas_cell` maps µ→96, ←→100, →→102, …, so packing µ into cell 95 shifts
-# every special glyph (all the arrows) one cell early.
+# Codepoints in atlas order (see §2.1 / `atlas_cell` in framebuffer.rs).
+# -1 = intentionally blank cell; the gaps are mandatory — the kernel maps
+# cells by fixed index, so packing them shifts every glyph after the gap.
 $cps=@(); 0x20..0x7E | ForEach-Object { $cps+=$_ }
 $cps+=-1   # cell 95 (DEL): intentionally blank
-$cps+=@(0xB5,0xD7,0x2014,0x2026,0x2190,0x2191,0x2192,0x2193,0x2BA1)
+$cps+=@(0xB5,0xD7,0x2014,0x2026,0x2190,0x2191,0x2192,0x2193,0x2BA1)  # 96..104
+$cps+=@(0xA3,0xAC,0x20AC,0xA6,0xA8,-1,-1)                            # 105..111
+0x384..0x3CE | ForEach-Object {                                      # 112..186
+  if ($_ -in 0x38B,0x38D,0x3A2) { $cps+=-1 } else { $cps+=$_ }       #  (holes)
+}
+$cps+=@(0x104,0x105,0x106,0x107,0x118,0x119,0x141,0x142,0x143,0x144,
+        0xD3,0xF3,0x15A,0x15B,0x179,0x17A,0x17B,0x17C)               # 187..204
 for($i=0;$i -lt $cps.Count;$i++){
   if($cps[$i] -lt 0x20){ continue }   # leave DEL / placeholder cells blank
   $ch=[char]::ConvertFromUtf32($cps[$i])

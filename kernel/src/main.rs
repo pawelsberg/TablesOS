@@ -27,6 +27,7 @@ mod framebuffer;
 mod gdt;
 mod install;
 mod interrupts;
+mod keymap;
 mod pci;
 mod ps2;
 mod rtc;

@@ -30,9 +30,10 @@ pub enum Font {
 /// Replacement glyph (a hollow box) for code points with no bitmap.
 const NOTDEF: [u8; 8] = [0x7E, 0x42, 0x42, 0x42, 0x42, 0x42, 0x7E, 0x00];
 
-/// Non-ASCII glyphs the application actually renders (arrows, dashes,
-/// ellipsis). Kept exhaustive with the code points used in `ui.rs` so nothing
-/// shows as the replacement box. Bit 0 is the left-most pixel.
+/// Non-ASCII glyphs the application actually renders: UI symbols (arrows,
+/// dashes, ellipsis), the drawn Greek capitals, and the keyboard-layout
+/// characters that can't be composed from a base + accent. Bit 0 is the
+/// left-most pixel.
 #[rustfmt::skip]
 mod extra {
     pub const EM_DASH:   [u8; 8] = [0x00,0x00,0x00,0x00,0xFF,0x00,0x00,0x00]; // U+2014 —
@@ -42,63 +43,230 @@ mod extra {
     pub const ARROW_R:   [u8; 8] = [0x00,0x20,0x40,0xBF,0xBF,0x40,0x20,0x00]; // U+2192 →
     pub const ARROW_D:   [u8; 8] = [0x18,0x18,0x18,0x18,0x18,0x7E,0x3C,0x18]; // U+2193 ↓
     pub const ARROW_RET: [u8; 8] = [0x04,0x04,0x24,0xFC,0x20,0x00,0x00,0x00]; // U+2BA1 ⮡
+
+    // Greek capitals with no Latin lookalike.
+    pub const CAP_GAMMA:  [u8; 8] = [0x3F,0x03,0x03,0x03,0x03,0x03,0x03,0x00]; // Γ
+    pub const CAP_DELTA:  [u8; 8] = [0x08,0x1C,0x1C,0x36,0x36,0x63,0x7F,0x00]; // Δ
+    pub const CAP_THETA:  [u8; 8] = [0x1C,0x36,0x63,0x7F,0x63,0x36,0x1C,0x00]; // Θ
+    pub const CAP_LAMBDA: [u8; 8] = [0x08,0x1C,0x1C,0x36,0x36,0x63,0x63,0x00]; // Λ
+    pub const CAP_XI:     [u8; 8] = [0x3F,0x00,0x00,0x1E,0x00,0x00,0x3F,0x00]; // Ξ
+    pub const CAP_PI:     [u8; 8] = [0x3F,0x33,0x33,0x33,0x33,0x33,0x33,0x00]; // Π
+    pub const CAP_SIGMA:  [u8; 8] = [0x3F,0x06,0x0C,0x18,0x0C,0x06,0x3F,0x00]; // Σ
+    pub const CAP_PHI:    [u8; 8] = [0x0C,0x1E,0x33,0x33,0x33,0x1E,0x0C,0x00]; // Φ
+    pub const CAP_PSI:    [u8; 8] = [0x49,0x49,0x49,0x3E,0x08,0x08,0x08,0x00]; // Ψ
+    pub const CAP_OMEGA:  [u8; 8] = [0x3E,0x63,0x63,0x63,0x36,0x36,0x77,0x00]; // Ω
+
+    // Polish stroked L (a diagonal through the stem, not an above-accent).
+    pub const L_STROKE:     [u8; 8] = [0x0E,0x0C,0x1C,0x0E,0x0C,0x0C,0x1E,0x00]; // ł
+    pub const CAP_L_STROKE: [u8; 8] = [0x0F,0x06,0x0E,0x07,0x46,0x66,0x7F,0x00]; // Ł
+
+    // Currency / logic signs for the UK layout.
+    pub const POUND:    [u8; 8] = [0x1C,0x36,0x06,0x1F,0x06,0x06,0x3F,0x00]; // £
+    pub const NOT_SIGN: [u8; 8] = [0x00,0x00,0x3F,0x30,0x30,0x00,0x00,0x00]; // ¬
+    pub const EURO:     [u8; 8] = [0x3C,0x66,0x06,0x1F,0x06,0x1F,0x66,0x3C]; // €
+
+    // Spacing Greek accents (dead key followed by space).
+    pub const TONOS:           [u8; 8] = [0x30,0x0C,0x00,0x00,0x00,0x00,0x00,0x00]; // ΄
+    pub const DIALYTIKA:       [u8; 8] = [0x36,0x00,0x00,0x00,0x00,0x00,0x00,0x00]; // ¨
+    pub const TONOS_DIALYTIKA: [u8; 8] = [0x36,0x08,0x00,0x00,0x00,0x00,0x00,0x00]; // ΅
 }
 
 /// Return the 8×8 bitmap for `ch` in `font`. Each byte is one row; bit 0 is
-/// the left-most pixel.
-pub fn glyph(font: Font, ch: char) -> &'static [u8; 8] {
+/// the left-most pixel. Returned by value: accented letters (Polish, Greek
+/// tonos/dialytika) are composed on the fly from a base glyph + accent.
+pub fn glyph(font: Font, ch: char) -> [u8; 8] {
     match font {
         Font::Body => body_glyph(ch),
         Font::Display => display_glyph(ch),
     }
 }
 
-/// The body face: `font8x8` basic, with the shared non-ASCII extras.
-fn body_glyph(ch: char) -> &'static [u8; 8] {
+/// The body face: `font8x8` basic + the Greek block + composed accented
+/// letters + the shared non-ASCII extras.
+fn body_glyph(ch: char) -> [u8; 8] {
+    if let Some(g) = base_bitmap(ch) {
+        return *g;
+    }
+    if let Some(g) = composed(ch) {
+        return g;
+    }
+    NOTDEF
+}
+
+/// Static bitmap for a code point, if one exists.
+fn base_bitmap(ch: char) -> Option<&'static [u8; 8]> {
     let c = ch as u32;
     if (0x20..0x7F).contains(&c) {
-        return &BASIC[(c - 0x20) as usize];
+        return Some(&BASIC[(c - 0x20) as usize]);
     }
+    // Greek lower-case block α..ω (with ς in the middle).
+    if (0x3B1..=0x3C9).contains(&c) {
+        return Some(&GREEK_LOW[(c - 0x3B1) as usize]);
+    }
+    // Greek capitals that coincide with a Latin letter reuse its bitmap.
+    let latin = |l: u8| Some(&BASIC[(l - 0x20) as usize]);
     match c {
-        0x2014 => &extra::EM_DASH,
-        0x2026 => &extra::ELLIPSIS,
-        0x2190 => &extra::ARROW_L,
-        0x2191 => &extra::ARROW_U,
-        0x2192 => &extra::ARROW_R,
-        0x2193 => &extra::ARROW_D,
-        0x2BA1 => &extra::ARROW_RET,
-        _ => &NOTDEF,
+        0x391 => latin(b'A'),
+        0x392 => latin(b'B'),
+        0x395 => latin(b'E'),
+        0x396 => latin(b'Z'),
+        0x397 => latin(b'H'),
+        0x399 => latin(b'I'),
+        0x39A => latin(b'K'),
+        0x39C => latin(b'M'),
+        0x39D => latin(b'N'),
+        0x39F => latin(b'O'),
+        0x3A1 => latin(b'P'),
+        0x3A4 => latin(b'T'),
+        0x3A5 => latin(b'Y'),
+        0x3A7 => latin(b'X'),
+        0x393 => Some(&extra::CAP_GAMMA),
+        0x394 => Some(&extra::CAP_DELTA),
+        0x398 => Some(&extra::CAP_THETA),
+        0x39B => Some(&extra::CAP_LAMBDA),
+        0x39E => Some(&extra::CAP_XI),
+        0x3A0 => Some(&extra::CAP_PI),
+        0x3A3 => Some(&extra::CAP_SIGMA),
+        0x3A6 => Some(&extra::CAP_PHI),
+        0x3A8 => Some(&extra::CAP_PSI),
+        0x3A9 => Some(&extra::CAP_OMEGA),
+        0x0141 => Some(&extra::CAP_L_STROKE), // Ł
+        0x0142 => Some(&extra::L_STROKE),     // ł
+        0x00A3 => Some(&extra::POUND),        // £
+        0x00AC => Some(&extra::NOT_SIGN),     // ¬
+        0x20AC => Some(&extra::EURO),         // €
+        0x00A6 => latin(b'|'),                // ¦ (the | glyph already has the gap)
+        0x00A8 => Some(&extra::DIALYTIKA),    // ¨
+        0x0384 => Some(&extra::TONOS),        // ΄
+        0x0385 => Some(&extra::TONOS_DIALYTIKA), // ΅
+        0x2014 => Some(&extra::EM_DASH),
+        0x2026 => Some(&extra::ELLIPSIS),
+        0x2190 => Some(&extra::ARROW_L),
+        0x2191 => Some(&extra::ARROW_U),
+        0x2192 => Some(&extra::ARROW_R),
+        0x2193 => Some(&extra::ARROW_D),
+        0x2BA1 => Some(&extra::ARROW_RET),
+        _ => None,
     }
+}
+
+/// Diacritics drawn over (or under) a base glyph.
+#[derive(Clone, Copy, PartialEq)]
+enum Accent {
+    Acute, // also the Greek tonos
+    DotAbove,
+    Diaeresis, // also the Greek dialytika
+    DiaeresisAcute,
+    Ogonek,
+}
+
+/// Accented letters composed as base glyph + accent: `(char, base, accent)`.
+const COMPOSED: &[(char, char, Accent)] = &[
+    ('ą', 'a', Accent::Ogonek),
+    ('Ą', 'A', Accent::Ogonek),
+    ('ę', 'e', Accent::Ogonek),
+    ('Ę', 'E', Accent::Ogonek),
+    ('ć', 'c', Accent::Acute),
+    ('Ć', 'C', Accent::Acute),
+    ('ń', 'n', Accent::Acute),
+    ('Ń', 'N', Accent::Acute),
+    ('ó', 'o', Accent::Acute),
+    ('Ó', 'O', Accent::Acute),
+    ('ś', 's', Accent::Acute),
+    ('Ś', 'S', Accent::Acute),
+    ('ź', 'z', Accent::Acute),
+    ('Ź', 'Z', Accent::Acute),
+    ('ż', 'z', Accent::DotAbove),
+    ('Ż', 'Z', Accent::DotAbove),
+    ('ά', 'α', Accent::Acute),
+    ('έ', 'ε', Accent::Acute),
+    ('ή', 'η', Accent::Acute),
+    ('ί', 'ι', Accent::Acute),
+    ('ό', 'ο', Accent::Acute),
+    ('ύ', 'υ', Accent::Acute),
+    ('ώ', 'ω', Accent::Acute),
+    ('Ά', 'Α', Accent::Acute),
+    ('Έ', 'Ε', Accent::Acute),
+    ('Ή', 'Η', Accent::Acute),
+    ('Ί', 'Ι', Accent::Acute),
+    ('Ό', 'Ο', Accent::Acute),
+    ('Ύ', 'Υ', Accent::Acute),
+    ('Ώ', 'Ω', Accent::Acute),
+    ('ϊ', 'ι', Accent::Diaeresis),
+    ('ϋ', 'υ', Accent::Diaeresis),
+    ('Ϊ', 'Ι', Accent::Diaeresis),
+    ('Ϋ', 'Υ', Accent::Diaeresis),
+    ('ΐ', 'ι', Accent::DiaeresisAcute),
+    ('ΰ', 'υ', Accent::DiaeresisAcute),
+];
+
+/// Build an accented glyph. Ogonek hooks below (row 7 is free on every base
+/// that takes one). Above-accents: an x-height base has rows 0–1 free for the
+/// accent; a full-height base (capitals) is first shifted down one row into
+/// its empty row 7 to make headroom.
+fn composed(ch: char) -> Option<[u8; 8]> {
+    let &(_, base, accent) = COMPOSED.iter().find(|&&(c, _, _)| c == ch)?;
+    let mut g = *base_bitmap(base)?;
+    if accent == Accent::Ogonek {
+        g[7] |= 0x30;
+        return Some(g);
+    }
+    if g[0] | g[1] != 0 {
+        for r in (1..8).rev() {
+            g[r] = g[r - 1];
+        }
+        g[0] = match accent {
+            Accent::Acute => 0x30,
+            Accent::DotAbove => 0x0C,
+            Accent::Diaeresis | Accent::DiaeresisAcute => 0x36,
+            Accent::Ogonek => unreachable!(),
+        };
+    } else {
+        match accent {
+            Accent::Acute => {
+                g[0] |= 0x30;
+                g[1] |= 0x0C;
+            }
+            Accent::DotAbove => g[1] |= 0x0C,
+            Accent::Diaeresis => g[1] |= 0x36,
+            Accent::DiaeresisAcute => {
+                g[0] |= 0x08;
+                g[1] |= 0x36;
+            }
+            Accent::Ogonek => unreachable!(),
+        }
+    }
+    Some(g)
 }
 
 /// The display face: bold geometric capitals + digits + the punctuation that
 /// shows up in chrome. Lower-case folds to upper-case; anything undefined
 /// falls back to the body face so layout never breaks.
-fn display_glyph(ch: char) -> &'static [u8; 8] {
-    let mut c = ch as u32;
-    if (0x61..=0x7A).contains(&c) {
-        c -= 0x20; // a–z → A–Z
-    }
+fn display_glyph(ch: char) -> [u8; 8] {
+    // Unicode-aware case fold so ż→Ż and α→Α keep the all-caps chrome
+    // convention (`core`'s table; ASCII a–z included).
+    let ch = ch.to_uppercase().next().unwrap_or(ch);
+    let c = ch as u32;
     if (0x41..=0x5A).contains(&c) {
-        return &DISP_AZ[(c - 0x41) as usize];
+        return DISP_AZ[(c - 0x41) as usize];
     }
     if (0x30..=0x39).contains(&c) {
-        return &DISP_09[(c - 0x30) as usize];
+        return DISP_09[(c - 0x30) as usize];
     }
     match c {
-        0x2F => &DISP_SLASH,
-        0x2B => &DISP_PLUS,
-        0x2D => &DISP_HYPHEN,
-        0x3A => &DISP_COLON,
-        0x2E => &DISP_DOT,
-        0x2C => &DISP_COMMA,
-        0x5B => &DISP_LBRACK,
-        0x5D => &DISP_RBRACK,
-        0x28 => &DISP_LPAREN,
-        0x29 => &DISP_RPAREN,
-        0x3D => &DISP_EQ,
-        0x21 => &DISP_BANG,
-        0x2014 => &DISP_EMDASH,
+        0x2F => DISP_SLASH,
+        0x2B => DISP_PLUS,
+        0x2D => DISP_HYPHEN,
+        0x3A => DISP_COLON,
+        0x2E => DISP_DOT,
+        0x2C => DISP_COMMA,
+        0x5B => DISP_LBRACK,
+        0x5D => DISP_RBRACK,
+        0x28 => DISP_LPAREN,
+        0x29 => DISP_RPAREN,
+        0x3D => DISP_EQ,
+        0x21 => DISP_BANG,
+        0x2014 => DISP_EMDASH,
         _ => body_glyph(ch), // space, arrows, rare punctuation
     }
 }
@@ -265,4 +433,36 @@ static BASIC: [[u8; 8]; 95] = [
     [0x18,0x18,0x18,0x00,0x18,0x18,0x18,0x00], // |
     [0x07,0x0C,0x0C,0x38,0x0C,0x0C,0x07,0x00], // }
     [0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00], // ~
+];
+
+/// Greek lower-case block, U+03B1 α ..= U+03C9 ω (final sigma ς included in
+/// sequence). Drawn to the same metrics as `BASIC`: x-height rows 2–6,
+/// descenders into row 7, bit 0 the left-most pixel.
+#[rustfmt::skip]
+static GREEK_LOW: [[u8; 8]; 25] = [
+    [0x00,0x00,0x2E,0x33,0x33,0x33,0x6E,0x00], // α
+    [0x1E,0x33,0x33,0x1F,0x33,0x33,0x1F,0x03], // β
+    [0x00,0x00,0x33,0x33,0x1E,0x0C,0x0C,0x06], // γ
+    [0x1C,0x06,0x0C,0x1E,0x33,0x33,0x1E,0x00], // δ
+    [0x00,0x00,0x1E,0x03,0x0E,0x03,0x1E,0x00], // ε
+    [0x3F,0x18,0x0C,0x06,0x06,0x1E,0x30,0x1C], // ζ
+    [0x00,0x00,0x1F,0x33,0x33,0x33,0x33,0x30], // η
+    [0x1E,0x33,0x33,0x3F,0x33,0x33,0x1E,0x00], // θ
+    [0x00,0x00,0x0C,0x0C,0x0C,0x0C,0x18,0x00], // ι
+    [0x00,0x00,0x33,0x1B,0x0F,0x1B,0x33,0x00], // κ
+    [0x06,0x0C,0x18,0x38,0x6C,0x66,0x63,0x00], // λ
+    [0x00,0x00,0x33,0x33,0x33,0x33,0x3F,0x03], // μ
+    [0x00,0x00,0x33,0x33,0x33,0x1E,0x0C,0x00], // ν
+    [0x3E,0x03,0x1E,0x03,0x03,0x1E,0x30,0x1C], // ξ
+    [0x00,0x00,0x1E,0x33,0x33,0x33,0x1E,0x00], // ο
+    [0x00,0x00,0x3F,0x36,0x36,0x36,0x36,0x00], // π
+    [0x00,0x00,0x1E,0x33,0x33,0x1F,0x03,0x03], // ρ
+    [0x00,0x00,0x1E,0x03,0x03,0x1E,0x30,0x1C], // ς
+    [0x00,0x00,0x7E,0x33,0x33,0x33,0x1E,0x00], // σ
+    [0x00,0x00,0x3F,0x0C,0x0C,0x2C,0x18,0x00], // τ
+    [0x00,0x00,0x33,0x33,0x33,0x33,0x1E,0x00], // υ
+    [0x00,0x0C,0x1E,0x33,0x33,0x33,0x1E,0x0C], // φ
+    [0x00,0x00,0x63,0x36,0x1C,0x36,0x63,0x01], // χ
+    [0x00,0x49,0x49,0x49,0x3E,0x08,0x08,0x08], // ψ
+    [0x00,0x00,0x63,0x63,0x6B,0x6B,0x36,0x00], // ω
 ];
