@@ -28,6 +28,9 @@ pub struct Mods {
     /// Right Alt (AltGr) — selects the third/fourth level on layouts that
     /// have one (Polish programmer, UK `€ ¦`).
     pub altgr: bool,
+    /// Either GUI (Win) key. GUI+Space cycles the active layout; while GUI is
+    /// held every other key produces nothing, so a chord never types.
+    pub gui: bool,
 }
 
 /// What one key level produces.
@@ -50,6 +53,8 @@ const BOTH: char = '\u{0385}'; // ΅
 
 struct Layout {
     name: &'static str,
+    /// Two-letter code for the always-visible HUD indicator.
+    short: &'static str,
     /// Per-usage overrides `(hid_usage, [plain, shift, altgr, shift+altgr])`,
     /// consulted before the US base table.
     keys: &'static [(u8, [Out; 4])],
@@ -130,6 +135,7 @@ fn control_key(usage: u8) -> Option<Key> {
 
 static US: Layout = Layout {
     name: "US",
+    short: "US",
     keys: &[],
     compose: &[],
 };
@@ -138,6 +144,7 @@ static US: Layout = Layout {
 /// 102nd key, `¬`/`¦` on the backquote key, `€` on AltGr+4.
 static UK: Layout = Layout {
     name: "UK",
+    short: "UK",
     keys: &[
         (0x1F, [Ch('2'), Ch('"'), Out::None, Out::None]),
         (0x20, [Ch('3'), Ch('£'), Out::None, Out::None]),
@@ -154,6 +161,7 @@ static UK: Layout = Layout {
 /// stroke/dot letters, `€` on AltGr+U.
 static PL: Layout = Layout {
     name: "Polish (programmer)",
+    short: "PL",
     keys: &[
         (0x04, [Ch('a'), Ch('A'), Ch('ą'), Ch('Ą')]),
         (0x06, [Ch('c'), Ch('C'), Ch('ć'), Ch('Ć')]),
@@ -174,6 +182,7 @@ static PL: Layout = Layout {
 /// standard el-GR layout.
 static GR: Layout = Layout {
     name: "Greek",
+    short: "GR",
     keys: &[
         (0x04, [Ch('α'), Ch('Α'), Out::None, Out::None]),
         (0x05, [Ch('β'), Ch('Β'), Out::None, Out::None]),
@@ -243,6 +252,22 @@ pub fn active_name() -> &'static str {
     LAYOUTS[ACTIVE.load(Ordering::Relaxed) % LAYOUTS.len()].name
 }
 
+/// Two-letter code of the active layout, for the HUD indicator.
+pub fn active_short() -> &'static str {
+    LAYOUTS[ACTIVE.load(Ordering::Relaxed) % LAYOUTS.len()].short
+}
+
+/// Advance to the next layout (US → UK → PL → GR → US), cancelling any
+/// pending dead key. Atomics only, so it is safe inside the keyboard IRQ.
+/// Load+store (not `fetch_add`) keeps the stored index in-range, matching
+/// [`set_layout`]; a racing second keyboard at worst loses one step.
+pub fn cycle_layout() -> &'static str {
+    let next = (ACTIVE.load(Ordering::Relaxed) + 1) % LAYOUTS.len();
+    ACTIVE.store(next, Ordering::Relaxed);
+    PENDING.store(0, Ordering::Relaxed);
+    LAYOUTS[next].name
+}
+
 /// Activate the layout with this display name (from [`layout_names`]).
 /// Returns false (and keeps the current layout) for an unknown name.
 pub fn set_layout(name: &str) -> bool {
@@ -260,6 +285,17 @@ pub fn set_layout(name: &str) -> bool {
 /// the active layout, handling dead-key composition. `None` means the press
 /// produces nothing (unknown usage, empty level, or a dead key being stored).
 pub fn translate(usage: u8, mods: Mods) -> Option<Key> {
+    // GUI (Win) chords, checked before everything else so they work on every
+    // screen. GUI+Space cycles the layout; any other key while GUI is held is
+    // swallowed (chars *and* control keys), so a chord never types or
+    // navigates. Swallowed keys leave a pending accent untouched.
+    if mods.gui {
+        if usage == 0x2C {
+            cycle_layout();
+            return Some(Key::LayoutSwitched);
+        }
+        return None;
+    }
     if let Some(k) = control_key(usage) {
         // Navigation/editing cancels a pending accent, like other OSes.
         PENDING.store(0, Ordering::Relaxed);

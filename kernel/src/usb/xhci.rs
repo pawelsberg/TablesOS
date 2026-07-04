@@ -1452,10 +1452,12 @@ fn service_keyboard(st: &mut XhciState, idx: usize, cc: u8) {
     }
     let armed_ok = cc == 1 || cc == 13;
     if armed_ok {
-        // HID modifier byte: bit1/5 = Shift, bit6 = Right Alt (AltGr).
+        // HID modifier byte: bit1/5 = Shift, bit6 = Right Alt (AltGr),
+        // bit3/7 = GUI (Win).
         let mods = crate::keymap::Mods {
             shift: report[0] & 0x22 != 0,
             altgr: report[0] & 0x40 != 0,
+            gui: report[0] & 0x88 != 0,
         };
         for i in 2..8 {
             let usage = report[i];

@@ -775,6 +775,13 @@ impl<D: BlockDevice> App<D> {
     // ---- input -----------------------------------------------------------
 
     fn on_key(&mut self, k: Key) {
+        // Win+Space already cycled the layout inside `keymap::translate` (so
+        // it works on every screen, even mid-text-entry); this is only the
+        // feedback. Intercepted before the per-screen handlers below.
+        if matches!(k, Key::LayoutSwitched) {
+            self.status = format!("keyboard layout: {}", crate::keymap::active_name());
+            return;
+        }
         // Screens with a dedicated key handler that re-borrows `self` (the
         // store) internally. Matching on the variant — rather than an integer
         // tag that has to be kept in sync by hand — means adding a new `Screen`
@@ -2699,14 +2706,17 @@ impl<D: BlockDevice> App<D> {
     fn hud_readout(&self) -> String {
         let per = time::tsc_per_us();
         let ver = tablestore::VERSION_STR;
+        // The layout indicator replaces the old "ONLINE" flair: same width, so
+        // the readout still leaves the title its space at 1024×768.
+        let kbd = crate::keymap::active_short();
         if per == 0 {
-            return format!("TABLESOS {ver} // SYS ONLINE");
+            return format!("TABLESOS {ver} // SYS ONLINE // KBD {kbd}");
         }
         let secs = unsafe { core::arch::x86_64::_rdtsc() } / (per.saturating_mul(1_000_000)).max(1);
         // Last frame's present cost (VRAM copy) — diagnostic for graphics speed
         // on real hardware, where there is no serial console.
         let fbus = fbm::last_present_ticks() / per.max(1);
-        format!("TABLESOS {ver} // T+{}s // FB {}us // ONLINE", secs, fbus)
+        format!("TABLESOS {ver} // T+{}s // FB {}us // KBD {kbd}", secs, fbus)
     }
 
     fn render(&mut self) {

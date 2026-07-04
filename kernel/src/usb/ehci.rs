@@ -1297,10 +1297,12 @@ fn decode_keyboard(h: &mut HidDev, report: &[u8]) {
     if report.len() < 8 {
         return;
     }
-    // HID modifier byte: bit1/5 = Shift, bit6 = Right Alt (AltGr).
+    // HID modifier byte: bit1/5 = Shift, bit6 = Right Alt (AltGr),
+    // bit3/7 = GUI (Win).
     let mods = crate::keymap::Mods {
         shift: report[0] & 0x22 != 0,
         altgr: report[0] & 0x40 != 0,
+        gui: report[0] & 0x88 != 0,
     };
     // Edge detection: emit a key once when its usage appears in the report.
     for i in 2..8 {

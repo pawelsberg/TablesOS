@@ -24,6 +24,9 @@ pub enum Key {
     Delete,
     PageUp,
     PageDown,
+    /// The GUI(Win)+Space chord switched the keyboard layout. Carries no
+    /// character — a feedback signal so the UI can show the new layout.
+    LayoutSwitched,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -41,6 +44,10 @@ pub enum Event {
 struct Kbd {
     shift: bool,
     altgr: bool,
+    gui: bool,
+    /// GUI+Space latch: typematic auto-repeat resends the Space make code
+    /// while held, but the chord must cycle once per physical press.
+    gui_space: bool,
     extended: bool,
 }
 
@@ -90,6 +97,8 @@ static QUEUE: Mutex<EventRing> = Mutex::new(EventRing::new());
 static KBD: Mutex<Kbd> = Mutex::new(Kbd {
     shift: false,
     altgr: false,
+    gui: false,
+    gui_space: false,
     extended: false,
 });
 
@@ -169,12 +178,33 @@ pub fn on_keyboard_byte(code: u8) {
         k.altgr = !released;
         return;
     }
-    if released {
+    // GUI (Win) keys: `E0 5B` (left) / `E0 5C` (right). Releasing GUI also
+    // re-arms the GUI+Space chord latch.
+    if ext && (make == 0x5B || make == 0x5C) {
+        k.gui = !released;
+        if released {
+            k.gui_space = false;
+        }
         return;
+    }
+    if released {
+        if !ext && make == 0x39 {
+            k.gui_space = false; // Space break re-arms the chord
+        }
+        return;
+    }
+    // GUI+Space chord: latch so typematic repeat of the held Space cycles
+    // the layout exactly once per physical press.
+    if k.gui && !ext && make == 0x39 {
+        if k.gui_space {
+            return;
+        }
+        k.gui_space = true;
     }
     let mods = crate::keymap::Mods {
         shift: k.shift,
         altgr: k.altgr,
+        gui: k.gui,
     };
     drop(k);
 
