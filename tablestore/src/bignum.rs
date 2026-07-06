@@ -47,19 +47,6 @@ impl BigUint {
         Some(v)
     }
 
-    /// Build from raw most-significant-first digits (each 0..=9). Used by the
-    /// codec; non-digit bytes yield `None`.
-    pub fn from_digits(digits: &[u8]) -> Option<BigUint> {
-        if digits.iter().any(|d| *d > 9) {
-            return None;
-        }
-        let mut v = BigUint {
-            digits: digits.to_vec(),
-        };
-        v.normalize();
-        Some(v)
-    }
-
     /// Canonical digits, most-significant-first (empty for zero).
     pub fn digits(&self) -> &[u8] {
         &self.digits
@@ -92,12 +79,6 @@ impl BigUint {
             r = (r * 10 + *d as u64) % m as u64;
         }
         r as u32
-    }
-
-    /// Number of decimal digits (0 has zero digits, matching the canonical
-    /// form; callers that want "1 digit for zero" handle that themselves).
-    pub fn digit_count(&self) -> usize {
-        self.digits.len()
     }
 
     /// `self + 1`, computed directly on the decimal digits (we keep no binary

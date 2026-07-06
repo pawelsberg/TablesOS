@@ -63,14 +63,6 @@ impl Table {
         self.columns.iter().find(|c| c.name == name)
     }
 
-    /// Is `col` the source of, or targeted by, any foreign key (this table
-    /// only — cross-table targeting is checked by the store)?
-    pub fn fk_touches(&self, col: &str) -> bool {
-        self.fks
-            .iter()
-            .any(|f| f.from_col == col || (f.to_table == self.name && f.to_col == col))
-    }
-
     /// Column indices that form this table's reference label, in display
     /// order. Uses the configured [`ref_cols`](Table::ref_cols) when set
     /// (skipping any name that no longer maps to a column); otherwise falls

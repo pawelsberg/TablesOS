@@ -169,10 +169,6 @@ struct Endpoint {
 /// One enumerated mass-storage device.
 pub struct MscDev {
     pub addr: u8,
-    #[allow(dead_code)] // identification, for future Drives-screen listing
-    pub vid: u16,
-    #[allow(dead_code)]
-    pub pid: u16,
     pipe: Pipe,
     bulk_in: Endpoint,
     bulk_out: Endpoint,
@@ -197,11 +193,6 @@ struct HidDev {
     pipe: Pipe,
     iface: u16,
     kind: HidKind,
-    /// Interrupt IN endpoint (number, max-packet) — captured for a future
-    /// switch from control GET_REPORT to interrupt-endpoint polling, which
-    /// real devices implement more reliably. Logged at registration.
-    #[allow(dead_code)]
-    int_in: (u8, u16),
     /// Last keyboard report (modifiers + 6 usages), for edge detection.
     last: [u8; 8],
     /// Consecutive failures; the device is parked after too many.
@@ -765,8 +756,6 @@ fn enumerate_addr0(
         crate::boot_status(&format!("ehci: addr {} = MSC {:04x}:{:04x}", addr, vid, pid));
         states[idx].msc.push(MscDev {
             addr,
-            vid,
-            pid,
             pipe,
             bulk_in: Endpoint { ep: bulk_in.0 & 0xF, mps: bulk_in.2, toggle: false },
             bulk_out: Endpoint { ep: bulk_out.0 & 0xF, mps: bulk_out.2, toggle: false },
@@ -826,7 +815,6 @@ fn enumerate_addr0(
                 pipe,
                 iface: ifn,
                 kind,
-                int_in,
                 last: [0; 8],
                 errors: 0,
             });

@@ -327,11 +327,9 @@ struct XhciState {
 /// Per-slot allocations needed for Address Device and subsequent control
 /// + bulk + interrupt transfers. Addresses are physical (identity-mapped
 /// on this kernel).
-#[allow(dead_code)]
 #[derive(Clone)]
 struct SlotResources {
     slot_id: u8,
-    port: u8,
     speed: u8,
     max_packet_size_ep0: u16,
     /// Device Context — array of 32 entries pointed to by `DCBAA[slot_id]`.
@@ -349,11 +347,8 @@ struct SlotResources {
     endpoints: Vec<EndpointState>,
 }
 
-#[allow(dead_code)]
 #[derive(Clone)]
 struct EndpointState {
-    /// USB endpoint address: bit 7 = direction (1 = IN), bits 3..0 = number.
-    address: u8,
     /// Device Context Index (`DCI = 2 * ep_num + (dir_in ? 1 : 0)`).
     dci: u8,
     /// 0=Control, 1=Isoch, 2=Bulk, 3=Interrupt (USB classification).
@@ -474,11 +469,6 @@ pub struct Interface {
     pub endpoints: Vec<Endpoint>,
 }
 
-/// `number` is set but currently only displayed indirectly via `address`;
-/// it'll be used by phase 4 sub-pass 7 to compute the Device Context Index
-/// (`DCI = 2 * number + (direction_in ? 1 : 0)`) when issuing Configure
-/// Endpoint.
-#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub struct Endpoint {
     /// Raw `bEndpointAddress`: bit 7 = direction (1=IN), bits 3..0 = number.
@@ -1207,10 +1197,6 @@ fn issue_enable_slot(
 }
 
 /// Snapshot of an event-ring TRB returned to a caller of `drain_event`.
-/// `trb_type` and `parameter` are not consumed yet but will be needed
-/// once we start parsing Port Status Change events and matching transfer
-/// completions to their issuing TRB pointer.
-#[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct Event {
     trb_type: u8,
@@ -1711,7 +1697,6 @@ fn build_slot_resources(
 
     SlotResources {
         slot_id,
-        port,
         speed,
         max_packet_size_ep0: max_pkt,
         device_ctx: device_ctx as u64,
@@ -2469,7 +2454,6 @@ pub fn configure_endpoints(
             };
 
             new_endpoints.push(EndpointState {
-                address: ep.address,
                 dci,
                 transfer_type: ep.transfer_type,
                 max_packet_size: ep.max_packet_size,
@@ -3157,7 +3141,6 @@ fn scsi_read10(
     Ok((outcome.scsi_status, data))
 }
 
-#[allow(dead_code)] // Will be used by the upcoming `BlockDevice` wrapper.
 fn scsi_write10(
     info: &XhciInfo,
     st: &mut XhciState,
@@ -3766,11 +3749,6 @@ pub fn take_last_msc_err() -> Option<alloc::string::String> {
     LAST_MSC_ERR.lock().take()
 }
 
-/// Several public methods + the `block_size` field are part of the
-/// future-mount API (USB-booted TablesOS volume) and not consumed yet
-/// — kept here so the surface is in place and the identity-gate path
-/// is testable end-to-end.
-#[allow(dead_code)]
 pub struct UsbMscDevice {
     slot_id: u8,
     /// MMIO base of the owning xHCI controller. Together with `slot_id` this
@@ -3778,7 +3756,6 @@ pub struct UsbMscDevice {
     /// controller, and this machine has two xHCIs that both number a slot 1.
     mmio_base: u64,
     sectors: u64,
-    block_size: u32,
     next_tag: u32,
     /// `Some(expected_sys_guid)` activates the identity gate. The
     /// wrapper re-reads MBR LBA 0 before every write and compares the
@@ -3788,7 +3765,6 @@ pub struct UsbMscDevice {
     poisoned: bool,
 }
 
-#[allow(dead_code)]
 impl UsbMscDevice {
     /// Build a wrapper from a cached probe. Refuses any block size other than
     /// 512 — the engine assumes that.
@@ -3803,7 +3779,6 @@ impl UsbMscDevice {
             slot_id: probe.slot_id,
             mmio_base: probe.mmio_base,
             sectors: cap.total_blocks(),
-            block_size: cap.block_size,
             next_tag: 0xCAFE_0000,
             identity_gate: None,
             poisoned: false,
@@ -3843,16 +3818,6 @@ impl UsbMscDevice {
         let mut dev = Self::from_probe(probe)?;
         dev.identity_gate = Some(expected_sys_guid);
         Ok(dev)
-    }
-
-    pub fn slot_id(&self) -> u8 {
-        self.slot_id
-    }
-    pub fn block_size(&self) -> u32 {
-        self.block_size
-    }
-    pub fn is_poisoned(&self) -> bool {
-        self.poisoned
     }
 
     fn next_tag(&mut self) -> u32 {
@@ -4198,37 +4163,6 @@ pub fn msc_write_blocks(
         return Err("WRITE(10) CSW status != 0");
     }
     Ok(())
-}
-
-/// Slot-addressed batched read — the read counterpart of [`msc_write_blocks`].
-/// Thin wrapper over the retrying [`msc_read_blocks`]: it resolves the owning
-/// controller's MMIO base from `slot_id` and supplies a fresh tag. `buf.len()`
-/// must be at least `blocks * 512`; exactly that many bytes are filled.
-///
-/// Currently unused — the upgrade flow used to relocate a volume by copying a
-/// physical sector range with this, but the copy-on-write rebuild now reads the
-/// old volume *logically* (scattered pages) instead. Retained as the read-side
-/// counterpart of the still-used [`msc_write_blocks`].
-#[allow(dead_code)]
-pub fn msc_read_blocks_slot(
-    slot_id: u8,
-    lba: u32,
-    blocks: u16,
-    buf: &mut [u8],
-) -> Result<(), &'static str> {
-    let want = blocks as usize * SECTOR;
-    if buf.len() < want {
-        return Err("msc_read_blocks_slot: buffer too small");
-    }
-    let mmio_base = {
-        let mut guard = STATES.lock();
-        state_for_slot(&mut guard, slot_id)
-            .ok_or("no controller owns this USB slot")?
-            .info
-            .mmio_base
-    };
-    let tag = next_msc_tag();
-    msc_read_blocks(mmio_base, slot_id, lba, blocks, &mut buf[..want], tag)
 }
 
 // ---- Self-test: write a pattern, read it back, verify ---------------

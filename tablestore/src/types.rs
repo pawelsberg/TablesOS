@@ -68,20 +68,6 @@ impl Type {
         Type::ALL.into_iter().find(|t| t.tag() == tag)
     }
 
-    /// Short hint shown next to the field in the Row Editor.
-    pub fn input_hint(self) -> &'static str {
-        match self {
-            Type::Integer => "e.g. -1234567890123456789",
-            Type::UnsignedInteger => "e.g. 1234567890123456789",
-            Type::Decimal => "e.g. -3.14159265358979",
-            Type::String => "any UTF-8 text",
-            Type::Date => "YYYY-MM-DD (year may be signed)",
-            Type::DateTz => "YYYY-MM-DD+HH:MM",
-            Type::Time => "HH:MM:SS[.fraction]",
-            Type::DateTime => "YYYY-MM-DDTHH:MM:SS[.fraction]",
-            Type::DateTimeTz => "YYYY-MM-DDTHH:MM:SS[.fraction]+HH:MM",
-        }
-    }
 }
 
 /// Parse failures carry a short message that the Row Editor shows inline next
