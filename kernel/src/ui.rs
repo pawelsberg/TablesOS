@@ -624,12 +624,6 @@ pub fn run<D: BlockDevice>(
         cursor_on: true,
         last_blink: interrupts::ticks(),
     };
-    // USB-HID input delivers no IRQ — it is polled cooperatively below — so the
-    // idle path can't simply `hlt` and wait for one. Cache its presence once (it
-    // is bound at boot, before the UI starts). EHCI HID is the keyboard+mouse
-    // path on pre-xHCI machines, where claiming the controller for the boot
-    // disk killed the BIOS's SMM legacy emulation.
-    let usb_poll = xhci::hid_present() || ehci::hid_present();
     app.render();
     loop {
         // Pull any USB-HID input into the shared input queue first, so the
@@ -671,7 +665,7 @@ pub fn run<D: BlockDevice>(
             app.last_blink = interrupts::ticks();
         }
         // Blink: while a text field is focused, flip the caret on a fixed
-        // cadence. The ~18 Hz timer IRQ already wakes the `hlt` below, so this
+        // cadence. The timer IRQ already wakes the `hlt` below, so this
         // costs one repaint per half-period and nothing while idle elsewhere.
         if !repaint && app.has_text_cursor() {
             let now = interrupts::ticks();
@@ -687,22 +681,19 @@ pub fn run<D: BlockDevice>(
             app.render();
         } else if let Some((x, y)) = moved_to {
             app.draw_cursor(x, y);
-        } else if usb_poll {
-            // USB-HID input has no IRQ to wake `hlt`, and the ~18 Hz timer alone
-            // would make the pointer crawl and a USB keyboard feel laggy. Briefly
-            // pause (so the core isn't in a tight spin) and loop to poll again —
-            // ~125 Hz when idle. Any PS/2 IRQs still enqueue in the meantime.
-            time::delay_ms(8);
         } else {
-            // Idle: sleep until the next IRQ (input or the ~18 Hz timer tick,
-            // which paces the blink).
-            x86_64::instructions::hlt();
+            // Idle: rest in `hlt` until the next IRQ. USB-HID input has no IRQ
+            // — it is polled at the top of the loop — but the TICK_HZ (125 Hz)
+            // timer bounds the sleep at one 8 ms poll period, so a USB pointer
+            // stays smooth and a USB keyboard responsive while the CPU actually
+            // sleeps instead of busy-spinning. PS/2 IRQs wake it even sooner.
+            interrupts::wait_for_tick();
         }
     }
 }
 
-/// Caret blink half-period, in PIT ticks (~18.2 Hz). ≈9 ticks ≈ 0.5 s.
-const BLINK_TICKS: u64 = 9;
+/// Caret blink half-period, in PIT ticks (`TICK_HZ`). ≈0.5 s.
+const BLINK_TICKS: u64 = interrupts::TICK_HZ / 2;
 
 struct App<D: BlockDevice> {
     store: Store<D>,
@@ -729,7 +720,7 @@ struct App<D: BlockDevice> {
     /// generation all match; any commit bumps the generation and invalidates it.
     row_cache: Option<RowCache>,
     /// Text-caret blink phase (drawn when true) and the PIT tick at which it
-    /// last flipped. The ~18 Hz timer IRQ wakes the idle `hlt` loop, which
+    /// last flipped. The timer IRQ wakes the idle `hlt` loop, which
     /// toggles this on a fixed cadence while a text field is focused.
     cursor_on: bool,
     last_blink: u64,

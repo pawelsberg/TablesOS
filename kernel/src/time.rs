@@ -16,7 +16,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::instructions::port::Port;
 
 /// PIT base frequency, hard-wired in the 8254 spec.
-const PIT_HZ: u64 = 1_193_182;
+pub const PIT_HZ: u64 = 1_193_182;
 
 static TSC_PER_US: AtomicU64 = AtomicU64::new(0);
 

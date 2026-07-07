@@ -1228,12 +1228,6 @@ pub fn find_boot_drive(sys_guid: &[u8; 16]) -> Option<(EhciMscDevice, u64)> {
 
 // ---- HID polling -----------------------------------------------------------------
 
-/// Is at least one EHCI HID device bound? The UI uses this to keep polling
-/// instead of `hlt`-waiting on IRQs that will never come.
-pub fn hid_present() -> bool {
-    STATES.lock().iter().any(|s| !s.hid.is_empty())
-}
-
 /// Poll every bound HID device with GET_REPORT and feed decoded events into
 /// the shared PS/2-shaped input queue. Called from the UI loop, never from
 /// an IRQ. A device that keeps failing is parked, not retried forever.

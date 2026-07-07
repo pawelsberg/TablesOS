@@ -3578,16 +3578,6 @@ pub fn setup_hid() -> bool {
     any
 }
 
-/// Is a USB-HID device (mouse or keyboard) bound? The UI uses this to choose
-/// its idle wait strategy — HID has no IRQ, so the loop polls rather than
-/// `hlt`-waiting for one that will never come.
-pub fn hid_present() -> bool {
-    STATES
-        .lock()
-        .iter()
-        .any(|s| !s.mice.is_empty() || !s.keyboards.is_empty())
-}
-
 /// Cooperatively poll **every** bound xHCI HID device across **all**
 /// controllers: recover any halted endpoint, drain every pending interrupt-IN
 /// completion (dispatched to the right mouse/keyboard by slot+DCI), re-arm,

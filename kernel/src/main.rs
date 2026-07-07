@@ -429,6 +429,7 @@ fn boot_pager_finish() {
 
     let per = boot_rows();
     let mut engaged = BOOT.lock().paused;
+    let start = interrupts::ticks();
     let mut elapsed = 0u64;
     let mut last_secs = u64::MAX;
 
@@ -492,10 +493,12 @@ fn boot_pager_finish() {
             }
         }
 
-        // ~125 Hz poll so a USB key (no IRQ) is caught promptly and the
-        // countdown stays smooth. PS/2 IRQs enqueue in the meantime regardless.
-        time::delay_ms(8);
-        elapsed += 8;
+        // Rest until the next TICK_HZ (125 Hz) timer IRQ so a USB key (no IRQ)
+        // is still caught within ~8 ms and the countdown stays smooth, without
+        // busy-spinning. A PS/2 IRQ can wake `hlt` mid-tick, so measure elapsed
+        // time from the tick counter rather than counting iterations.
+        interrupts::wait_for_tick();
+        elapsed = interrupts::ticks().wrapping_sub(start) * 1000 / interrupts::TICK_HZ;
     }
 }
 
@@ -894,8 +897,9 @@ fn fatal(msg: &str) -> ! {
             let bp = BOOT.lock();
             draw_boot_page(&bp.lines, view, per, Hint::Fatal);
         }
-        // ~125 Hz poll so a USB key (no IRQ) is caught promptly.
-        time::delay_ms(8);
+        // Rest until the next TICK_HZ timer IRQ (~8 ms) so a USB key (no IRQ)
+        // is caught promptly without busy-spinning the CPU.
+        interrupts::wait_for_tick();
     }
 }
 

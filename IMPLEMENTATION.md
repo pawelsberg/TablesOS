@@ -184,7 +184,9 @@ mouse is dead. Owning xHCI for the boot disk and keeping BIOS HID emulation are
 mutually exclusive. Full root-cause + the **regression invariants** (don't
 re-enable BIOS emulation; never poll USB from an IRQ — the heap-free-IRQ rule;
 keep the periodic-endpoint Interval in `configure_endpoints`; one shared cursor;
-the UI idle path can't `hlt` forever when a USB mouse is present) are in
+the UI idle path can't `hlt` *unbounded* when a USB mouse is present — it now
+`hlt`s with the PIT reprogrammed to 125 Hz so every sleep is capped at one 8 ms
+poll period) are in
 `solved-issues/USB mouse on real hardware.md`. A `usb-mouse` is attached to the
 QEMU xHCI bus (`src/main.rs`) so this path is exercised on every `cargo run`.
 A USB-HID **keyboard** is a cheap follow-on (protocol 0x01) but is not yet

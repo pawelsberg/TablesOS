@@ -111,9 +111,11 @@ real hardware again. Each is here because it is non-obvious:
 4. **PS/2 and USB share one cursor and one queue.** `apply_motion` /
    `feed_mouse_delta` in `ps2.rs` are the single screen-space apply path; both
    sources go through it. Don't fork a second cursor.
-5. **The UI idle path must not `hlt` indefinitely when a USB mouse is present.**
-   It has no IRQ to wake it; that is what the `mouse_present()` check and the
-   8 ms poll delay are for.
+5. **The UI idle path must not sleep unbounded when a USB mouse is present.**
+   It has no IRQ to wake it. Originally an 8 ms `delay_ms` busy-poll; since the
+   power-saving rework the PIT ticks at 125 Hz (`interrupts::TICK_HZ`) so the
+   idle `hlt` is itself bounded at one 8 ms poll period — don't lower the tick
+   rate back to 18.2 Hz or the pointer crawls again.
 6. **`setup_mouse` runs after `discover_boot_disk`** and must not re-reset ports
    on a USB-booted machine (would disturb the open boot disk).
 

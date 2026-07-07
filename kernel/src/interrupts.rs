@@ -20,7 +20,14 @@ enum Irq {
 pub static PICS: Mutex<ChainedPics> =
     Mutex::new(unsafe { ChainedPics::new(PIC1, PIC2) });
 
-/// Monotonic tick from the PIT (used for the panic blink / debouncing).
+/// PIT channel-0 (timer IRQ) rate programmed in `init`. 125 Hz makes one tick
+/// exactly the 8 ms USB-HID polling cadence, so the idle loops can rest in
+/// `hlt` (woken by this tick) instead of busy-spinning on the TSC. USB-HID
+/// delivers no IRQ — it is polled cooperatively — so this tick is what keeps a
+/// USB pointer smooth while the CPU actually sleeps.
+pub const TICK_HZ: u64 = 125;
+
+/// Monotonic tick from the PIT (used for the caret blink / countdowns).
 pub static TICKS: Mutex<u64> = Mutex::new(0);
 
 static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
@@ -50,6 +57,17 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
 pub fn init() {
     IDT.load();
     unsafe { PICS.lock().initialize() };
+    // Raise the PIT tick from the BIOS default ~18.2 Hz to TICK_HZ. Channel 0,
+    // lobyte/hibyte, mode 2 (rate generator), binary. Channel 2 (used by
+    // `time::init` for TSC calibration) is untouched.
+    unsafe {
+        use x86_64::instructions::port::Port;
+        let div = (crate::time::PIT_HZ / TICK_HZ) as u16;
+        Port::<u8>::new(0x43).write(0b0011_0100);
+        let mut ch0: Port<u8> = Port::new(0x40);
+        ch0.write(div as u8);
+        ch0.write((div >> 8) as u8);
+    }
     // Drain anything the 8042 buffered before we owned it — e.g. the break
     // (release) code of a key pressed in the boot-time resolution chooser,
     // which lands after stage2's `cli` and is never read. A leftover byte keeps
@@ -81,10 +99,23 @@ fn eoi(irq: u8) {
     unsafe { PICS.lock().notify_end_of_interrupt(irq) }
 }
 
-/// Monotonic PIT tick count (~18.2 Hz). The timer IRQ also locks `TICKS`, so
+/// Monotonic PIT tick count (`TICK_HZ`). The timer IRQ also locks `TICKS`, so
 /// the read masks interrupts to avoid deadlocking against a tick on this core.
 pub fn ticks() -> u64 {
     x86_64::instructions::interrupts::without_interrupts(|| *TICKS.lock())
+}
+
+/// Rest the CPU until the next interrupt — at most one PIT tick (~8 ms at
+/// `TICK_HZ`), sooner if a PS/2 IRQ arrives. The power-friendly pacing step
+/// for the cooperative USB-HID poll loops, replacing their `delay_ms(8)` TSC
+/// busy-spin. If interrupts are off, `hlt` would sleep forever, so fall back
+/// to the bounded busy-wait instead.
+pub fn wait_for_tick() {
+    if x86_64::instructions::interrupts::are_enabled() {
+        x86_64::instructions::hlt();
+    } else {
+        crate::time::delay_ms(1000 / TICK_HZ);
+    }
 }
 
 extern "x86-interrupt" fn breakpoint(f: InterruptStackFrame) {
