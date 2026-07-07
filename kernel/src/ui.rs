@@ -2186,9 +2186,31 @@ impl<D: BlockDevice> App<D> {
                 return;
             }
         };
+        // The field's current text is the display form of the target column
+        // value (that's what fk_select writes back), so the picker can open on
+        // the row that's already selected rather than always the first one.
+        let current: Option<String> = match self.top() {
+            Screen::Editor(ed) => ed
+                .fields
+                .get(field_idx)
+                .filter(|f| !f.is_null && !f.value.is_empty())
+                .map(|f| f.value.clone()),
+            _ => None,
+        };
+        let to_col_idx = schema.column_index(to_col);
         // Extract rows as (id, reference_label) pairs. Skip rows where to_col is NULL.
         let mut fk_rows: Vec<(RowId, String)> = Vec::new();
+        let mut sel: Option<usize> = None;
         for (id, row) in rows {
+            if sel.is_none() {
+                if let (Some(cur), Some(ci)) = (current.as_deref(), to_col_idx) {
+                    if let Some(Some(v)) = row.get(ci) {
+                        if v.display() == cur {
+                            sel = Some(fk_rows.len());
+                        }
+                    }
+                }
+            }
             let label = schema.reference_label(&row);
             fk_rows.push((id, label));
         }
@@ -2197,14 +2219,19 @@ impl<D: BlockDevice> App<D> {
             self.status = format!("no rows in '{to_table}' to pick from");
             return;
         }
+        let sel = sel.unwrap_or(0);
+        // Scroll so the pre-selected row is visible (at the bottom of the
+        // window when it's beyond the first page, matching ↓'s behaviour).
+        let visible = visible_rows().max(1);
+        let top = sel.saturating_sub(visible - 1);
         self.push(Screen::FkPick {
             field_idx,
             from_col: from_col.to_string(),
             to_table: to_table.to_string(),
             to_col: to_col.to_string(),
             rows: fk_rows,
-            sel: 0,
-            top: 0,
+            sel,
+            top,
         });
     }
 
