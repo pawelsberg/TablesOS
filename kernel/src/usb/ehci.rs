@@ -1301,7 +1301,7 @@ fn decode_keyboard(h: &mut HidDev, report: &[u8]) {
         if h.last[2..8].contains(&usage) {
             continue; // still held from the previous poll
         }
-        if let Some(key) = crate::keymap::translate(usage, mods) {
+        for key in crate::keymap::translate(usage, mods) {
             crate::ps2::feed_key(key);
         }
     }

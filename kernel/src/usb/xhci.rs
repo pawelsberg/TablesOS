@@ -1450,7 +1450,7 @@ fn service_keyboard(st: &mut XhciState, idx: usize, cc: u8) {
             if usage < 4 || last[2..8].contains(&usage) {
                 continue; // empty/rollover, or held since the last report
             }
-            if let Some(key) = crate::keymap::translate(usage, mods) {
+            for key in crate::keymap::translate(usage, mods) {
                 crate::ps2::feed_key(key);
             }
         }

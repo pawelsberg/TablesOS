@@ -9,9 +9,11 @@
 //! Layouts are static data: every layout is a set of per-usage **overrides**
 //! over the US base table, four output levels per key (plain / Shift / AltGr /
 //! Shift+AltGr), plus a dead-key composition list. Dead keys (the Greek tonos
-//! and dialytika) emit nothing and combine with the next character; dead key
-//! followed by space yields the accent itself, and an impossible combination
-//! drops the accent and keeps the letter.
+//! and dialytika) emit nothing and combine with the next character, matching
+//! Windows el-GR: dead key followed by space yields the accent itself, an
+//! impossible combination emits the spacing accent *and* the character
+//! (`;` `κ` → `΄κ`), and a second dead key emits both spacing accents
+//! (`;` `;` → `΄΄`), leaving nothing pending.
 //!
 //! Everything here is static tables and atomics — **no allocation, no locks**
 //! — because [`translate`] runs inside the PS/2 keyboard IRQ handler (see the
@@ -281,10 +283,18 @@ pub fn set_layout(name: &str) -> bool {
     }
 }
 
-/// Translate one pressed key (HID usage + modifiers) into a [`Key`] through
-/// the active layout, handling dead-key composition. `None` means the press
-/// produces nothing (unknown usage, empty level, or a dead key being stored).
-pub fn translate(usage: u8, mods: Mods) -> Option<Key> {
+/// Translate one pressed key (HID usage + modifiers) into keys through the
+/// active layout, handling dead-key composition. Yields nothing when the
+/// press produces nothing (unknown usage, empty level, or a dead key being
+/// stored); yields two characters when a pending accent fails to compose,
+/// Windows-style (spacing accent, then the character itself).
+pub fn translate(usage: u8, mods: Mods) -> impl Iterator<Item = Key> {
+    translate2(usage, mods).into_iter().flatten()
+}
+
+fn translate2(usage: u8, mods: Mods) -> [Option<Key>; 2] {
+    let one = |k: Key| [Some(k), None];
+    const NONE: [Option<Key>; 2] = [None, None];
     // GUI (Win) chords, checked before everything else so they work on every
     // screen. GUI+Space cycles the layout; any other key while GUI is held is
     // swallowed (chars *and* control keys), so a chord never types or
@@ -292,14 +302,14 @@ pub fn translate(usage: u8, mods: Mods) -> Option<Key> {
     if mods.gui {
         if usage == 0x2C {
             cycle_layout();
-            return Some(Key::LayoutSwitched);
+            return one(Key::LayoutSwitched);
         }
-        return None;
+        return NONE;
     }
     if let Some(k) = control_key(usage) {
         // Navigation/editing cancels a pending accent, like other OSes.
         PENDING.store(0, Ordering::Relaxed);
-        return Some(k);
+        return one(k);
     }
     let level = (mods.shift as usize) | ((mods.altgr as usize) << 1);
     let lay = LAYOUTS[ACTIVE.load(Ordering::Relaxed) % LAYOUTS.len()];
@@ -310,26 +320,33 @@ pub fn translate(usage: u8, mods: Mods) -> Option<Key> {
         .map(|(_, levels)| levels[level])
         .unwrap_or_else(|| us_base(usage, level));
     match out {
-        Out::None => None,
+        Out::None => NONE,
         Out::Dead(d) => {
-            PENDING.store(d as u32, Ordering::Relaxed);
-            None
+            // A dead key while one is pending emits both spacing accents and
+            // leaves nothing pending (Windows: `;` `;` types `΄΄`).
+            let pending = PENDING.swap(d as u32, Ordering::Relaxed);
+            match char::from_u32(pending).filter(|_| pending != 0) {
+                Some(p) => {
+                    PENDING.store(0, Ordering::Relaxed);
+                    [Some(Key::Char(p)), Some(Key::Char(d))]
+                }
+                None => NONE,
+            }
         }
         Out::Ch(c) => {
             let pending = PENDING.swap(0, Ordering::Relaxed);
-            if pending == 0 {
-                return Some(Key::Char(c));
-            }
-            let d = char::from_u32(pending)?;
+            let Some(d) = char::from_u32(pending).filter(|_| pending != 0) else {
+                return one(Key::Char(c));
+            };
             if c == ' ' {
-                return Some(Key::Char(d)); // dead + space = the accent itself
+                return one(Key::Char(d)); // dead + space = the accent itself
             }
-            let composed = lay
-                .compose
-                .iter()
-                .find(|&&(a, b, _)| a == d && b == c)
-                .map(|&(_, _, x)| x);
-            Some(Key::Char(composed.unwrap_or(c)))
+            match lay.compose.iter().find(|&&(a, b, _)| a == d && b == c) {
+                Some(&(_, _, x)) => one(Key::Char(x)),
+                // No composition: spacing accent then the character, as on
+                // Windows (`;` `κ` types `΄κ`).
+                None => [Some(Key::Char(d)), Some(Key::Char(c))],
+            }
         }
     }
 }

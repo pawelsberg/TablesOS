@@ -214,7 +214,7 @@ pub fn on_keyboard_byte(code: u8) {
     let Some(usage) = crate::keymap::ps2_to_usage(make, ext) else {
         return;
     };
-    if let Some(key) = crate::keymap::translate(usage, mods) {
+    for key in crate::keymap::translate(usage, mods) {
         push(Event::Key(key));
     }
 }
