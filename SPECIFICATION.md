@@ -100,6 +100,7 @@ row's identity directly rather than a bare key.
 | `Add unique` | Add unique to a column |
 | `Remove unique` | Remove unique from a column |
 | `Set reference columns` | Choose the ordered columns used to label a row when it appears as a reference. |
+| `Set column width` | Set a column's display width. |
 
 
 ### Data Operations
@@ -109,6 +110,7 @@ row's identity directly rather than a bare key.
 | `Insert` | Insert a row. |
 | `Update a row` | Update a row. |
 | `Delete a row` | Delete a row. |
+| `Order rows` | Sort the rows. |
 | `Navigate back and forth` | Navigate relationships. |
 
 ### Maintenance Operations
@@ -117,15 +119,22 @@ row's identity directly rather than a bare key.
 |---|---|
 | `shutdown` | Shut down the computer. |
 | `New operating system on USB storage device` | Create a new (empty) TablesOS operating system on another USB storage device. |
+| `Top up version` | Upgrade another TablesOS device in place to the running version, keeping its data. |
+| `Keyboard layout` | Choose the active keyboard layout. |
+| `About` | Show system information. |
 
 ---
 
 ## Durability and crash recovery
 
-The pendrive may be removed at any moment. System uses **write-ahead journaling**
-to guarantee that the store is always recoverable to a consistent state.
-After any power loss, mounting recovers a consistent store with at most the last 
-uncommitted transaction lost.
+The pendrive may be removed at any moment. The store is **copy-on-write**: a
+commit writes every changed page to a fresh physical location and then
+atomically publishes the new state; the previous state stays intact until that
+instant. After any power loss, mounting recovers a consistent store with at
+most the last uncommitted transaction lost.
+
+Because each write lands on a fresh location chosen across the whole device,
+wear is spread evenly and no flash hot spots form.
 
 ---
 
@@ -137,6 +146,28 @@ directed only to the disk carrying the unique id captured during boot; a
 foreign or swapped disk is never written to. The sole exception is the
 explicit *New operating system on USB storage device* maintenance operation,
 which deliberately writes a fresh system to a different, user-chosen device.
+
+---
+
+## Versioning and upgrade
+
+TablesOS has a single version, stamped into every on-disk structure. A device
+carrying an older version can be **topped up** in place from a running system:
+its data is migrated, step by step, to the running version. Only devices at
+the same or an older version are offered as top-up targets.
+
+---
+
+## User interface
+
+Input comes from keyboard and mouse. System has multiple keyboard
+layouts and can be switched at any time.
+
+At boot the user may choose the display resolution from the modes the firmware
+offers; a choice that is not confirmed in time reverts to a safe default.
+
+Boot progress is traced on screen and can be reviewed at the end of boot,
+before the GUI starts.
 
 ---
 
@@ -165,7 +196,9 @@ TablesOS is a single-user OS:
 ## Implementation notes
 
 Build emits an image that can be written to a pendrive of any size.
-It represents TableOS without any tables. OS claims the rest of the pendrive during runtime.
+It represents TablesOS without any tables. The *New operating system on USB
+storage device* and *Top up version* operations create the volume spanning the
+full capacity of the target device.
 
 OS is written in Rust. 
 ---
