@@ -13,9 +13,11 @@
 //!    `upgrade` flow ([`crate::Store::finalize_upgrade`] stamps the version;
 //!    the kernel replaces the boot prefix). Not this module's concern.
 //!
-//! Right now the only released versions are v0.1.0 and v0.2.0 and their on-disk
-//! *data* layouts are identical, so the single step is a no-op. The scaffolding
-//! exists so that a future format change is a localised, testable addition: a
+//! Most released steps are no-ops (the data layout carried over unchanged); the
+//! one real format change so far is v0.3.0 → v0.4.0, where the copy-on-write
+//! pager replaced the in-place journal — that conversion happens *before* a
+//! `Store` exists (see [`rebuild_v3_into`]), so even its ladder step is a
+//! formality. Each future format change is a localised, testable addition: a
 //! new entry in [`KNOWN_VERSIONS`] and a new arm in [`apply_step`].
 
 use crate::block::BlockDevice;
@@ -32,7 +34,7 @@ const fn v(major: u32, minor: u32, patch: u32) -> u32 {
 
 /// Every released on-disk version, oldest first. The migration ladder steps
 /// strictly upward through this list. Append new releases here as they ship.
-pub const KNOWN_VERSIONS: &[u32] = &[v(0, 1, 0), v(0, 2, 0), v(0, 3, 0), v(0, 4, 0)];
+pub const KNOWN_VERSIONS: &[u32] = &[v(0, 1, 0), v(0, 2, 0), v(0, 3, 0), v(0, 4, 0), v(0, 5, 0)];
 
 /// Is `version` a release this build knows how to migrate from?
 pub fn is_known(version: u32) -> bool {
@@ -95,6 +97,11 @@ fn apply_step<D: BlockDevice>(_store: &mut Store<D>, from: u32, to: u32) -> Resu
         // target region *before* it is ever mounted as a `Store`. By the time a
         // `Store` exists it is already v0.4.0, so this ladder step is a formality.
         (a, b) if a == v(0, 3, 0) && b == v(0, 4, 0) => Ok(()),
+        // v0.4.0 -> v0.5.0: kernel/UI release only — the copy-on-write on-disk
+        // format is unchanged and a v0.4.0 volume mounts as-is (the pager
+        // checks magic+CRC, not the version stamp). No data transform; the
+        // upgrade path rebuilds/re-stamps and replaces the boot prefix.
+        (a, b) if a == v(0, 4, 0) && b == v(0, 5, 0) => Ok(()),
         _ => Err(StoreError::Corrupt("no migration step for this version pair")),
     }
 }
@@ -178,6 +185,19 @@ mod tests {
     fn one_step_up() {
         let mut s = store(16);
         assert_eq!(migrate_data(&mut s, v(0, 1, 0), v(0, 2, 0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn full_ladder_reaches_current_version() {
+        // From the oldest release all the way to the running version: one step
+        // per released version in between. Guards against a bumped
+        // crate::VERSION missing its KNOWN_VERSIONS / apply_step entry.
+        let mut s = store(16);
+        assert!(is_known(crate::VERSION), "current version must be in KNOWN_VERSIONS");
+        assert_eq!(
+            migrate_data(&mut s, v(0, 1, 0), crate::VERSION).unwrap(),
+            (KNOWN_VERSIONS.len() - 1) as u32
+        );
     }
 
     #[test]

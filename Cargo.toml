@@ -21,7 +21,7 @@ resolver = "2"
 # `tablestore::VERSION` — into every on-disk version field (MBR boot header,
 # volume superblock, journal control header). There are deliberately no
 # independent format numbers: a change here is assumed to change every on-disk
-# format at once. The displayed form is `tablestore::VERSION_STR` (= "v0.3.0").
+# format at once. The displayed form is `tablestore::VERSION_STR` (= "v0.5.0").
 #
 # Upgrade path: an existing volume of an OLDER version can be brought up to this
 # one in place (keeping its data) via the Table List `[u]` "top up version on
@@ -42,8 +42,14 @@ resolver = "2"
 # is migrated with data preserved by reading it through the frozen `compat_v3`
 # reader and rebuilding it into the new layout (see `migrate.rs` /
 # `kernel/src/upgrade.rs`).
+#
+# v0.5.0: kernel/UI release — Greek/Polish keyboard layouts with dead keys and
+# Win+Space switching, boot-time resolution chooser, idle HLT, faster
+# framebuffer present. The on-disk CoW format is unchanged from v0.4.0, so
+# 0.4.0 → 0.5.0 is a no-op data migration (rebuild + re-stamp via the top-up
+# path); the data LBA may still move if the boot prefix size changed.
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 
 # The kernel as an artifact dependency, compiled for bare metal. Because it is
 # a *normal* dependency, Cargo exposes `CARGO_BIN_FILE_KERNEL_kernel` to this

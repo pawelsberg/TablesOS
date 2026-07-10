@@ -89,7 +89,15 @@ enum Action {
     /// Top up (upgrade) the existing TablesOS volume on the given USB slot to
     /// the running version, keeping its data. Label shown in the confirmation.
     UpgradeOs(u8, String),
+    /// Prompt result = new size in MiB for the in-place resize of the running
+    /// volume.
+    ResizeVolume,
+    /// Confirmed in-place resize of the running volume to this many pages.
+    ResizeVolumeTo(u64),
 }
+
+/// 4 KiB store pages per MiB — the resize prompt talks MiB, the store pages.
+const PAGES_PER_MIB: u64 = (1 << 20) / tablestore::journal::PAGE as u64;
 
 enum Screen {
     List {
@@ -865,6 +873,26 @@ impl<D: BlockDevice> App<D> {
                             caret: 0,
                             action: Action::CreateTable,
                         });
+                    }
+                    Key::Char('r') | Key::Char('R') => {
+                        let cur = self.store.total_pages() / PAGES_PER_MIB;
+                        // Shrink floor rounds up, expand ceiling rounds down —
+                        // both stay inside what the store will actually accept.
+                        let min = (self.store.min_total_pages() + PAGES_PER_MIB - 1)
+                            / PAGES_PER_MIB;
+                        let max = self.store.device_pages() / PAGES_PER_MIB;
+                        if max <= min {
+                            self.status = "no room to resize this drive".into();
+                        } else {
+                            nav = Nav::Push(Screen::Prompt {
+                                title: format!(
+                                    "New volume size in MiB (now {cur}, min {min}, max {max})"
+                                ),
+                                buf: String::new(),
+                                caret: 0,
+                                action: Action::ResizeVolume,
+                            });
+                        }
                     }
                     Key::Char('p') | Key::Char('P') => {
                         nav = Nav::Push(Screen::Pick {
@@ -1846,6 +1874,40 @@ impl<D: BlockDevice> App<D> {
                     Err(e) => self.err(e),
                 }
             }
+            Action::ResizeVolume => {
+                let mib: u64 = match text.trim().parse() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        self.status = "size must be a whole number of MiB".into();
+                        return;
+                    }
+                };
+                let pages = mib * PAGES_PER_MIB;
+                let cur = self.store.total_pages();
+                let min = self.store.min_total_pages();
+                let max = self.store.device_pages();
+                if pages < min || pages > max {
+                    self.status = format!(
+                        "size out of range ({}..{} MiB)",
+                        (min + PAGES_PER_MIB - 1) / PAGES_PER_MIB,
+                        max / PAGES_PER_MIB
+                    );
+                    return;
+                }
+                if pages == cur {
+                    self.status = "volume is already that size".into();
+                    return;
+                }
+                let verb = if pages > cur { "Expand" } else { "Shrink" };
+                self.push(Screen::Confirm {
+                    msg: format!(
+                        "{verb} volume from {} to {} MiB? All data is kept.",
+                        cur / PAGES_PER_MIB,
+                        mib
+                    ),
+                    action: Action::ResizeVolumeTo(pages),
+                });
+            }
             Action::SetDisplayWidth(table, col) => {
                 let trimmed = text.trim();
                 let width = if trimmed.is_empty() {
@@ -1962,6 +2024,16 @@ impl<D: BlockDevice> App<D> {
 
     fn resolve_confirm(&mut self, action: Action) {
         match action {
+            Action::ResizeVolumeTo(pages) => match self.store.resize(pages) {
+                Ok(()) => {
+                    self.status = format!(
+                        "volume resized to {} — {} free",
+                        ata::human_size_bytes(self.store.capacity_bytes()),
+                        ata::human_size_bytes(self.store.free_bytes())
+                    )
+                }
+                Err(e) => self.err(e),
+            },
             Action::DeleteRow(t, id) => match self.store.delete(&t, id) {
                 Ok(_) => self.status = "row deleted".into(),
                 Err(e) => self.err(e),
@@ -2820,7 +2892,7 @@ impl<D: BlockDevice> App<D> {
             for (li, line) in frame.body.iter().enumerate() {
                 let color = match line.kind {
                     LineKind::Normal => fbm::C_FG,
-                    LineKind::Dim => fbm::C_DIM,
+                    LineKind::Dim | LineKind::Gauge(_) => fbm::C_DIM,
                     LineKind::Selected => fbm::C_FG,
                     LineKind::Error => fbm::C_ERR,
                     LineKind::Accent => fbm::C_ACCENT,
@@ -2840,6 +2912,35 @@ impl<D: BlockDevice> App<D> {
                         // 2px outline marks the active cell/column clearly.
                         d.fill_rect(hx, y - 2, hw, hh, hl_color);
                         d.stroke_rect(hx, y - 2, hw, hh, 2, fbm::C_CELL_SEL);
+                    }
+                }
+                // Usage gauge: paint the bar into the `[…]` span before the
+                // text pass, so the brackets and MiB figures render on top.
+                if let LineKind::Gauge(permille) = line.kind {
+                    let chars: Vec<char> = line.text.chars().collect();
+                    let open = chars.iter().position(|&c| c == '[');
+                    let close = chars.iter().position(|&c| c == ']');
+                    if let (Some(l), Some(r)) = (open, close) {
+                        if r > l + 1 {
+                            let (gx, gw) = (BODY_X + (l + 1) * CELL_W, (r - l - 1) * CELL_W);
+                            let (gy, gh) = (y + 1, CELL_H - 3);
+                            d.fill_rect(gx, gy, gw, gh, fbm::C_SEL);
+                            d.stroke_rect(gx, gy, gw, gh, 1, fbm::C_PANEL_EDGE);
+                            let mut fw = gw * permille as usize / 1000;
+                            if permille > 0 && fw < 2 {
+                                fw = 2; // a near-empty volume still shows a sliver
+                            }
+                            if fw > 0 {
+                                // Neon fill, switching to alert red when the
+                                // volume is ≥90% full.
+                                let (top, bot) = if permille >= 900 {
+                                    (fbm::C_ERR, fbm::C_ERR)
+                                } else {
+                                    (fbm::C_ACCENT, fbm::C_CELL_SEL)
+                                };
+                                d.fill_grad_rect(gx, gy, fw, gh, top, bot);
+                            }
+                        }
                     }
                 }
                 // Section headers: Display face, gradient-filled, flagged with
@@ -2966,9 +3067,44 @@ impl<D: BlockDevice> App<D> {
         let tables = self.store.list_tables().unwrap_or_default();
         let mut body = Vec::new();
         body.push(line(
-            "Tables  [↑↓] select  [Enter] open  [c]reate  [d]rives  [n]ew OS on USB  top [u]p USB  [k]eyboard  [a]bout  [p]ower",
+            "Tables  [↑↓] select  [Enter] open  [c]reate  [d]rives  [n]ew OS on USB  top [u]p USB  [r]esize  [k]eyboard  [a]bout  [p]ower",
             LineKind::Dim,
         ).hit(Hit::Shortcuts));
+        // Storage gauge: the bar shows the used fraction of the volume; the
+        // figures stay in MiB. Bar width flexes with the panel so the MiB text
+        // always fits.
+        let free = self.store.free_bytes();
+        let cap = self.store.capacity_bytes();
+        let dev_b = self.store.device_bytes();
+        let label = "Space [";
+        let cols = self.body_cols();
+        let mut tail = format!(
+            "] {} free of {}",
+            ata::human_size_bytes(free),
+            ata::human_size_bytes(cap),
+        );
+        // The device suffix is a bonus — drop it before squeezing the bar
+        // below its minimum width on a narrow panel.
+        if dev_b > cap {
+            let suffix = format!("  (device {})", ata::human_size_bytes(dev_b));
+            if label.chars().count() + tail.chars().count() + suffix.chars().count() + 10
+                <= cols
+            {
+                tail.push_str(&suffix);
+            }
+        }
+        let bar_w = cols
+            .saturating_sub(label.chars().count() + tail.chars().count())
+            .clamp(10, 40);
+        let mut space = String::from(label);
+        space.extend(core::iter::repeat(' ').take(bar_w));
+        space.push_str(&tail);
+        let used_pm = if cap == 0 {
+            0
+        } else {
+            ((cap - free) as u128 * 1000 / cap as u128) as u16
+        };
+        body.push(line(&space, LineKind::Gauge(used_pm)));
         body.push(line("", LineKind::Normal));
         if tables.is_empty() {
             body.push(line("(no tables yet — press 'c' to create one)", LineKind::Dim));
@@ -4798,6 +4934,10 @@ enum LineKind {
     Selected,
     Error,
     Accent,
+    /// A usage meter: the span between the line's `[` and `]` is painted as a
+    /// proportional bar (the payload is the filled fraction in per-mille);
+    /// the rest of the line renders as dim text on top.
+    Gauge(u16),
 }
 
 /// What a mouse click on a body line does. Co-located with the line so the

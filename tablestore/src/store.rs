@@ -98,6 +98,48 @@ impl<D: BlockDevice> Store<D> {
         self.pager.superblock().total_pages
     }
 
+    /// Volume capacity in bytes (format-time size — the physical medium may
+    /// be larger; see the top-up path).
+    pub fn capacity_bytes(&self) -> u64 {
+        self.total_pages() * PAGE as u64
+    }
+
+    /// Bytes free for future commits, from the pager's exact physical
+    /// accounting ([`Pager::free_pages`]). O(1), no device I/O.
+    pub fn free_bytes(&self) -> u64 {
+        self.pager.free_pages() * PAGE as u64
+    }
+
+    /// Bytes occupied on the volume: committed data pages, PMAP nodes,
+    /// free-list links, plus the fixed superblock/anchor reserve — so
+    /// `used_bytes() + free_bytes() == capacity_bytes()` always holds.
+    pub fn used_bytes(&self) -> u64 {
+        self.capacity_bytes() - self.free_bytes()
+    }
+
+    /// Pages the physical medium can hold — the upper bound for
+    /// [`Store::resize`]. The volume itself may be smaller.
+    pub fn device_pages(&self) -> u64 {
+        self.pager.device_pages()
+    }
+
+    /// Bytes the physical medium can hold.
+    pub fn device_bytes(&self) -> u64 {
+        self.device_pages() * PAGE as u64
+    }
+
+    /// Smallest volume size (pages) [`Store::resize`] can shrink to right now.
+    pub fn min_total_pages(&self) -> u64 {
+        self.pager.min_total_pages()
+    }
+
+    /// Grow or shrink the volume in place to `new_total_pages`, preserving all
+    /// tables. Bounded by [`Store::min_total_pages`] and
+    /// [`Store::device_pages`]; on error the volume keeps its old size, intact.
+    pub fn resize(&mut self, new_total_pages: u64) -> Result<()> {
+        self.pager.resize(new_total_pages)
+    }
+
     /// Finish a version "top up" after the volume's bytes are in place: record
     /// the (possibly new) volume size and force-rewrite the superblock so every
     /// on-disk version field is stamped with the current product version.
@@ -1161,6 +1203,43 @@ mod tests {
     }
     fn sv(s: &str) -> Option<Value> {
         Some(Value::Str(s.into()))
+    }
+
+    /// In-place resize keeps every table intact: expand onto a larger medium,
+    /// use the new space, shrink back to the tightest size, remount.
+    #[test]
+    fn resize_preserves_tables() {
+        let mut st = Store::format(dev()).unwrap();
+        st.create_table("t").unwrap();
+        st.add_column("t", col("id", Type::UnsignedInteger, false, true))
+            .unwrap();
+        st.add_column("t", col("name", Type::String, false, false))
+            .unwrap();
+        for i in 0..200 {
+            st.insert("t", vec![iv(&i.to_string()), sv(&format!("row {i}"))])
+                .unwrap();
+        }
+        let mut snap = st.device_mut().snapshot();
+        drop(st);
+        snap.resize(snap.len() + 32 * 1024 * 1024, 0);
+
+        let mut st = Store::open(MemBlockDevice::from_snapshot(snap)).unwrap();
+        let before = st.total_pages();
+        st.resize(st.device_pages()).unwrap();
+        assert!(st.total_pages() > before);
+        assert_eq!(st.scan("t").unwrap().len(), 200);
+        st.insert("t", vec![iv("1000"), sv("after expand")]).unwrap();
+
+        let min = st.min_total_pages();
+        st.resize(min).unwrap();
+        assert_eq!(st.total_pages(), min);
+        assert_eq!(st.scan("t").unwrap().len(), 201);
+
+        let snap = st.device_mut().snapshot();
+        drop(st);
+        let mut st = Store::open(MemBlockDevice::from_snapshot(snap)).unwrap();
+        assert_eq!(st.scan("t").unwrap().len(), 201);
+        assert_eq!(st.free_bytes() + st.used_bytes(), st.capacity_bytes());
     }
 
     #[test]

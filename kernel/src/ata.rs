@@ -589,7 +589,12 @@ pub fn partition_type_name(t: u8) -> &'static str {
 /// Decimal-ish human size for a sector count. No floats (avoids the soft-FP
 /// dependency on `x86_64-unknown-none`).
 pub fn human_size_sectors(sectors: u64) -> String {
-    let bytes = sectors.saturating_mul(SECTOR as u64);
+    human_size_bytes(sectors.saturating_mul(SECTOR as u64))
+}
+
+/// Decimal-ish human size for a byte count. No floats (avoids the soft-FP
+/// dependency on `x86_64-unknown-none`).
+pub fn human_size_bytes(bytes: u64) -> String {
     if bytes >= 1u64 << 30 {
         let n = bytes.saturating_mul(100) >> 30;
         format!("{}.{:02} GiB", n / 100, n % 100)
